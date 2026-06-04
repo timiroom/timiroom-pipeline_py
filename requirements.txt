@@ -1,0 +1,33 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# OpenAI
+openai>=1.50.0
+
+# PostgreSQL + pgvector
+psycopg2-binary>=2.9.10
+pgvector>=0.3.0
+
+# Anthropic
+anthropic>=0.34.0
+
+# Kafka
+aiokafka>=0.11.0
+
+# PDF 파싱
+pdfplumber>=0.11.0
+
+# HTTP 클라이언트
+httpx>=0.27.0
+
+# SSE
+sse-starlette>=2.1.0
+
+# 벡터 계산
+numpy>=1.26.0
+
+# 멀티파트 처리
+python-multipart>=0.0.9
