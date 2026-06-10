@@ -4,6 +4,7 @@ from collections import defaultdict
 
 import psycopg2
 import psycopg2.extras
+from kiwipiepy import Kiwi
 from openai import AsyncOpenAI
 from pgvector.psycopg2 import register_vector
 
@@ -14,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 RRF_K = 60
 SESSION_BOOST = 1.5
+
+# 검색어로 의미 있는 품사: 일반명사, 고유명사, 의존명사, 외국어, 한자
+_SEARCH_TAGS = {"NNG", "NNP", "NNB", "SL", "SH"}
+_kiwi = Kiwi()
 
 
 class HybridSearchService:
@@ -103,13 +108,10 @@ class HybridSearchService:
             return []
 
     def _keyword_search(self, query: str) -> list[DocumentChunk]:
-        cleaned = "".join(
-            c if c.isalnum() or c.isspace() else " " for c in query
-        ).strip()
-        if any("가" <= c <= "힣" for c in cleaned):
-            return []
-
-        ts_query = " & ".join(w for w in cleaned.split() if w)
+        tokens = [t.form for t in _kiwi.tokenize(query) if t.tag in _SEARCH_TAGS]
+        if not tokens:
+            tokens = [w for w in query.split() if len(w) > 1]
+        ts_query = " & ".join(tokens)
         if not ts_query:
             return []
 
@@ -120,10 +122,10 @@ class HybridSearchService:
                     cur.execute(
                         """
                         SELECT id, content, metadata,
-                               ts_rank(to_tsvector('english', content),
-                                       to_tsquery('english', %s)) AS rank
+                               ts_rank(tokens, to_tsquery('simple', %s)) AS rank
                         FROM document_chunks
-                        WHERE to_tsvector('english', content) @@ to_tsquery('english', %s)
+                        WHERE tokens IS NOT NULL
+                          AND tokens @@ to_tsquery('simple', %s)
                         ORDER BY rank DESC
                         LIMIT %s
                         """,

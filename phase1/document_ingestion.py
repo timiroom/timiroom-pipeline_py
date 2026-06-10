@@ -4,12 +4,15 @@ import uuid
 
 import psycopg2
 import psycopg2.extras
+from kiwipiepy import Kiwi
 from openai import AsyncOpenAI
 from pgvector.psycopg2 import register_vector
 
 from .semantic_chunking import SemanticChunkingService
 
 logger = logging.getLogger(__name__)
+
+_kiwi = Kiwi()
 
 EMBED_MODEL = "text-embedding-3-large"
 # Kafka consumer path용 고정 크기 청크 (SemanticChunking 미사용)
@@ -78,16 +81,18 @@ class DocumentIngestionService:
             with conn.cursor() as cur:
                 for i, (text, vec) in enumerate(zip(texts, embeddings)):
                     meta = {**metadata, "chunk_index": i}
+                    tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
                     cur.execute(
                         """
-                        INSERT INTO document_chunks (id, content, metadata, embedding)
-                        VALUES (%s, %s, %s::jsonb, %s::vector)
+                        INSERT INTO document_chunks (id, content, metadata, embedding, tokens)
+                        VALUES (%s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
                         """,
                         (
                             str(uuid.uuid4()),
                             text,
                             json.dumps(meta, ensure_ascii=False),
                             str(vec),
+                            tokens_text,
                         ),
                     )
                     saved += 1

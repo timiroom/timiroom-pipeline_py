@@ -29,5 +29,8 @@ sse-starlette>=2.1.0
 # 벡터 계산
 numpy>=1.26.0
 
+# 한국어 형태소 분석
+kiwipiepy>=0.18.0
+
 # 멀티파트 처리
 python-multipart>=0.0.9
