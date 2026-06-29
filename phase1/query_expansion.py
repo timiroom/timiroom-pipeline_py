@@ -15,15 +15,17 @@ EXPANSION_PROMPT = """
 
 class QueryExpansionService:
 
-    def __init__(self, client: AsyncOpenAI):
+    def __init__(self, client: AsyncOpenAI, model: str = ""):
         self._client = client
+        self._model = model
 
     async def expand(self, query: str) -> list[str]:
         try:
             response = await self._client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self._model,
                 temperature=0.7,
                 messages=[{"role": "user", "content": EXPANSION_PROMPT.format(query=query)}],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             lines = response.choices[0].message.content.strip().splitlines()
             expanded = [l.strip() for l in lines if l.strip()]

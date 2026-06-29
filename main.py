@@ -12,7 +12,6 @@ if hasattr(sys.stderr, "buffer"):
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from config.settings import settings
@@ -21,6 +20,7 @@ from common.exception_handler import register_exception_handlers
 from common.logging_middleware import RequestIdMiddleware, RequestIdFilter
 from common.pm_skills import PmSkillsLoader
 from phase1.document_ingestion import DocumentIngestionService
+from phase1.embedding_service import EmbeddingService
 from phase1.semantic_chunking import SemanticChunkingService
 from phase1.form_to_query import FormToQueryService
 from phase1.hybrid_search import HybridSearchService
@@ -69,38 +69,41 @@ logging.getLogger("aiokafka").setLevel(logging.INFO)
 
 # ── API 클라이언트 ────────────────────────────────────────────────
 
-openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
-anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+exaone_client = AsyncOpenAI(
+    api_key=settings.exaone_api_key,
+    base_url="https://api.friendli.ai/dedicated/v1",
+)
 
 # ── Phase 1 ───────────────────────────────────────────────────────
 
 session_store = SessionVectorStore()
-pm_skills = PmSkillsLoader(openai_client)
+embedding_service = EmbeddingService(settings.embedding_model)
+pm_skills = PmSkillsLoader(exaone_client)
 
-query_expansion = QueryExpansionService(openai_client)
+query_expansion = QueryExpansionService(exaone_client, settings.exaone_endpoint_id)
 hybrid_search = HybridSearchService(
     db_url=settings.db_url,
-    client=openai_client,
+    embedder=embedding_service,
     session_store=session_store,
     top_k_vector=settings.rag_top_k_vector,
     top_k_keyword=settings.rag_top_k_keyword,
-    embed_model=settings.openai_embedding_model,
 )
 reranker = RerankerService(
-    client=openai_client,
+    client=exaone_client,
+    model=settings.exaone_endpoint_id,
     top_k_final=settings.rag_top_k_final,
     enabled=settings.rag_reranker_enabled,
     cohere_api_key=settings.cohere_api_key,
     cohere_model=settings.cohere_rerank_model,
+    ko_reranker_model=settings.ko_reranker_model,
 )
 form_to_query = FormToQueryService()
-pdf_parsing = PDFParsingService(session_store)
+pdf_parsing = PDFParsingService(session_store, embedding_service)
 document_ingestion_service = DocumentIngestionService(
     db_url=settings.db_url,
-    client=openai_client,
+    embedder=embedding_service,
     chunk_size=settings.rag_chunk_size,
     chunk_overlap=settings.rag_chunk_overlap,
-    embed_model=settings.openai_embedding_model,
 )
 
 rag_pipeline_service = RagPipelineService(
@@ -115,20 +118,20 @@ rag_pipeline_service = RagPipelineService(
 
 # ── Phase 1 추천 서비스 ───────────────────────────────────────────
 
-tech_stack_service = TechStackRecommendationService(anthropic_client, settings.anthropic_chat_model)
-persona_service = PersonaRecommendationService(anthropic_client, settings.anthropic_chat_model)
-feature_service = FeatureRecommendationService(anthropic_client, settings.anthropic_chat_model)
+tech_stack_service = TechStackRecommendationService(exaone_client, settings.exaone_endpoint_id)
+persona_service = PersonaRecommendationService(exaone_client, settings.exaone_endpoint_id)
+feature_service = FeatureRecommendationService(exaone_client, settings.exaone_endpoint_id)
 
 # ── Phase 2 ───────────────────────────────────────────────────────
 
 progress_service = PipelineProgressService()
 
-search_agent = SearchAgent(settings.openai_api_key)
-pm_agent = PmAgent(openai_client, pm_skills, settings.openai_chat_model)
-prd_agent = PrdAgent(settings.openai_api_key, settings.openai_chat_model)
-dba_agent = DbaAgent(openai_client, settings.openai_chat_model)
-api_agent = ApiAgent(openai_client, settings.openai_chat_model)
-qa_agent = QaAgent(openai_client, settings.openai_chat_model)
+search_agent = SearchAgent(exaone_client, settings.exaone_endpoint_id)
+pm_agent = PmAgent(exaone_client, pm_skills, settings.exaone_endpoint_id)
+prd_agent = PrdAgent(exaone_client, settings.exaone_endpoint_id)
+dba_agent = DbaAgent(exaone_client, settings.exaone_endpoint_id)
+api_agent = ApiAgent(exaone_client, settings.exaone_endpoint_id)
+qa_agent = QaAgent(exaone_client, settings.exaone_endpoint_id)
 
 orchestration_graph = OrchestrationGraph(
     search_agent=search_agent,

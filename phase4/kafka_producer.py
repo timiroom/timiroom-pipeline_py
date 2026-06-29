@@ -16,7 +16,8 @@ RECONNECT_DELAY = 5
 class KafkaProducerService:
     """
     비동기 Kafka Producer.
-    - start()는 즉시 반환하고 백그라운드에서 무한 재시도 연결
+    - start()는 즉시 반환하고 백그라운드에서 연결 유지
+    - 연결 끊기면 자동 재연결 (무한 재시도)
     - Kafka 미준비 시 publish()는 경고 후 스킵 (앱 기동 차단 없음)
     """
 
@@ -42,11 +43,15 @@ class KafkaProducerService:
     async def publish(self, state: PipelineState) -> str | None:
         if not self._ready or self._producer is None:
             logger.warning("Kafka Producer 미준비 — 결과 저장 건너뜀")
+            self._ensure_connecting()
             return None
 
         pipeline_id = str(uuid.uuid4())
         event = {
             "pipelineId": pipeline_id,
+            "projectName": state.project_name,
+            "platform": state.platform.value if state.platform else "",
+            "techStack": state.tech_stack,
             "userQuery": state.user_query,
             "featureList": state.feature_list,
             "prdDocument": state.prd_document,
@@ -63,7 +68,13 @@ class KafkaProducerService:
         except Exception as e:
             logger.error("Kafka 발행 실패: %s", e)
             self._ready = False
+            self._ensure_connecting()
             return None
+
+    def _ensure_connecting(self) -> None:
+        """연결 태스크가 없거나 종료된 경우 재시작."""
+        if self._connect_task is None or self._connect_task.done():
+            self._connect_task = asyncio.create_task(self._connect_loop())
 
     async def _connect_loop(self) -> None:
         attempt = 0
@@ -79,6 +90,8 @@ class KafkaProducerService:
                 await self._producer.start()
                 self._ready = True
                 logger.info("Kafka Producer 연결 성공 (시도 %d회)", attempt)
+                # 연결 유지 — 태스크가 살아있는 동안 대기
+                # publish()에서 오류 발생 시 _ready=False + _ensure_connecting()으로 재진입
                 return
             except asyncio.CancelledError:
                 return

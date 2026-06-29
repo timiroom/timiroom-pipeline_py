@@ -1,6 +1,6 @@
-import asyncio
 import logging
 
+from debug_dump import PipelineDump
 from phase2.agents.api_agent import ApiAgent
 from phase2.agents.dba_agent import DbaAgent
 from phase2.agents.pm_agent import PmAgent
@@ -37,41 +37,64 @@ class OrchestrationGraph:
 
     async def run(self, initial_state: PipelineState, pipeline_id: str | None = None) -> PipelineState:
         logger.info("=== Phase 2 오케스트레이션 시작 ===")
+        dump = PipelineDump(pipeline_id or "no-id")
+        final_state = initial_state
 
-        self._progress.send(pipeline_id, "SEARCH", "시장 조사 중...", 30)
-        after_search = await self._search.execute(initial_state)
+        try:
+            self._progress.send(pipeline_id, "SEARCH", "시장 조사 중...", 30)
+            after_search = await self._search.execute(initial_state, dump)
+            dump.log_state("SEARCH", after_search)
 
-        self._progress.send(pipeline_id, "PM", "기능 분석 및 설계 지시 생성 중...", 40)
-        after_pm = await self._pm.execute(after_search)
+            self._progress.send(pipeline_id, "PM", "기능 분석 및 설계 지시 생성 중...", 40)
+            after_pm = await self._pm.execute(after_search, dump)
+            dump.log_state("PM", after_pm)
 
-        self._progress.send(pipeline_id, "PRD", "PRD 문서 작성 중...", 50)
-        after_prd_dba_api = await self._run_prd_with_rollback(after_pm, pipeline_id)
+            self._progress.send(pipeline_id, "PRD", "PRD 문서 작성 중...", 50)
+            after_prd_dba_api = await self._run_prd_with_rollback(after_pm, pipeline_id, dump)
+            dump.log_state("PRD_DBA_API", after_prd_dba_api)
 
-        self._progress.send(pipeline_id, "QA", "QA 검수 중...", 75)
-        final_state = await self._run_qa_retry(after_prd_dba_api, 0, pipeline_id)
+            self._progress.send(pipeline_id, "QA", "QA 검수 중...", 75)
+            final_state = await self._run_qa_retry(after_prd_dba_api, 0, pipeline_id, dump)
+            dump.log_state("QA", final_state)
 
-        logger.info("=== Phase 2 완료 ===")
+            logger.info("=== Phase 2 완료 ===")
+        except Exception as e:
+            logger.error("오케스트레이션 예외: %s", e)
+            raise
+        finally:
+            dump.close(final_state)
+
         return final_state
 
     async def execute(self, user_query: str, context_prompt: str) -> PipelineState:
+        import uuid
         initial = PipelineState(user_query=user_query, context_prompt=context_prompt)
-        return await self.run(initial, None)
+        return await self.run(initial, f"retry-{uuid.uuid4().hex[:8]}")
 
     async def _run_prd_with_rollback(
-        self, pm_state: PipelineState, pipeline_id: str | None
+        self, pm_state: PipelineState, pipeline_id: str | None, dump=None
     ) -> PipelineState:
         current = pm_state
 
         for attempt in range(3):
             logger.info("PRD 에이전트 실행 중... (시도 %d)", attempt + 1)
-            after_prd = await self._prd.execute(current)
+            after_prd = await self._prd.execute(current, dump)
 
-            self._progress.send(pipeline_id, "DBA_API", "DB 스키마 · API 설계 중...", 60)
+            self._progress.send(pipeline_id, "DBA_API", "DB 스키마 설계 중...", 58)
+            dba_result = await self._dba.execute(after_prd, dump)
+            if dump:
+                dump.log_state(f"DBA (attempt {attempt + 1})", dba_result)
 
-            dba_result, api_result = await asyncio.gather(
-                self._dba.execute(after_prd),
-                self._api.execute(after_prd),
+            # API 에이전트는 DBA 결과(DB 스키마)를 받아 일관된 경로를 설계
+            self._progress.send(pipeline_id, "DBA_API", "API 스펙 설계 중...", 65)
+            api_input = after_prd.copy(
+                context_prompt=(after_prd.context_prompt or "")
+                    + "\n\n=== DBA 설계 DB 스키마 (아래 테이블명을 API 경로에 반영하세요) ===\n"
+                    + (dba_result.db_schema or ""),
             )
+            api_result = await self._api.execute(api_input, dump)
+            if dump:
+                dump.log_state(f"API (attempt {attempt + 1})", api_result)
 
             has_dba_feedback = bool((dba_result.prd_feedback_from_dba or "").strip())
             has_api_feedback = bool((api_result.prd_feedback_from_api or "").strip())
@@ -104,7 +127,7 @@ class OrchestrationGraph:
         return current
 
     async def _run_qa_retry(
-        self, state: PipelineState, attempt: int, pipeline_id: str | None
+        self, state: PipelineState, attempt: int, pipeline_id: str | None, dump=None
     ) -> PipelineState:
         if attempt > 0:
             self._progress.send(
@@ -113,7 +136,9 @@ class OrchestrationGraph:
             )
 
         logger.info("QA 에이전트 실행 중... (시도 %d)", attempt + 1)
-        qa_result = await self._qa.execute(state)
+        qa_result = await self._qa.execute(state, dump)
+        if dump:
+            dump.log_state(f"QA (attempt {attempt + 1})", qa_result)
 
         qa_failed = bool((qa_result.last_validation_error or "").strip())
 
@@ -143,10 +168,13 @@ class OrchestrationGraph:
             retry_count=attempt + 1,
         )
 
-        dba_result, api_result = await asyncio.gather(
-            self._dba.execute(retry_base),
-            self._api.execute(retry_base),
+        dba_result = await self._dba.execute(retry_base, dump)
+        api_retry_input = retry_base.copy(
+            context_prompt=retry_context
+                + "\n\n=== DBA 설계 DB 스키마 ===\n"
+                + (dba_result.db_schema or ""),
         )
+        api_result = await self._api.execute(api_retry_input, dump)
 
         merged = retry_base.copy(
             db_schema=dba_result.db_schema,
@@ -156,4 +184,4 @@ class OrchestrationGraph:
             retry_count=attempt + 1,
         )
 
-        return await self._run_qa_retry(merged, attempt + 1, pipeline_id)
+        return await self._run_qa_retry(merged, attempt + 1, pipeline_id, dump)

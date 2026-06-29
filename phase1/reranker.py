@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import httpx
@@ -28,24 +29,54 @@ class RerankerService:
     def __init__(
         self,
         client: AsyncOpenAI,
+        model: str = "",
         top_k_final: int = 5,
         enabled: bool = True,
         cohere_api_key: str = "",
-        cohere_model: str = "rerank-english-v3.0",
+        cohere_model: str = "rerank-multilingual-v3.0",
+        ko_reranker_model: str = "Dongjin-kr/ko-reranker",
     ):
         self._client = client
+        self._model = model
         self._top_k = top_k_final
         self._enabled = enabled
         self._cohere_key = cohere_api_key
         self._cohere_model = cohere_model
+        self._local_reranker = None
+
+        if ko_reranker_model:
+            try:
+                from sentence_transformers import CrossEncoder
+                self._local_reranker = CrossEncoder(ko_reranker_model)
+                logger.info("Ko-Reranker 로딩 완료: %s", ko_reranker_model)
+            except Exception as e:
+                logger.warning("Ko-Reranker 로딩 실패 — GPT fallback 사용: %s", e)
 
     async def rerank(self, query: str, candidates: list[DocumentChunk]) -> list[DocumentChunk]:
         if not self._enabled or not candidates:
             return candidates[: self._top_k]
 
+        if self._local_reranker:
+            return await self._rerank_local(query, candidates)
         if self._cohere_key:
             return await self._rerank_cohere(query, candidates)
         return await self._rerank_gpt(query, candidates)
+
+    async def _rerank_local(self, query: str, candidates: list[DocumentChunk]) -> list[DocumentChunk]:
+        try:
+            pairs = [(query, c.content) for c in candidates]
+            loop = asyncio.get_event_loop()
+            scores = await loop.run_in_executor(
+                None,
+                lambda: self._local_reranker.predict(pairs, show_progress_bar=False),
+            )
+            ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+            result = [c for _, c in ranked[: self._top_k]]
+            logger.debug("Ko-Reranker 완료 — %d docs 반환", len(result))
+            return result
+        except Exception as e:
+            logger.warning("Ko-Reranker 추론 실패: %s — GPT fallback", e)
+            return await self._rerank_gpt(query, candidates)
 
     async def _rerank_gpt(self, query: str, candidates: list[DocumentChunk]) -> list[DocumentChunk]:
         try:
@@ -55,7 +86,7 @@ class RerankerService:
                 doc_lines.append(f"{i + 1}. {preview}")
 
             response = await self._client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self._model,
                 temperature=0.0,
                 messages=[{
                     "role": "user",
@@ -65,6 +96,7 @@ class RerankerService:
                         top_k=self._top_k,
                     ),
                 }],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             text = response.choices[0].message.content.strip()
             indices = [int(p.strip()) - 1 for p in text.split(",") if p.strip().isdigit()]

@@ -55,22 +55,48 @@ class RagPipelineService:
         try:
             # Step 1: PDF 파싱
             if pdf_files:
-                self._pdf_parsing.parse_and_store_all(pdf_files, session_id)
+                logger.info("[%s] ▶ Step 1: PDF 파싱 시작 (%d개)", session_id[:8], len(pdf_files))
+                await self._pdf_parsing.parse_and_store_all(pdf_files, session_id)
+                logger.info("[%s] ✔ Step 1: PDF 파싱 완료", session_id[:8])
 
             # Step 2: 폼 → 쿼리 합성
+            logger.info("[%s] ▶ Step 2: 폼 → 쿼리 합성", session_id[:8])
             synthesized = self._form_to_query.synthesize(form)
+            logger.info("[%s] ✔ Step 2: 합성 쿼리\n%s", session_id[:8], synthesized[:200])
 
             # Step 3: 쿼리 확장
+            logger.info("[%s] ▶ Step 3: 쿼리 확장 (LLM 호출)", session_id[:8])
             expanded = await self._query_expansion.expand(synthesized)
+            logger.info("[%s] ✔ Step 3: 확장 쿼리 %d개 생성", session_id[:8], len(expanded))
+            for i, q in enumerate(expanded, 1):
+                logger.info("[%s]   [%d] %s", session_id[:8], i, q)
 
             # Step 4: Hybrid Search
+            logger.info("[%s] ▶ Step 4: Hybrid Search (벡터 + 키워드)", session_id[:8])
             retrieved = await self._hybrid_search.search_with_session(expanded, session_id)
+            logger.info("[%s] ✔ Step 4: %d개 청크 검색됨", session_id[:8], len(retrieved))
+            for i, c in enumerate(retrieved[:5], 1):
+                logger.info(
+                    "[%s]   [%d] rrf=%.5f topic=%s | %s",
+                    session_id[:8], i, c.relevance_score or 0,
+                    c.metadata.get("topic", "?"), c.content[:60],
+                )
 
             # Step 5: Reranking
+            logger.info("[%s] ▶ Step 5: Reranking (Ko-Reranker)", session_id[:8])
             reranked = await self._reranker.rerank(synthesized, retrieved)
+            logger.info("[%s] ✔ Step 5: %d개로 압축", session_id[:8], len(reranked))
+            for i, c in enumerate(reranked, 1):
+                logger.info(
+                    "[%s]   [%d] topic=%s | %s",
+                    session_id[:8], i,
+                    c.metadata.get("topic", "?"), c.content[:60],
+                )
 
             # Step 6: PipelineState 조립
+            logger.info("[%s] ▶ Step 6: Context 조립", session_id[:8])
             context_prompt = self._assemble_context(reranked, synthesized)
+            logger.info("[%s] ✔ Step 6: context_prompt %d자 생성", session_id[:8], len(context_prompt))
 
             from phase2.state import PipelineState
             return PipelineState(

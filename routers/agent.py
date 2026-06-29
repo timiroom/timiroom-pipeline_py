@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 def _timeouts() -> tuple[int, int]:
     from main import settings
@@ -29,9 +28,9 @@ class AgentResponse(BaseModel):
     metadata: dict = {}
 
 
-def _api_keys():
+def _anthropic_key() -> str:
     from main import settings
-    return settings.openai_api_key, getattr(settings, "anthropic_api_key", "")
+    return getattr(settings, "anthropic_api_key", "")
 
 
 # ── SSE 스트리밍 ──────────────────────────────────────────────────
@@ -42,18 +41,14 @@ async def chat_stream(
     x_llm_model: Annotated[str, Header(alias="X-LLM-Model")],
     request: AgentRequest,
 ):
-    openai_key, anthropic_key = _api_keys()
-    is_anthropic = x_llm_provider.lower() == "anthropic"
-    api_key = anthropic_key if is_anthropic else openai_key
+    if x_llm_provider.lower() != "anthropic":
+        raise HTTPException(status_code=400, detail="지원하지 않는 LLM 프로바이더입니다. anthropic만 사용 가능합니다.")
+    api_key = _anthropic_key()
 
     async def generate():
         try:
-            if is_anthropic:
-                async for chunk in _stream_anthropic(api_key, x_llm_model, request):
-                    yield chunk
-            else:
-                async for chunk in _stream_openai(api_key, x_llm_model, request):
-                    yield chunk
+            async for chunk in _stream_anthropic(api_key, x_llm_model, request):
+                yield chunk
         except Exception as e:
             logger.error("스트리밍 오류: %s", e)
             yield f"data: {{\"error\": \"{e}\"}}\n\n"
@@ -69,15 +64,11 @@ async def chat(
     x_llm_model: Annotated[str, Header(alias="X-LLM-Model")],
     request: AgentRequest,
 ) -> AgentResponse:
-    openai_key, anthropic_key = _api_keys()
-    is_anthropic = x_llm_provider.lower() == "anthropic"
-    api_key = anthropic_key if is_anthropic else openai_key
-
+    if x_llm_provider.lower() != "anthropic":
+        raise HTTPException(status_code=400, detail="지원하지 않는 LLM 프로바이더입니다. anthropic만 사용 가능합니다.")
+    api_key = _anthropic_key()
     try:
-        if is_anthropic:
-            content = await _call_anthropic(api_key, x_llm_model, request)
-        else:
-            content = await _call_openai(api_key, x_llm_model, request)
+        content = await _call_anthropic(api_key, x_llm_model, request)
         return AgentResponse(content=content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -90,16 +81,12 @@ async def test(
     x_llm_provider: Annotated[str, Header(alias="X-LLM-Provider")],
     x_llm_model: Annotated[str, Header(alias="X-LLM-Model")],
 ) -> dict:
-    openai_key, anthropic_key = _api_keys()
-    is_anthropic = x_llm_provider.lower() == "anthropic"
-    api_key = anthropic_key if is_anthropic else openai_key
-
+    if x_llm_provider.lower() != "anthropic":
+        raise HTTPException(status_code=400, detail="지원하지 않는 LLM 프로바이더입니다. anthropic만 사용 가능합니다.")
+    api_key = _anthropic_key()
     ping = AgentRequest(messages=[{"role": "user", "content": "Hello"}], system_prompt=None)
     try:
-        if is_anthropic:
-            await _call_anthropic(api_key, x_llm_model, ping)
-        else:
-            await _call_openai(api_key, x_llm_model, ping)
+        await _call_anthropic(api_key, x_llm_model, ping)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -165,53 +152,3 @@ def _build_anthropic_body(model: str, req: AgentRequest, stream: bool) -> dict:
         body["system"] = req.system_prompt
     return body
 
-
-# ── OpenAI ────────────────────────────────────────────────────────
-
-async def _call_openai(api_key: str, model: str, req: AgentRequest) -> str:
-    _, sync_timeout = _timeouts()
-    body = _build_openai_body(model, req, stream=False)
-    async with httpx.AsyncClient(timeout=sync_timeout) as client:
-        resp = await client.post(
-            OPENAI_API_URL,
-            headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
-            json=body,
-        )
-        resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
-
-
-async def _stream_openai(api_key: str, model: str, req: AgentRequest):
-    stream_timeout, _ = _timeouts()
-    body = _build_openai_body(model, req, stream=True)
-    async with httpx.AsyncClient(timeout=stream_timeout) as client:
-        async with client.stream(
-            "POST",
-            OPENAI_API_URL,
-            headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
-            json=body,
-        ) as resp:
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                if not data_str:
-                    continue
-                try:
-                    node = json.loads(data_str)
-                    text = node["choices"][0].get("delta", {}).get("content", "")
-                    if text:
-                        yield f"data: {json.dumps({'delta': text})}\n\n"
-                except Exception:
-                    pass
-    yield "data: [DONE]\n\n"
-
-
-def _build_openai_body(model: str, req: AgentRequest, stream: bool) -> dict:
-    messages = []
-    if req.system_prompt:
-        messages.append({"role": "system", "content": req.system_prompt})
-    messages.extend(req.messages)
-    return {"model": model, "stream": stream, "messages": messages}

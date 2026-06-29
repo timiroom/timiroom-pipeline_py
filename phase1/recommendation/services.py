@@ -1,7 +1,8 @@
-import json
 import logging
 
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
+
+from phase2.json_utils import try_parse_json
 
 from .models import (
     TechStackResponse,
@@ -13,12 +14,10 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "claude-sonnet-4-20250514"
-
 
 class TechStackRecommendationService:
 
-    def __init__(self, client: AsyncAnthropic, model: str = _DEFAULT_MODEL):
+    def __init__(self, client: AsyncOpenAI, model: str):
         self._client = client
         self._model = model
 
@@ -35,15 +34,20 @@ class TechStackRecommendationService:
 {{"frontend":[],"backend":[],"database":[],"devops":[],"mobile":[]}}"""
 
         try:
-            resp = await self._client.messages.create(
+            resp = await self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=512,
                 temperature=0.3,
-                system="당신은 소프트웨어 아키텍처 전문가입니다.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요.",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": "당신은 소프트웨어 아키텍처 전문가입니다.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요."},
+                    {"role": "user", "content": prompt},
+                ],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            raw = resp.content[0].text.strip()
-            data = json.loads(raw)
+            raw = (resp.choices[0].message.content or "").strip()
+            data = try_parse_json(raw)
+            if data is None:
+                raise ValueError(f"JSON 파싱 실패: {raw[:200]}")
             return TechStackResponse.model_validate(data)
         except Exception as e:
             logger.warning("기술 스택 추천 실패, 기본값 반환: %s", e)
@@ -52,7 +56,7 @@ class TechStackRecommendationService:
 
 class PersonaRecommendationService:
 
-    def __init__(self, client: AsyncAnthropic, model: str = _DEFAULT_MODEL):
+    def __init__(self, client: AsyncOpenAI, model: str):
         self._client = client
         self._model = model
 
@@ -70,15 +74,20 @@ class PersonaRecommendationService:
 {{"personas":[{{"persona":"","usageEnvironment":"","biggestPainPoint":""}}]}}"""
 
         try:
-            resp = await self._client.messages.create(
+            resp = await self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=512,
                 temperature=0.4,
-                system="당신은 UX 리서처입니다.\n서비스 정보를 보고 가장 핵심적인 타겟 유저 페르소나를 추천하세요.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요.",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": "당신은 UX 리서처입니다.\n서비스 정보를 보고 가장 핵심적인 타겟 유저 페르소나를 추천하세요.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요."},
+                    {"role": "user", "content": prompt},
+                ],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            raw = resp.content[0].text.strip()
-            data = json.loads(raw)
+            raw = (resp.choices[0].message.content or "").strip()
+            data = try_parse_json(raw)
+            if data is None:
+                raise ValueError(f"JSON 파싱 실패: {raw[:200]}")
             return PersonaRecommendationResponse.model_validate(data)
         except Exception as e:
             logger.warning("페르소나 추천 실패: %s", e)
@@ -87,7 +96,7 @@ class PersonaRecommendationService:
 
 class FeatureRecommendationService:
 
-    def __init__(self, client: AsyncAnthropic, model: str = _DEFAULT_MODEL):
+    def __init__(self, client: AsyncOpenAI, model: str):
         self._client = client
         self._model = model
 
@@ -116,15 +125,20 @@ class FeatureRecommendationService:
 {{"features":[{{"priority":"MUST","featureName":"","description":""}}]}}"""
 
         try:
-            resp = await self._client.messages.create(
+            resp = await self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=1024,
                 temperature=0.3,
-                system="당신은 프로덕트 매니저입니다.\n프로젝트 정보를 보고 필요한 기능을 MoSCoW 우선순위로 추천하세요.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요.",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": "당신은 프로덕트 매니저입니다.\n프로젝트 정보를 보고 필요한 기능을 MoSCoW 우선순위로 추천하세요.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요."},
+                    {"role": "user", "content": prompt},
+                ],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            raw = resp.content[0].text.strip()
-            data = json.loads(raw)
+            raw = (resp.choices[0].message.content or "").strip()
+            data = try_parse_json(raw)
+            if data is None:
+                raise ValueError(f"JSON 파싱 실패: {raw[:200]}")
             return FeatureRecommendationResponse.model_validate(data)
         except Exception as e:
             logger.warning("기능 추천 실패: %s", e)

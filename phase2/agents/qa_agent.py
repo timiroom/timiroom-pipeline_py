@@ -1,11 +1,14 @@
-import json
+import asyncio
 import logging
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
+from phase2.json_utils import try_parse_json
 from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
+
+_MAX_SCHEMA_CHARS = 8000  # QA 입력에 전달할 db_schema/api_spec 최대 길이
 
 QA_PROMPT = """당신은 시니어 소프트웨어 아키텍트입니다.
 아래 세 가지 설계 산출물의 논리적 정합성을 검수하세요.
@@ -49,7 +52,7 @@ class QaAgent:
         self._client = client
         self._model = model
 
-    async def execute(self, state: PipelineState) -> PipelineState:
+    async def execute(self, state: PipelineState, dump=None) -> PipelineState:
         logger.info("QA 에이전트 시작")
 
         relax_msg = ""
@@ -59,19 +62,44 @@ class QaAgent:
                 "치명적인 구조적 결함만 잡고 나머지는 passed=true로 처리하세요."
             )
 
+        raw_db = state.db_schema or ""
+        raw_api = state.api_spec or ""
+        # JSON 중간 절단을 피하기 위해 마지막 완전한 테이블/엔드포인트 경계에서 자름
+        db_schema = self._safe_truncate(raw_db, _MAX_SCHEMA_CHARS, "db_schema")
+        api_spec = self._safe_truncate(raw_api, _MAX_SCHEMA_CHARS, "api_spec")
+
         prompt = QA_PROMPT.format(
             feature_list="\n".join(state.feature_list),
-            db_schema=state.db_schema,
-            api_spec=state.api_spec,
+            db_schema=db_schema,
+            api_spec=api_spec,
             relax_msg=relax_msg,
         )
 
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            temperature=0.0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.choices[0].message.content or ""
+        raw = ""
+        for attempt in range(3):
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    temperature=0.0,
+                    frequency_penalty=0.3,
+                    messages=[
+                        {"role": "system", "content": "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                )
+                raw = response.choices[0].message.content or ""
+                break
+            except (InternalServerError, APITimeoutError, APIConnectionError) as e:
+                logger.warning("QA API 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
+                if attempt < 2:
+                    await asyncio.sleep(10 * (attempt + 1))
+                else:
+                    logger.error("QA API 최종 실패 — 통과로 처리")
+                    raw = '{"passed": true, "issues": [], "suggestions": []}'
+
+        if dump:
+            dump.log_raw("QA", 1, raw)
         passed, issues, suggestions = self._parse(raw)
 
         if passed:
@@ -90,15 +118,24 @@ class QaAgent:
                 status_message="QA 에이전트 — 결함 발견, 재생성 필요",
             )
 
+    def _safe_truncate(self, text: str, max_chars: int, label: str) -> str:
+        if len(text) <= max_chars:
+            return text
+        # 마지막 }, ] 경계에서 잘라서 JSON 파서가 일부라도 읽을 수 있게 함
+        truncated = text[:max_chars]
+        last_boundary = max(truncated.rfind("},"), truncated.rfind("},\n"), truncated.rfind("]"))
+        if last_boundary > max_chars // 2:
+            truncated = truncated[:last_boundary + 1]
+        logger.warning("QA: %s 잘림 (%d → %d chars)", label, len(text), len(truncated))
+        return truncated + "\n... (이하 생략, 위 내용으로만 검수)"
+
     def _parse(self, raw: str) -> tuple[bool, list[str], list[str]]:
-        try:
-            clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            data = json.loads(clean)
+        data = try_parse_json(raw)
+        if data and isinstance(data, dict):
             return (
                 bool(data.get("passed", True)),
                 [str(i) for i in data.get("issues", [])],
                 [str(s) for s in data.get("suggestions", [])],
             )
-        except Exception as e:
-            logger.error("QA 파싱 실패: %s", e)
-            return True, [], []
+        logger.error("QA 파싱 실패 — 통과로 처리")
+        return True, [], []

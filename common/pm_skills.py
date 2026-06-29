@@ -69,10 +69,14 @@ class PmSkillsLoader:
         if not self._skills:
             return ""
 
-        resp = await self._client.embeddings.create(
-            model="text-embedding-3-small", input=query
-        )
-        query_vec = np.array(resp.data[0].embedding, dtype=np.float32)
+        try:
+            resp = await self._client.embeddings.create(
+                model="text-embedding-3-small", input=query
+            )
+            query_vec = np.array(resp.data[0].embedding, dtype=np.float32)
+        except Exception as e:
+            logger.warning("PM 스킬 쿼리 임베딩 실패 — 스킬 없이 진행: %s", e)
+            return ""
 
         scored = sorted(
             self._skills,

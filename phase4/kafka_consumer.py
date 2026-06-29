@@ -85,6 +85,14 @@ class KafkaConsumerService:
         user_query = event.get("userQuery", "")
         logger.info("Kafka 메시지 수신 — pipelineId: %s", pipeline_id)
 
+        base_meta = {
+            "pipeline_id": pipeline_id,
+            "project_name": event.get("projectName", ""),
+            "platform": event.get("platform", ""),
+            "tech_stack": event.get("techStack", []),
+            "query": user_query,
+        }
+
         total = 0
         for field_key, doc_type in [
             ("prdDocument", "prd"),
@@ -94,9 +102,9 @@ class KafkaConsumerService:
         ]:
             text = event.get(field_key, "")
             if text and text.strip():
-                meta = {"type": doc_type, "pipeline_id": pipeline_id, "query": user_query}
+                meta = {**base_meta, "type": doc_type}
                 try:
-                    saved = await self._ingestion.ingest_fixed(text, meta)
+                    saved = await self._ingestion.ingest(text, meta)
                     logger.info("  %s 저장 완료 — %d chunks", doc_type, saved)
                     total += saved
                 except Exception as e:

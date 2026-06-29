@@ -10,14 +10,6 @@ class RetryService:
     def __init__(self, max_retry: int = 3):
         self._max_retry = max_retry
 
-    async def retry(self, state: PipelineState) -> PipelineState:
-        from phase2.orchestration_graph import OrchestrationGraph
-        from phase3.validation_service import ValidationService
-        raise RuntimeError(
-            "RetryService.retry()는 orchestration_graph와 validation_service 인스턴스가 필요합니다. "
-            "OrchestrationController.run_pipeline()에서 직접 호출하세요."
-        )
-
     async def retry_with(
         self,
         state: PipelineState,
@@ -30,7 +22,7 @@ class RetryService:
             logger.warning("최대 재시도 횟수 초과 (%d/%d)", current_retry, self._max_retry)
             return state.copy(status_message="Human-in-the-Loop 필요 — 관리자 검토 요청")
 
-        logger.info("재시도 시작 (%d/%d)", current_retry, self._max_retry)
+        logger.info("Phase 3 재시도 시작 (%d/%d)", current_retry, self._max_retry)
 
         retry_prompt = (
             (state.context_prompt or "")
@@ -45,7 +37,7 @@ class RetryService:
         validated = validation_service.validate(retry_state)
 
         if validated.validated:
-            logger.info("재시도 성공 (%d/%d)", current_retry, self._max_retry)
+            logger.info("Phase 3 재시도 성공 (%d/%d)", current_retry, self._max_retry)
             return validated
 
         return await self.retry_with(validated, orchestration_graph, validation_service)

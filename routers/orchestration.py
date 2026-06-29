@@ -8,9 +8,11 @@ from fastapi import APIRouter, Form, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 
 from common.api_response import ok
+from phase1.form_to_query import FormToQueryService
 from phase1.models import FormData
 from phase1.rag_pipeline import RagPipelineService
 from phase2.orchestration_graph import OrchestrationGraph
+from phase2.state import PipelineState
 from phase2.sse_service import PipelineProgressService
 from phase3.retry_service import RetryService
 from phase3.validation_service import ValidationService
@@ -26,11 +28,11 @@ router = APIRouter(prefix="/api/v1/orchestration", tags=["orchestration"])
 def _services():
     from main import (
         rag_pipeline_service, orchestration_graph, validation_service,
-        retry_service, kafka_producer_service, progress_service,
+        retry_service, kafka_producer_service, progress_service, form_to_query,
     )
     return (
         rag_pipeline_service, orchestration_graph, validation_service,
-        retry_service, kafka_producer_service, progress_service,
+        retry_service, kafka_producer_service, progress_service, form_to_query,
     )
 
 
@@ -38,6 +40,7 @@ def _services():
 async def generate(
     request: Annotated[str, Form()],
     files: list[UploadFile] = File(default=[]),
+    skip_phase1: Annotated[bool, Form()] = False,
 ):
     """
     파이프라인 시작 — 즉시 pipelineId 반환, 파이프라인은 백그라운드 실행.
@@ -46,6 +49,10 @@ async def generate(
     try:
         form_data = FormData.model_validate_json(request)
     except Exception as e:
+        logger.error(
+            "FormData 검증 실패: %s | 수신 JSON 앞 600자: %.600s",
+            e, request,
+        )
         raise HTTPException(status_code=400, detail=f"요청 형식 오류: {e}")
 
     _validate_form(form_data)
@@ -62,11 +69,12 @@ async def generate(
     logger.info("파이프라인 시작 | pipelineId: %s, project: %s",
                 pipeline_id[:8], form_data.project_name)
 
-    (rag_svc, orch, val_svc, retry_svc, kafka_svc, progress_svc) = _services()
+    (rag_svc, orch, val_svc, retry_svc, kafka_svc, progress_svc, form_to_query_svc) = _services()
 
     asyncio.create_task(
         _run_pipeline(pipeline_id, form_data, pdf_bytes,
-                      rag_svc, orch, val_svc, retry_svc, kafka_svc, progress_svc)
+                      rag_svc, orch, val_svc, retry_svc, kafka_svc, progress_svc,
+                      form_to_query_svc, skip_phase1=skip_phase1)
     )
 
     return ok({"pipelineId": pipeline_id})
@@ -75,7 +83,7 @@ async def generate(
 @router.get("/progress/{pipeline_id}")
 async def progress(pipeline_id: str):
     """SSE 구독 — 파이프라인 진행 상황 실시간 수신."""
-    _, _, _, _, _, progress_svc = _services()
+    _, _, _, _, _, progress_svc, _ = _services()
 
     async def event_generator():
         try:
@@ -104,12 +112,31 @@ async def _run_pipeline(
     retry_svc: RetryService,
     kafka_svc: KafkaProducerService,
     progress_svc: PipelineProgressService,
+    form_to_query_svc: FormToQueryService,
+    skip_phase1: bool = False,
 ) -> None:
     try:
         # Phase 1
-        progress_svc.send(pipeline_id, "PHASE1_START", "PDF 파싱 및 검색 준비 중...", 5)
-        state = await rag_svc.build_from_form(form_data, pdf_bytes)
-        progress_svc.send(pipeline_id, "PHASE1_DONE", "검색 컨텍스트 구성 완료", 25)
+        if skip_phase1:
+            progress_svc.send(pipeline_id, "PHASE1_SKIP", "Phase 1 건너뜀 (테스트 모드)", 25)
+            user_query = form_to_query_svc.synthesize(form_data)
+            state = PipelineState(
+                project_name=form_data.project_name,
+                platform=form_data.platform,
+                tech_stack=form_data.tech_stack or [],
+                problem_definition=form_data.problem_definition,
+                target_users=form_data.target_users,
+                must_features=form_to_query_svc.extract_must_features(form_data),
+                excluded_features=form_to_query_svc.extract_excluded_features(form_data),
+                feature_list=form_to_query_svc.extract_all_included_features(form_data),
+                user_query=user_query,
+                context_prompt=user_query,
+                status_message="Phase 1 건너뜀",
+            )
+        else:
+            progress_svc.send(pipeline_id, "PHASE1_START", "PDF 파싱 및 검색 준비 중...", 5)
+            state = await rag_svc.build_from_form(form_data, pdf_bytes)
+            progress_svc.send(pipeline_id, "PHASE1_DONE", "검색 컨텍스트 구성 완료", 25)
 
         # Phase 2
         phase2_state = await orch.run(state, pipeline_id)

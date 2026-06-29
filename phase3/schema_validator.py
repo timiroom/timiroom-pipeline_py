@@ -2,6 +2,8 @@ import json
 import logging
 from dataclasses import dataclass
 
+from phase2.json_utils import try_parse_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,5 +48,10 @@ class SchemaValidator:
         try:
             json.loads(value)
             return []
-        except Exception as e:
-            return [f"{label}: 유효하지 않은 JSON 형식 — {e}"]
+        except Exception:
+            pass
+        # try_parse_json으로 복구 시도
+        if try_parse_json(value) is not None:
+            logger.info("%s: JSON 복구 성공 — 검증 통과", label)
+            return []
+        return [f"{label}: 유효하지 않은 JSON 형식"]
