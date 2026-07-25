@@ -4,10 +4,39 @@ import logging
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
 from common.pm_skills import PmSkillsLoader
-from phase2.json_utils import try_parse_json
+from phase2.json_utils import try_parse_json, has_suspicious_script
 from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
+
+_MAX_FEATURE_NAME_LEN = 60
+_MIN_MEANINGFUL_CHAR_RATIO = 0.5
+_MAX_HYPHEN_SEGMENTS = 4
+
+
+def _is_plausible_feature(name) -> bool:
+    """EXAONE이 토큰 손상으로 뱉는 스크램블된 기능명을 걸러내는 보수적 결정론적 필터.
+    (예: '기구-재물-현황-한다그-보(목록-밀동-2 엘드폰)' 같은 실제 관찰된 손상 사례)"""
+    if not isinstance(name, str) or not name.strip():
+        return False
+    stripped = name.strip()
+    if len(stripped) > _MAX_FEATURE_NAME_LEN:
+        return False
+    if has_suspicious_script(stripped):
+        return False
+    meaningful = sum(1 for ch in stripped if ch.isalnum())
+    non_space = sum(1 for ch in stripped if not ch.isspace())
+    if non_space and meaningful / non_space < _MIN_MEANINGFUL_CHAR_RATIO:
+        return False
+    if stripped.count("-") > _MAX_HYPHEN_SEGMENTS:
+        return False
+    return True
+
+# EXAONE 모델 카드 권장 샘플링 파라미터
+# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+_TEMPERATURE = 1.0
+_TOP_P = 0.95
+_PRESENCE_PENALTY = 0.0
 
 PM_PROMPT = """당신은 시니어 소프트웨어 아키텍트이자 PM입니다.
 아래 요구사항을 분석하여 JSON 형식으로만 응답하세요.
@@ -27,7 +56,7 @@ PM_PROMPT = """당신은 시니어 소프트웨어 아키텍트이자 PM입니�
 
 요구사항:
 {context}
-"""
+{form_features_hint}"""
 
 
 class PmAgent:
@@ -47,9 +76,17 @@ class PmAgent:
             skills_section = ""
             logger.warning("PM 스킬 미적용")
 
+        # 폼에서 추출된 기능 목록을 프롬프트에 명시하여 PM 에이전트가 빠뜨리지 않도록 힌트 제공
+        form_features = state.feature_list or []
+        form_features_hint = (
+            "\n\n[폼에서 입력된 기능 목록 — 반드시 포함하고 더 상세히 확장하세요]\n"
+            + "\n".join(f"- {f}" for f in form_features)
+        ) if form_features else ""
+
         prompt = PM_PROMPT.format(
             skills_section=skills_section,
             context=state.context_prompt,
+            form_features_hint=form_features_hint,
         )
 
         data = None
@@ -57,7 +94,9 @@ class PmAgent:
             try:
                 response = await self._client.chat.completions.create(
                     model=self._model,
-                    temperature=0.1,
+                    temperature=_TEMPERATURE,
+                    top_p=_TOP_P,
+                    presence_penalty=_PRESENCE_PENALTY,
                     frequency_penalty=0.3,
                     messages=[
                         {"role": "system", "content": "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."},
@@ -81,7 +120,14 @@ class PmAgent:
 
         feature_list, dba_instruction, api_instruction = self._extract(data)
 
-        # 파싱 완전 실패 시 기존 state의 feature_list 유지
+        if feature_list:
+            kept = [f for f in feature_list if _is_plausible_feature(f)]
+            dropped = [f for f in feature_list if f not in kept]
+            if dropped:
+                logger.warning("PM featureList — 손상 의심 항목 %d개 제외: %s", len(dropped), dropped)
+            feature_list = kept
+
+        # 파싱 완전 실패 또는 전량 필터링 시 기존 state의 feature_list 유지
         if not feature_list:
             feature_list = state.feature_list or []
             logger.warning("PM feature_list 도출 실패 — 기존 feature_list 유지 (%d개)", len(feature_list))

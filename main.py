@@ -25,7 +25,6 @@ from phase1.semantic_chunking import SemanticChunkingService
 from phase1.form_to_query import FormToQueryService
 from phase1.hybrid_search import HybridSearchService
 from phase1.pdf_parsing import PDFParsingService
-from phase1.query_expansion import QueryExpansionService
 from phase1.rag_pipeline import RagPipelineService
 from phase1.recommendation.services import (
     TechStackRecommendationService,
@@ -33,6 +32,7 @@ from phase1.recommendation.services import (
     FeatureRecommendationService,
 )
 from phase1.reranker import RerankerService
+from phase1.search_rl_service import SearchRLService
 from phase1.session_vector_store import SessionVectorStore
 from phase2.agents.api_agent import ApiAgent
 from phase2.agents.dba_agent import DbaAgent
@@ -55,7 +55,7 @@ _root_logger.setLevel(logging.DEBUG)
 
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(logging.Formatter(
-    "%(asctime)s.%(msecs)03d [%(request_id)s] %(levelname)-5s %(name)s - %(message)s",
+    "%(asctime)s.%(msecs)03d [%(pipeline_id)s] [%(request_id)s] %(levelname)-5s %(name)s - %(message)s",
     datefmt="%H:%M:%S",
 ))
 _handler.addFilter(RequestIdFilter())
@@ -77,28 +77,38 @@ exaone_client = AsyncOpenAI(
 # ── Phase 1 ───────────────────────────────────────────────────────
 
 session_store = SessionVectorStore()
-embedding_service = EmbeddingService(settings.embedding_model)
-pm_skills = PmSkillsLoader(exaone_client)
+embedding_service = EmbeddingService(
+    settings.upstage_api_key,
+    settings.solar_embedding_query_model,
+    settings.solar_embedding_passage_model,
+)
+pm_skills = PmSkillsLoader(embedding_service)
 
-query_expansion = QueryExpansionService(exaone_client, settings.exaone_endpoint_id)
+search_rl_service = SearchRLService(db_url=settings.db_url)
 hybrid_search = HybridSearchService(
     db_url=settings.db_url,
     embedder=embedding_service,
     session_store=session_store,
     top_k_vector=settings.rag_top_k_vector,
     top_k_keyword=settings.rag_top_k_keyword,
+    similarity_threshold=settings.rag_similarity_threshold,
+    min_threshold=settings.rag_min_threshold,
+    min_results=settings.rag_min_results,
+    threshold_step=settings.rag_threshold_step,
+    rl_service=search_rl_service,
 )
 reranker = RerankerService(
-    client=exaone_client,
-    model=settings.exaone_endpoint_id,
     top_k_final=settings.rag_top_k_final,
     enabled=settings.rag_reranker_enabled,
-    cohere_api_key=settings.cohere_api_key,
-    cohere_model=settings.cohere_rerank_model,
     ko_reranker_model=settings.ko_reranker_model,
 )
 form_to_query = FormToQueryService()
-pdf_parsing = PDFParsingService(session_store, embedding_service)
+pdf_chunker = SemanticChunkingService(
+    embedding_service,
+    max_chunk_size=settings.rag_chunk_size,
+    chunk_overlap=settings.rag_chunk_overlap,
+)
+pdf_parsing = PDFParsingService(session_store, embedding_service, pdf_chunker)
 document_ingestion_service = DocumentIngestionService(
     db_url=settings.db_url,
     embedder=embedding_service,
@@ -107,13 +117,12 @@ document_ingestion_service = DocumentIngestionService(
 )
 
 rag_pipeline_service = RagPipelineService(
-    query_expansion=query_expansion,
     hybrid_search=hybrid_search,
     reranker=reranker,
     form_to_query=form_to_query,
     pdf_parsing=pdf_parsing,
     session_store=session_store,
-    top_k_hybrid=settings.rag_top_k_vector,
+    rl_service=search_rl_service,
 )
 
 # ── Phase 1 추천 서비스 ───────────────────────────────────────────
@@ -160,6 +169,7 @@ kafka_consumer_service = KafkaConsumerService(
     topic=settings.kafka_topic_pipeline_result,
     group_id=settings.kafka_consumer_group_id,
     ingestion_service=document_ingestion_service,
+    dead_letter_topic=settings.kafka_topic_dead_letter,
 )
 
 
@@ -194,6 +204,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Type", "Cache-Control", "Transfer-Encoding", "X-Accel-Buffering"],
+    max_age=3600,
 )
 
 from routers.orchestration import router as orchestration_router

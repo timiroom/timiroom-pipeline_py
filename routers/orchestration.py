@@ -8,6 +8,7 @@ from fastapi import APIRouter, Form, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 
 from common.api_response import ok
+from common.logging_middleware import pipeline_id_var
 from phase1.form_to_query import FormToQueryService
 from phase1.models import FormData
 from phase1.rag_pipeline import RagPipelineService
@@ -21,8 +22,10 @@ from phase4.kafka_producer import KafkaProducerService
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+MAX_CONCURRENT_PIPELINES = 10  # Java AsyncConfig.pipelineExecutor(core=4, max=10)에 대응
 
 router = APIRouter(prefix="/api/v1/orchestration", tags=["orchestration"])
+_pipeline_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PIPELINES)
 
 
 def _services():
@@ -115,6 +118,31 @@ async def _run_pipeline(
     form_to_query_svc: FormToQueryService,
     skip_phase1: bool = False,
 ) -> None:
+    token = pipeline_id_var.set(pipeline_id[:8])
+    try:
+        async with _pipeline_semaphore:
+            await _run_pipeline_inner(
+                pipeline_id, form_data, pdf_bytes,
+                rag_svc, orch, val_svc, retry_svc, kafka_svc, progress_svc,
+                form_to_query_svc, skip_phase1,
+            )
+    finally:
+        pipeline_id_var.reset(token)
+
+
+async def _run_pipeline_inner(
+    pipeline_id: str,
+    form_data: FormData,
+    pdf_bytes: list[tuple[str, bytes]],
+    rag_svc: RagPipelineService,
+    orch: OrchestrationGraph,
+    val_svc: ValidationService,
+    retry_svc: RetryService,
+    kafka_svc: KafkaProducerService,
+    progress_svc: PipelineProgressService,
+    form_to_query_svc: FormToQueryService,
+    skip_phase1: bool = False,
+) -> None:
     try:
         # Phase 1
         if skip_phase1:
@@ -147,7 +175,7 @@ async def _run_pipeline(
         validated = val_svc.validate(phase2_state)
         if not validated.validated:
             logger.warning("Phase 3 검증 실패 — RetryService 진입")
-            validated = await retry_svc.retry_with(validated, orch, val_svc)
+            validated = await retry_svc.retry_with(validated, orch, val_svc, pipeline_id=pipeline_id)
 
         if not validated.validated:
             logger.warning("HITL 요청 | 자동 검증 실패")

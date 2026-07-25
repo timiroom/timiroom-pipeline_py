@@ -6,6 +6,29 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# 한국어/영어 응답 맥락에서 나타날 수 없는 스크립트 — EXAONE이 드물게 토큰을 잘못
+# 생성해 태국어·아랍/페르시아어·일본어 등이 섞여 나오는 오염을 감지한다.
+_SUSPICIOUS_SCRIPT_RE = re.compile(
+    r'[؀-ۿݐ-ݿ'  # 아랍/페르시아
+    r'฀-๿'                # 태국
+    r'ऀ-ॿ'                # 데바나가리
+    r'֐-׿'                # 히브리
+    r'Ѐ-ӿ'                # 키릴
+    r'぀-ゟ'                # 히라가나
+    r'゠-ヿ]'               # 가타카나
+)
+
+
+def has_suspicious_script(node) -> bool:
+    """파싱된 JSON 트리 안에 예상치 못한 스크립트가 섞여 있으면 True."""
+    if isinstance(node, str):
+        return bool(_SUSPICIOUS_SCRIPT_RE.search(node))
+    if isinstance(node, dict):
+        return any(has_suspicious_script(v) for v in node.values())
+    if isinstance(node, list):
+        return any(has_suspicious_script(v) for v in node)
+    return False
+
 
 def try_parse_json(raw: str) -> dict | list | None:
     """마크다운·태그 제거 후 JSON 파싱. 깨진 경우 복구 시도."""
@@ -88,6 +111,13 @@ def try_parse_json(raw: str) -> dict | list | None:
             )
         except Exception:
             logger.debug("try_parse_json: 6단계 모두 실패. 오류=%s | 앞 300자: %s", e6, repaired[:300])
+
+    # 6.5) 마지막으로 파싱 가능한 요소 경계까지만 잘라내고 나머지 괄호를 닫는 구제 수단
+    #      토큰 반복 루프나 응답 잘림으로 배열/객체 중간이 손상된 경우,
+    #      이미 완성된 앞부분만이라도 살려서 반환한다 (전체 폐기보다 부분 성공이 낫다)
+    salvaged = _salvage_last_valid_boundary(add_comma)
+    if salvaged is not None:
+        return salvaged
 
     # 7) ast.literal_eval 폴백
     #    EXAONE이 Python dict 스타일로 출력할 때:
@@ -263,6 +293,27 @@ def _find_json_start(text: str) -> str:
         return text[brace:]
     bracket = text.find('[')
     return text[bracket:] if bracket != -1 else ""
+
+
+def _salvage_last_valid_boundary(text: str) -> dict | list | None:
+    """토큰 반복 루프·응답 잘림으로 배열/객체 요소 중간이 손상된 경우,
+    마지막으로 완결된 객체(`}`) 경계까지만 남기고 나머지 열린 괄호를 닫아 파싱을 시도한다.
+    뒤에서부터 시도해 가장 많은 내용이 살아남는 경계를 우선 채택한다 —
+    전체를 폐기하는 것보다 이미 완성된 앞부분이라도 살리는 편이 낫다.
+    """
+    positions = [i for i, ch in enumerate(text) if ch == '}']
+    for pos in reversed(positions[-200:]):
+        candidate = _close_brackets(text[:pos + 1])
+        try:
+            node = json.loads(candidate)
+            logger.warning(
+                "try_parse_json: 마지막 유효 객체 경계(%d/%d자)까지 잘라내어 부분 복구",
+                pos + 1, len(text),
+            )
+            return node
+        except Exception:
+            continue
+    return None
 
 
 def _close_brackets(text: str) -> str:

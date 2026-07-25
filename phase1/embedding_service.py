@@ -1,54 +1,41 @@
-import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-EMBED_DIM = 1024
+EMBED_DIM = 4096
 
-try:
-    from sentence_transformers import SentenceTransformer
-    _ST_AVAILABLE = True
-except ImportError:
-    _ST_AVAILABLE = False
-    logger.warning(
-        "sentence_transformers 미설치 — EmbeddingService 비활성화 (Phase 1 skip 모드에서는 영향 없음). "
-        "활성화하려면: pip install sentence-transformers"
-    )
+UPSTAGE_BASE_URL = "https://api.upstage.ai/v1"
 
 
 class EmbeddingService:
     """
-    sentence-transformers 기반 로컬 임베딩 서비스.
-    sentence_transformers 미설치 시 stub으로 동작 (Phase 1 skip 모드 전용).
+    Upstage Solar Embedding API 기반 임베딩 서비스.
+    query/passage 모델이 분리돼 있어 용도에 맞는 메서드를 사용해야 한다.
     """
 
-    def __init__(self, model_name: str = "nlpai-lab/KURE-v1"):
-        if _ST_AVAILABLE:
-            logger.info("임베딩 모델 로딩 시작: %s", model_name)
-            self._model = SentenceTransformer(model_name)
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
-            logger.info("임베딩 모델 로딩 완료")
-        else:
-            self._model = None
-            self._executor = None
+    def __init__(
+        self,
+        api_key: str,
+        query_model: str = "solar-embedding-2-query",
+        passage_model: str = "solar-embedding-2-passage",
+    ):
+        self._client = AsyncOpenAI(api_key=api_key, base_url=UPSTAGE_BASE_URL)
+        self._query_model = query_model
+        self._passage_model = passage_model
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        if not _ST_AVAILABLE or self._model is None:
-            raise RuntimeError("sentence_transformers 미설치 — 임베딩 불가. pip install sentence-transformers")
-        loop = asyncio.get_event_loop()
-        vecs: np.ndarray = await loop.run_in_executor(
-            self._executor,
-            lambda: self._model.encode(
-                texts,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            ),
-        )
-        return vecs.tolist()
+        """문서/패시지 임베딩 (ingestion, chunking 등 저장 대상 텍스트)."""
+        resp = await self._client.embeddings.create(model=self._passage_model, input=texts)
+        return [d.embedding for d in resp.data]
 
-    async def embed_one(self, text: str) -> list[float]:
-        results = await self.embed([text])
-        return results[0]
+    async def embed_query(self, text: str) -> list[float]:
+        """단일 검색 쿼리 임베딩."""
+        resp = await self._client.embeddings.create(model=self._query_model, input=text)
+        return resp.data[0].embedding
+
+    async def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """복수 검색 쿼리 임베딩."""
+        resp = await self._client.embeddings.create(model=self._query_model, input=texts)
+        return [d.embedding for d in resp.data]

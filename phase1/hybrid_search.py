@@ -11,12 +11,17 @@ from pgvector.psycopg2 import register_vector
 
 from common.document_chunk import DocumentChunk
 from .embedding_service import EmbeddingService
+from .search_rl_service import SearchParams, SearchRLService
 from .session_vector_store import SessionVectorStore
 
 logger = logging.getLogger(__name__)
 
 RRF_K = 60
 SESSION_BOOST = 1.5
+
+# Phase1 검색 대상 타입 — ERD·API는 JSON 구조라 의미 벡터 품질이 낮고 노이즈가 됨 (rag-pipeline과 동일)
+_SEARCH_TYPES = ("prd", "market_research", "features")
+_SEARCH_TYPE_SQL = "AND metadata->>'type' IN ('prd', 'market_research', 'features')"
 
 _SEARCH_TAGS = {"NNG", "NNP", "NNB", "SL", "SH"}
 _kiwi = Kiwi()
@@ -31,23 +36,33 @@ class HybridSearchService:
         session_store: SessionVectorStore,
         top_k_vector: int = 20,
         top_k_keyword: int = 20,
+        similarity_threshold: float = 0.3,
+        min_threshold: float = 0.1,
+        min_results: int = 5,
+        threshold_step: float = 0.1,
+        rl_service: SearchRLService | None = None,
     ):
         self._db_url = db_url
         self._embedder = embedder
         self._session_store = session_store
         self._top_k_vector = top_k_vector
         self._top_k_keyword = top_k_keyword
+        self._similarity_threshold = similarity_threshold
+        self._min_threshold = min_threshold
+        self._min_results = min_results
+        self._threshold_step = threshold_step
+        self._rl_service = rl_service
 
     def _get_conn(self):
         conn = psycopg2.connect(self._db_url)
         register_vector(conn)
         return conn
 
-    async def search(self, query: str, top_k: int) -> list[DocumentChunk]:
+    async def search(self, query: str, top_k: int, threshold: float | None = None) -> list[DocumentChunk]:
         """벡터·키워드 검색을 병렬 실행 후 RRF 합산."""
         loop = asyncio.get_running_loop()
         vector_results, keyword_results = await asyncio.gather(
-            self._vector_search(query),
+            self._vector_search(query, threshold),
             loop.run_in_executor(None, self._keyword_search, query),
         )
         rrf_results = self._rrf(vector_results, keyword_results, top_k)
@@ -57,9 +72,13 @@ class HybridSearchService:
         )
         return rrf_results
 
-    async def search_multiple(self, queries: list[str], top_k: int) -> list[DocumentChunk]:
+    async def search_multiple(
+        self, queries: list[str], top_k: int, threshold: float | None = None
+    ) -> list[DocumentChunk]:
         """쿼리 목록을 병렬 실행하고 RRF로 크로스쿼리 합산."""
-        all_results = await asyncio.gather(*[self.search(query, top_k) for query in queries])
+        all_results = await asyncio.gather(
+            *[self.search(query, top_k, threshold) for query in queries]
+        )
 
         scores: dict[str, float] = defaultdict(float)
         chunks: dict[str, DocumentChunk] = {}
@@ -77,20 +96,41 @@ class HybridSearchService:
     async def search_with_session(
         self, queries: list[str], session_id: str
     ) -> list[DocumentChunk]:
-        global_results = await self.search_multiple(queries, self._top_k_vector)
+        """RL 연동 메인 진입점 — RagPipelineService에서 호출.
+
+        1. SearchRLService.get_params()로 epsilon-greedy 파라미터 선택
+        2. 파라미터(임계값)로 Hybrid Search 수행
+        3. 세션 PDF 청크가 있으면 RRF로 병합
+        4. 결과를 RL 로그에 기록 → 리랭커 피드백 대기
+        """
+        if self._rl_service is not None:
+            params = self._rl_service.get_params()
+            logger.debug(
+                "RL 파라미터 선택 — vw:%.2f kw:%.2f st:%.4f",
+                params.vector_weight, params.keyword_weight, params.similarity_threshold,
+            )
+            threshold = params.similarity_threshold
+        else:
+            params = SearchParams(1.0, 1.0, self._similarity_threshold)
+            threshold = self._similarity_threshold
+
+        global_results = await self.search_multiple(queries, self._top_k_vector, threshold)
 
         if self._session_store.has_session(session_id):
             session_chunks = self._session_store.get(session_id)
             session_results = await self._session_similarity_search(queries, session_chunks)
-            return self._rrf(global_results, session_results, self._top_k_vector)
+            global_results = self._rrf(global_results, session_results, self._top_k_vector)
+
+        if self._rl_service is not None:
+            self._rl_service.log_search(session_id, params, len(global_results))
 
         return global_results
 
-    async def _vector_search(self, query: str) -> list[DocumentChunk]:
+    async def _vector_search(self, query: str, threshold: float | None = None) -> list[DocumentChunk]:
         try:
-            query_vec = await self._embedder.embed_one(query)
+            query_vec = await self._embedder.embed_query(query)
             loop = asyncio.get_running_loop()
-            chunks = await loop.run_in_executor(None, self._vector_search_sync, query_vec)
+            chunks = await loop.run_in_executor(None, self._vector_search_sync, query_vec, threshold)
             if chunks:
                 logger.info(
                     "[Vector] %d 건 | 최고점수=%.4f | 최저점수=%.4f",
@@ -103,22 +143,32 @@ class HybridSearchService:
             logger.warning("벡터 검색 실패: %s", e)
             return []
 
-    def _vector_search_sync(self, query_vec: list[float]) -> list[DocumentChunk]:
+    def _vector_search_sync(
+        self, query_vec: list[float], threshold_override: float | None = None
+    ) -> list[DocumentChunk]:
         conn = self._get_conn()
         try:
+            threshold = threshold_override if threshold_override is not None else self._similarity_threshold
+            rows = []
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    SELECT id, content, metadata,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM document_chunks
-                    WHERE 1 - (embedding <=> %s::vector) >= 0.5
-                    ORDER BY score DESC
-                    LIMIT %s
-                    """,
-                    (query_vec, query_vec, self._top_k_vector),
-                )
-                rows = cur.fetchall()
+                while True:
+                    cur.execute(
+                        f"""
+                        SELECT id, content, metadata,
+                               1 - (embedding <=> %s::vector) AS score
+                        FROM document_chunks
+                        WHERE 1 - (embedding <=> %s::vector) >= %s
+                          {_SEARCH_TYPE_SQL}
+                        ORDER BY score DESC
+                        LIMIT %s
+                        """,
+                        (query_vec, query_vec, threshold, self._top_k_vector),
+                    )
+                    rows = cur.fetchall()
+
+                    if len(rows) >= self._min_results or threshold - self._threshold_step < self._min_threshold:
+                        break
+                    threshold -= self._threshold_step
         finally:
             conn.close()
 
@@ -145,12 +195,13 @@ class HybridSearchService:
             try:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(
-                        """
+                        f"""
                         SELECT id, content, metadata,
                                ts_rank(tokens, to_tsquery('simple', %s)) AS rank
                         FROM document_chunks
                         WHERE tokens IS NOT NULL
                           AND tokens @@ to_tsquery('simple', %s)
+                          {_SEARCH_TYPE_SQL}
                         ORDER BY rank DESC
                         LIMIT %s
                         """,
@@ -192,7 +243,7 @@ class HybridSearchService:
 
         if chunks[0].embedding is not None:
             try:
-                query_vecs = await self._embedder.embed(queries)
+                query_vecs = await self._embedder.embed_queries(queries)
                 avg_vec = np.mean(
                     [np.array(v, dtype=np.float32) for v in query_vecs], axis=0
                 )

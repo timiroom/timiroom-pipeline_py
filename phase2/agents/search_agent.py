@@ -9,6 +9,12 @@ logger = logging.getLogger(__name__)
 
 LABELS = ["시장규모/경쟁사", "Pain Point", "법규", "기술트렌드", "사용자통계"]
 
+# EXAONE 모델 카드 권장 샘플링 파라미터
+# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+_TEMPERATURE = 1.0
+_TOP_P = 0.95
+_PRESENCE_PENALTY = 0.0
+
 
 class SearchAgent:
 
@@ -94,7 +100,9 @@ class SearchAgent:
         resp = await self._client.chat.completions.create(
             model=self._model,
             max_tokens=2000,
-            temperature=0.2,
+            temperature=_TEMPERATURE,
+            top_p=_TOP_P,
+            presence_penalty=_PRESENCE_PENALTY,
             messages=[{"role": "user", "content": prompt}],
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
@@ -105,7 +113,9 @@ class SearchAgent:
             resp = await self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=100,
-                temperature=0,
+                temperature=_TEMPERATURE,
+                top_p=_TOP_P,
+                presence_penalty=_PRESENCE_PENALTY,
                 messages=[
                     {
                         "role": "system",

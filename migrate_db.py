@@ -35,13 +35,13 @@ cur.execute("""
 """)
 row = cur.fetchone()
 atttypmod = row[0] if row else -1
-print(f"  embedding atttypmod: {atttypmod} (1024이면 정상, -1이면 차원 미지정)")
+print(f"  embedding atttypmod: {atttypmod} (4096이면 정상, -1이면 차원 미지정)")
 
-if atttypmod != 1024:
-    print("  embedding 컬럼을 vector(1024)로 재생성...")
+if atttypmod != 4096:
+    print("  embedding 컬럼을 vector(4096)로 재생성 (Solar 임베딩 전환) — 기존 임베딩 데이터는 소실되므로 재수집 필요")
     cur.execute("ALTER TABLE document_chunks DROP COLUMN embedding")
-    cur.execute("ALTER TABLE document_chunks ADD COLUMN embedding vector(1024)")
-    print("  [OK] embedding vector(1024) 재생성")
+    cur.execute("ALTER TABLE document_chunks ADD COLUMN embedding vector(4096)")
+    print("  [OK] embedding vector(4096) 재생성 — reembed_documents.py로 재수집 필요")
 
 # 4. GIN 인덱스
 cur.execute("""
@@ -69,12 +69,33 @@ cur.execute("""
 """)
 print("  [OK] content_hash UNIQUE 컬럼 + 제약조건")
 
-# 6. HNSW 벡터 인덱스
+# 6. 벡터 인덱스는 생성하지 않음 — pgvector HNSW/IVFFlat은 vector 타입 기준 2000차원,
+#    halfvec으로도 4000차원이 한계라 4096차원 Solar 임베딩은 인덱싱 불가. 순차 스캔 사용.
+cur.execute("DROP INDEX IF EXISTS idx_chunks_embedding")
+print("  [OK] 벡터 인덱스 없이 순차 스캔 사용 (구 HNSW 인덱스 있었다면 제거)")
+
+# 7. Phase1 SearchRLService (phase1/search_rl_service.py) 테이블
 cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-    ON document_chunks USING hnsw (embedding vector_cosine_ops)
+    CREATE TABLE IF NOT EXISTS rl_params (
+        id                   INT PRIMARY KEY,
+        similarity_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.3,
+        total_runs           BIGINT NOT NULL DEFAULT 0,
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
 """)
-print("  [OK] idx_chunks_embedding HNSW 인덱스")
+cur.execute("INSERT INTO rl_params (id, similarity_threshold) VALUES (1, 0.3) ON CONFLICT (id) DO NOTHING")
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS rl_search_log (
+        pipeline_id          TEXT PRIMARY KEY,
+        vector_weight        DOUBLE PRECISION NOT NULL,
+        keyword_weight       DOUBLE PRECISION NOT NULL,
+        similarity_threshold DOUBLE PRECISION NOT NULL,
+        chunk_count          INT NOT NULL,
+        avg_cohere_score     DOUBLE PRECISION,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+""")
+print("  [OK] rl_params / rl_search_log 테이블 (SearchRLService)")
 
 conn.commit()
 conn.close()

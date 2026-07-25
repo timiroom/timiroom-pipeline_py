@@ -4,14 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # ── 로컬 임베딩 (sentence-transformers) ──────────────────────
-    # nlpai-lab/KURE-v1: bge-m3 기반 한국어 특화 파인튜닝, 1024차원
-    # 대안: BAAI/bge-m3 (멀티링구얼), jhgan/ko-sroberta-multitask (768차원, 경량)
-    embedding_model: str = "nlpai-lab/KURE-v1"
-
-    # ── Anthropic ─────────────────────────────────────────────────
-    anthropic_api_key: str = ""
-    anthropic_chat_model: str = "claude-sonnet-4-20250514"
+    # ── Upstage Solar 임베딩 ─────────────────────────────────────
+    # query/passage 전용 모델이 분리되어 있음 (동일 벡터 공간)
+    upstage_api_key: str = ""
+    solar_embedding_query_model: str = "solar-embedding-2-query"
+    solar_embedding_passage_model: str = "solar-embedding-2-passage"
 
     # ── K-EXAONE (Friendli.ai) ────────────────────────────────────
     exaone_api_key: str = ""
@@ -26,10 +23,6 @@ class Settings(BaseSettings):
     kafka_topic_dead_letter: str = "rag.pipeline.result.DLT"
     kafka_consumer_group_id: str = "rag-pipeline-group"
 
-    # ── Cohere ────────────────────────────────────────────────────
-    cohere_api_key: str = ""
-    cohere_rerank_model: str = "rerank-multilingual-v3.0"
-
     # ── 로컬 Ko-Reranker ──────────────────────────────────────────
     # Dongjin-kr/ko-reranker: bge-reranker-large 기반 한국어 파인튜닝
     # 빈 문자열로 설정 시 비활성화
@@ -42,6 +35,10 @@ class Settings(BaseSettings):
     rag_top_k_keyword: int = 20
     rag_top_k_final: int = 5
     rag_reranker_enabled: bool = True
+    rag_similarity_threshold: float = 0.3
+    rag_min_threshold: float = 0.1
+    rag_min_results: int = 5
+    rag_threshold_step: float = 0.1
 
     # ── Agent 타임아웃 (초) ───────────────────────────────────────
     agent_stream_timeout: int = 90

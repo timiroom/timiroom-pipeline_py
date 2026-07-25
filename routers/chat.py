@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter
 from openai import InternalServerError, APITimeoutError, APIConnectionError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from common.api_response import ok
 from phase1.models import FormData, MoSCoW, PlatformType
@@ -13,6 +13,12 @@ from phase2.json_utils import try_parse_json
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
+
+# EXAONE 모델 카드 권장 샘플링 파라미터
+# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+_TEMPERATURE = 1.0
+_TOP_P = 0.95
+_PRESENCE_PENALTY = 0.0
 
 
 def _exaone_endpoint_id() -> str:
@@ -99,18 +105,20 @@ class ChatMessageDto(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessageDto]
+    messages: list[ChatMessageDto] = Field(min_length=1, description="메시지 목록이 비어있습니다")
 
 
-async def _call_exaone(client, messages: list[dict], max_tokens: int, temperature: float = 0.7) -> str:
+async def _call_exaone(client, messages: list[dict], max_tokens: int) -> str:
     """EXAONE 호출 (재시도 3회)"""
     for attempt in range(3):
         try:
             resp = await client.chat.completions.create(
                 model=_exaone_endpoint_id(),
                 max_tokens=max_tokens,
+                temperature=_TEMPERATURE,
+                top_p=_TOP_P,
+                presence_penalty=_PRESENCE_PENALTY,
                 frequency_penalty=0.3,
-                temperature=temperature,
                 response_format={"type": "json_object"},
                 messages=messages,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
@@ -279,7 +287,7 @@ async def _generate_dynamic_suggestions(
             {"role": "user", "content": dynamic_prompt}
         ]
         
-        raw = await _call_exaone(client, messages_for_suggestions, max_tokens=500, temperature=0.8)
+        raw = await _call_exaone(client, messages_for_suggestions, max_tokens=500)
         node = try_parse_json(raw)
         
         if node and isinstance(node, dict):
@@ -329,7 +337,7 @@ async def _generate_project_name_candidates(messages: list[ChatMessageDto], clie
             {"role": "user", "content": name_prompt}
         ]
         
-        raw = await _call_exaone(client, name_msgs, max_tokens=500, temperature=0.8)
+        raw = await _call_exaone(client, name_msgs, max_tokens=500)
         node = try_parse_json(raw)
         
         if node and isinstance(node, dict):
@@ -359,7 +367,7 @@ async def _synthesize_form_data(messages: list[ChatMessageDto], client) -> dict 
 
     for attempt in range(2):
         try:
-            raw = await _call_exaone(client, synthesis_msgs, max_tokens=2000, temperature=0.5)
+            raw = await _call_exaone(client, synthesis_msgs, max_tokens=4000)
             logger.debug("Synthesis attempt %d raw (%.500s)", attempt + 1, raw)
 
             node = try_parse_json(raw)
@@ -436,8 +444,8 @@ async def message(req: ChatRequest) -> dict:
         
         # 동적 생성도 실패하면 재시도
         if not suggestions:
-            logger.warning("동적 생성 실패 — EXAONE 재호출 (temperature 증가)")
-            raw2 = await _call_exaone(exaone_client, collection_messages, max_tokens=800, temperature=0.9)
+            logger.warning("동적 생성 실패 — EXAONE 재호출")
+            raw2 = await _call_exaone(exaone_client, collection_messages, max_tokens=800)
             node2 = try_parse_json(raw2)
             if node2 and isinstance(node2, dict):
                 s2 = (node2.get("suggestions") or node2.get("sugations") or node2.get("suggestion") or [])
@@ -485,8 +493,9 @@ async def message(req: ChatRequest) -> dict:
             # 2단계: FormData 합성 (user_msg_count >= 8 또는 이름 생성 실패)
             form_data = await _synthesize_form_data(req.messages, exaone_client)
             if form_data:
-                # user_msg_count >= 8이면 마지막 user 메시지가 프로젝트명
-                if user_msg_count >= 8 and len(req.messages) > 0:
+                # user_msg_count == 8일 때만 마지막 user 메시지가 프로젝트명
+                # (9 이상은 합성 실패 후 추가로 수집한 보충 설명이므로 이름이 아님 — LLM 합성 결과를 신뢰)
+                if user_msg_count == 8 and len(req.messages) > 0:
                     last_user_msg = None
                     for m in reversed(req.messages):
                         if m.role == "user":

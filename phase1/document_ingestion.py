@@ -72,31 +72,31 @@ class DocumentIngestionService:
         try:
             with conn.cursor() as cur:
                 for i, (text, vec) in enumerate(zip(texts, embeddings)):
-                    meta = {**metadata, "chunk_index": i}
-                    tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
-                    content_hash = hashlib.md5(text.encode()).hexdigest()
-                    cur.execute(
-                        """
-                        INSERT INTO document_chunks (id, content, content_hash, metadata, embedding, tokens)
-                        VALUES (%s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
-                        ON CONFLICT (content_hash) DO NOTHING
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            text,
-                            content_hash,
-                            json.dumps(meta, ensure_ascii=False),
-                            str(vec),
-                            tokens_text,
-                        ),
-                    )
-                    if cur.rowcount > 0:
-                        saved += 1
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logger.error("청크 저장 실패: %s", e)
-            raise
+                    try:
+                        meta = {**metadata, "chunk_index": i}
+                        tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
+                        content_hash = hashlib.md5(text.encode()).hexdigest()
+                        cur.execute(
+                            """
+                            INSERT INTO document_chunks (id, content, content_hash, metadata, embedding, tokens)
+                            VALUES (%s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
+                            ON CONFLICT (content_hash) DO NOTHING
+                            """,
+                            (
+                                str(uuid.uuid4()),
+                                text,
+                                content_hash,
+                                json.dumps(meta, ensure_ascii=False),
+                                str(vec),
+                                tokens_text,
+                            ),
+                        )
+                        if cur.rowcount > 0:
+                            saved += 1
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning("청크 저장 실패 (건너뜀) — index %d: %s", i, e)
         finally:
             conn.close()
         return saved

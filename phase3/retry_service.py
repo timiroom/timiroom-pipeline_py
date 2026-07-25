@@ -15,6 +15,7 @@ class RetryService:
         state: PipelineState,
         orchestration_graph,
         validation_service,
+        pipeline_id: str | None = None,
     ) -> PipelineState:
         current_retry = state.retry_count + 1
 
@@ -31,13 +32,16 @@ class RetryService:
             + "\n\n위 오류를 반드시 수정해서 다시 생성해주세요."
         )
 
-        retry_state = await orchestration_graph.execute(state.user_query, retry_prompt)
-        retry_state = retry_state.copy(retry_count=current_retry)
+        # feature_list/project_name/platform 등 기존 state를 그대로 보존하고
+        # context_prompt만 재시도 피드백으로 교체 — 문자열만으로 새 state를 만들면
+        # Phase1/2에서 이미 구축된 정보가 전부 소실된다.
+        retry_state = state.copy(context_prompt=retry_prompt, retry_count=current_retry)
+        result = await orchestration_graph.run(retry_state, pipeline_id)
 
-        validated = validation_service.validate(retry_state)
+        validated = validation_service.validate(result)
 
         if validated.validated:
             logger.info("Phase 3 재시도 성공 (%d/%d)", current_retry, self._max_retry)
             return validated
 
-        return await self.retry_with(validated, orchestration_graph, validation_service)
+        return await self.retry_with(validated, orchestration_graph, validation_service, pipeline_id)
