@@ -32,6 +32,7 @@ class HybridSearchService:
     def __init__(
         self,
         db_url: str,
+        document_table: str,
         embedder: EmbeddingService,
         session_store: SessionVectorStore,
         top_k_vector: int = 20,
@@ -43,6 +44,7 @@ class HybridSearchService:
         rl_service: SearchRLService | None = None,
     ):
         self._db_url = db_url
+        self._document_table = document_table
         self._embedder = embedder
         self._session_store = session_store
         self._top_k_vector = top_k_vector
@@ -156,7 +158,7 @@ class HybridSearchService:
                         f"""
                         SELECT id, content, metadata,
                                1 - (embedding <=> %s::vector) AS score
-                        FROM document_chunks
+                        FROM {self._document_table}
                         WHERE 1 - (embedding <=> %s::vector) >= %s
                           {_SEARCH_TYPE_SQL}
                         ORDER BY score DESC
@@ -198,7 +200,7 @@ class HybridSearchService:
                         f"""
                         SELECT id, content, metadata,
                                ts_rank(tokens, to_tsquery('simple', %s)) AS rank
-                        FROM document_chunks
+                        FROM {self._document_table}
                         WHERE tokens IS NOT NULL
                           AND tokens @@ to_tsquery('simple', %s)
                           {_SEARCH_TYPE_SQL}

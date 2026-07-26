@@ -1,4 +1,19 @@
 services:
+  pipeline:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DB_URL: postgresql://user:password@postgres:5432/timiroom
+      PORT: "8080"
+      RAG_DOCUMENT_TABLE: document_chunks
+      KO_RERANKER_MODEL: ""
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   postgres:
     image: pgvector/pgvector:pg16
     environment:
@@ -10,6 +25,11 @@ services:
     volumes:
       - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d timiroom"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata:

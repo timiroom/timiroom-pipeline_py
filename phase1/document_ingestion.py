@@ -24,11 +24,13 @@ class DocumentIngestionService:
     def __init__(
         self,
         db_url: str,
+        document_table: str,
         embedder: EmbeddingService,
         chunk_size: int = 512,
         chunk_overlap: int = 64,
     ):
         self._db_url = db_url
+        self._document_table = document_table
         self._embedder = embedder
         self._semantic_chunker = SemanticChunkingService(
             embedder, max_chunk_size=chunk_size, chunk_overlap=chunk_overlap
@@ -77,8 +79,8 @@ class DocumentIngestionService:
                         tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
                         content_hash = hashlib.md5(text.encode()).hexdigest()
                         cur.execute(
-                            """
-                            INSERT INTO document_chunks (id, content, content_hash, metadata, embedding, tokens)
+                            f"""
+                            INSERT INTO {self._document_table} (id, content, content_hash, metadata, embedding, tokens)
                             VALUES (%s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
                             ON CONFLICT (content_hash) DO NOTHING
                             """,

@@ -1,7 +1,4 @@
-"""
-document_chunks.embedding 컬럼을 Solar 임베딩(passage 모델)으로 재수집한다.
-migrate_db.py로 embedding 컬럼을 vector(4096)으로 재생성한 뒤 1회 실행.
-"""
+"""RAG_DOCUMENT_TABLE의 빈 임베딩을 Solar passage 모델로 재수집한다."""
 import asyncio
 
 import psycopg2
@@ -15,6 +12,7 @@ BATCH_SIZE = 50
 
 
 async def main() -> None:
+    table_name = settings.get_rag_document_table()
     embedder = EmbeddingService(
         settings.upstage_api_key,
         settings.solar_embedding_query_model,
@@ -25,7 +23,7 @@ async def main() -> None:
     register_vector(conn)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT id, content FROM document_chunks WHERE embedding IS NULL")
+            cur.execute(f"SELECT id, content FROM {table_name} WHERE embedding IS NULL")
             rows = cur.fetchall()
 
         print(f"재임베딩 대상: {len(rows)}건")
@@ -38,7 +36,7 @@ async def main() -> None:
             with conn.cursor() as cur:
                 for row, vec in zip(batch, vectors):
                     cur.execute(
-                        "UPDATE document_chunks SET embedding = %s::vector WHERE id = %s",
+                        f"UPDATE {table_name} SET embedding = %s::vector WHERE id = %s",
                         (vec, row["id"]),
                     )
             conn.commit()

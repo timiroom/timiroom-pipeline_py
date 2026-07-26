@@ -1,0 +1,66 @@
+name: Deploy Python RAG pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_TAG: sha-${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/timiroom-pipeline-py:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: Install kubeseal
+        run: |
+          wget -q https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.27.3/kubeseal-0.27.3-linux-amd64.tar.gz
+          tar -xzf kubeseal-0.27.3-linux-amd64.tar.gz kubeseal
+          sudo mv kubeseal /usr/local/bin/
+
+      - name: Update NAS GitOps image and sealed secret
+        env:
+          ALL_SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          git clone https://${{ secrets.GH_PAT }}@github.com/timiroom/timiroom-ops.git
+          cd timiroom-ops/apps/rag-pipeline
+          kustomize edit set image rag-pipeline-image=${{ secrets.DOCKER_USERNAME }}/timiroom-pipeline-py:${{ env.IMAGE_TAG }}
+
+          echo "$ALL_SECRETS_JSON" \
+            | jq -r 'to_entries[] | select(.key | startswith("PIPELINE_")) | "\(.key | sub("^PIPELINE_"; ""))=\(.value)"' \
+            > temp-secrets.env
+          test -s temp-secrets.env
+          kubectl create secret generic rag-pipeline-secrets -n timiroom \
+            --from-env-file=temp-secrets.env --dry-run=client -o yaml > plain-secret.yaml
+          kubeseal --format=yaml --cert=pub-cert.pem \
+            < plain-secret.yaml > sealed-secret.yaml
+          rm -f temp-secrets.env plain-secret.yaml
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add kustomization.yaml sealed-secret.yaml
+          git commit -m "chore: deploy Python RAG pipeline [${{ env.IMAGE_TAG }}]"
+          git push

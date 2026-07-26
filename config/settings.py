@@ -1,4 +1,13 @@
+import re
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def validate_sql_identifier(value: str) -> str:
+    """환경변수로 받은 테이블명이 SQL 식별자로 안전한지 확인한다."""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
+        raise ValueError("RAG_DOCUMENT_TABLE은 영문, 숫자, 밑줄로만 구성해야 합니다")
+    return value
 
 
 class Settings(BaseSettings):
@@ -16,6 +25,8 @@ class Settings(BaseSettings):
 
     # ── PostgreSQL ────────────────────────────────────────────────
     db_url: str = "postgresql://localhost:5432/timiroom"
+    # 기존 Spring 임베딩(vector(1024))과 Solar(vector(4096))를 분리할 수 있다.
+    rag_document_table: str = "document_chunks"
 
     # ── Kafka ─────────────────────────────────────────────────────
     kafka_bootstrap_servers: str = "localhost:9092"
@@ -52,6 +63,9 @@ class Settings(BaseSettings):
 
     def get_allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]
+
+    def get_rag_document_table(self) -> str:
+        return validate_sql_identifier(self.rag_document_table)
 
 
 settings = Settings()

@@ -87,6 +87,7 @@ pm_skills = PmSkillsLoader(embedding_service)
 search_rl_service = SearchRLService(db_url=settings.db_url)
 hybrid_search = HybridSearchService(
     db_url=settings.db_url,
+    document_table=settings.get_rag_document_table(),
     embedder=embedding_service,
     session_store=session_store,
     top_k_vector=settings.rag_top_k_vector,
@@ -111,6 +112,7 @@ pdf_chunker = SemanticChunkingService(
 pdf_parsing = PDFParsingService(session_store, embedding_service, pdf_chunker)
 document_ingestion_service = DocumentIngestionService(
     db_url=settings.db_url,
+    document_table=settings.get_rag_document_table(),
     embedder=embedding_service,
     chunk_size=settings.rag_chunk_size,
     chunk_overlap=settings.rag_chunk_overlap,
@@ -225,6 +227,16 @@ register_exception_handlers(app)
 
 @app.get("/actuator/health")
 def health():
+    return {"status": "UP"}
+
+
+@app.get("/actuator/health/liveness")
+def liveness():
+    return {"status": "UP"}
+
+
+@app.get("/actuator/health/readiness")
+def readiness():
     return {"status": "UP"}
 
 

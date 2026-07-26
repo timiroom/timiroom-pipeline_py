@@ -29,9 +29,6 @@ httpx>=0.27.0
 # SSE
 sse-starlette>=2.1.0
 
-# 로컬 리랭커 (CrossEncoder, ko-reranker)
-sentence-transformers>=3.0.0
-
 # 벡터 계산
 numpy>=1.26.0
 
