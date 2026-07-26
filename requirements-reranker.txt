@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# 선택 기능: 로컬 CrossEncoder 기반 한국어 리랭커
+# NAS 기본 이미지는 EXAONE/Upstage API 중심으로 운영하므로 설치하지 않는다.
+sentence-transformers>=3.0.0

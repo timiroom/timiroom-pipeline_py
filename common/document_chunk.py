@@ -9,3 +9,4 @@ class DocumentChunk:
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
     relevance_score: float | None = None
+    embedding: list[float] | None = None

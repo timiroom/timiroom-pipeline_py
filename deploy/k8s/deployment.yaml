@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-pipeline
+  namespace: timiroom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-pipeline
+  template:
+    metadata:
+      labels:
+        app: rag-pipeline
+    spec:
+      initContainers:
+        - name: migrate
+          image: chunwol/timiroom-pipeline-py:latest
+          command: ["python", "migrate_db.py"]
+          env:
+            - name: RAG_DOCUMENT_TABLE
+              value: document_chunks_ko
+          envFrom:
+            - secretRef:
+                name: rag-pipeline-secrets
+      containers:
+        - name: rag-pipeline
+          image: chunwol/timiroom-pipeline-py:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: RAG_DOCUMENT_TABLE
+              value: document_chunks_ko
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:9092
+            - name: ALLOWED_ORIGINS
+              value: https://timiroom.kro.kr
+            - name: KO_RERANKER_MODEL
+              value: ""
+          envFrom:
+            - secretRef:
+                name: rag-pipeline-secrets
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 120
+            periodSeconds: 20

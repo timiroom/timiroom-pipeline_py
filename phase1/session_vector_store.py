@@ -10,13 +10,16 @@ class SessionVectorStore:
 
     def put(self, session_id: str, chunks: list[DocumentChunk]) -> None:
         with self._lock:
-            self._store[session_id] = chunks
+            existing = self._store.get(session_id)
+            self._store[session_id] = existing + chunks if existing else chunks
 
     def get(self, session_id: str) -> list[DocumentChunk]:
-        return self._store.get(session_id, [])
+        with self._lock:
+            return self._store.get(session_id, [])
 
     def has_session(self, session_id: str) -> bool:
-        return session_id in self._store
+        with self._lock:
+            return session_id in self._store
 
     def clear(self, session_id: str) -> None:
         with self._lock:

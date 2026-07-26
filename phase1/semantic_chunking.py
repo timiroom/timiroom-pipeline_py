@@ -3,14 +3,13 @@ import re
 import uuid
 
 import numpy as np
-from openai import AsyncOpenAI
 
 from common.document_chunk import DocumentChunk
+from .embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
 SIMILARITY_THRESHOLD = 0.75
-EMBED_MODEL = "text-embedding-3-large"
 
 
 class SemanticChunkingService:
@@ -22,11 +21,10 @@ class SemanticChunkingService:
     4. 최대 크기 초과 시 강제 분할
     """
 
-    def __init__(self, client: AsyncOpenAI, max_chunk_size: int = 512, chunk_overlap: int = 64, embed_model: str = "text-embedding-3-large"):
-        self._client = client
+    def __init__(self, embedder: EmbeddingService, max_chunk_size: int = 512, chunk_overlap: int = 64):
+        self._embedder = embedder
         self._max_size = max_chunk_size
         self._overlap = chunk_overlap
-        self._embed_model = embed_model
 
     async def chunk(self, text: str, metadata: dict) -> list[DocumentChunk]:
         logger.debug("Semantic Chunking 시작 — 문서 길이: %d chars", len(text))
@@ -47,8 +45,8 @@ class SemanticChunkingService:
         return [s.strip() for s in parts if s.strip()]
 
     async def _embed_sentences(self, sentences: list[str]) -> list[np.ndarray]:
-        resp = await self._client.embeddings.create(model=self._embed_model, input=sentences)
-        return [np.array(item.embedding, dtype=np.float32) for item in resp.data]
+        vecs = await self._embedder.embed(sentences)
+        return [np.array(v, dtype=np.float32) for v in vecs]
 
     def _detect_boundaries(self, embeddings: list[np.ndarray]) -> list[int]:
         boundaries = [0]

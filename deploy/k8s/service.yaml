@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-pipeline-svc
+  namespace: timiroom
+spec:
+  type: ClusterIP
+  selector:
+    app: rag-pipeline
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

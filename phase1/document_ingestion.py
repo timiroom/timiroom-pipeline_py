@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -5,17 +7,15 @@ import uuid
 import psycopg2
 import psycopg2.extras
 from kiwipiepy import Kiwi
-from openai import AsyncOpenAI
 from pgvector.psycopg2 import register_vector
 
+from .embedding_service import EmbeddingService
 from .semantic_chunking import SemanticChunkingService
 
 logger = logging.getLogger(__name__)
 
 _kiwi = Kiwi()
 
-EMBED_MODEL = "text-embedding-3-large"
-# Kafka consumer path용 고정 크기 청크 (SemanticChunking 미사용)
 KAFKA_CHUNK_SIZE = 800
 
 
@@ -24,16 +24,16 @@ class DocumentIngestionService:
     def __init__(
         self,
         db_url: str,
-        client: AsyncOpenAI,
+        document_table: str,
+        embedder: EmbeddingService,
         chunk_size: int = 512,
         chunk_overlap: int = 64,
-        embed_model: str = "text-embedding-3-large",
     ):
         self._db_url = db_url
-        self._client = client
-        self._embed_model = embed_model
+        self._document_table = document_table
+        self._embedder = embedder
         self._semantic_chunker = SemanticChunkingService(
-            client, max_chunk_size=chunk_size, chunk_overlap=chunk_overlap, embed_model=embed_model
+            embedder, max_chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )
 
     def _get_conn(self):
@@ -42,10 +42,6 @@ class DocumentIngestionService:
         return conn
 
     async def ingest(self, content: str, metadata: dict) -> int:
-        """
-        Semantic Chunking → 임베딩 → pgvector 저장.
-        /api/v1/rag/ingest 엔드포인트 전용.
-        """
         logger.info("문서 수집 시작 — source: %s", metadata.get("source", "unknown"))
         chunks = await self._semantic_chunker.chunk(content, metadata)
         texts = [c.content for c in chunks]
@@ -54,10 +50,7 @@ class DocumentIngestionService:
         return saved
 
     async def ingest_fixed(self, content: str, metadata: dict) -> int:
-        """
-        고정 크기 청크 → 임베딩 → pgvector 저장.
-        Kafka Consumer path 전용 (Java KafkaConsumerService와 동일).
-        """
+        """고정 크기 청크 → 임베딩 → pgvector 저장. Kafka Consumer path 전용."""
         texts = self._split_fixed(content, KAFKA_CHUNK_SIZE)
         return await self._embed_and_store(texts, metadata)
 
@@ -71,39 +64,43 @@ class DocumentIngestionService:
     async def _embed_and_store(self, texts: list[str], metadata: dict) -> int:
         if not texts:
             return 0
+        embeddings = await self._embedder.embed(texts)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._store_to_db, texts, embeddings, metadata)
 
-        resp = await self._client.embeddings.create(model=self._embed_model, input=texts)
-        embeddings = [item.embedding for item in resp.data]
-
+    def _store_to_db(self, texts: list[str], embeddings: list[list[float]], metadata: dict) -> int:
         conn = self._get_conn()
         saved = 0
         try:
             with conn.cursor() as cur:
                 for i, (text, vec) in enumerate(zip(texts, embeddings)):
-                    meta = {**metadata, "chunk_index": i}
-                    tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
-                    cur.execute(
-                        """
-                        INSERT INTO document_chunks (id, content, metadata, embedding, tokens)
-                        VALUES (%s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            text,
-                            json.dumps(meta, ensure_ascii=False),
-                            str(vec),
-                            tokens_text,
-                        ),
-                    )
-                    saved += 1
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logger.error("청크 저장 실패: %s", e)
-            raise
+                    try:
+                        meta = {**metadata, "chunk_index": i}
+                        tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
+                        content_hash = hashlib.md5(text.encode()).hexdigest()
+                        cur.execute(
+                            f"""
+                            INSERT INTO {self._document_table} (id, content, content_hash, metadata, embedding, tokens)
+                            VALUES (%s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
+                            ON CONFLICT (content_hash) DO NOTHING
+                            """,
+                            (
+                                str(uuid.uuid4()),
+                                text,
+                                content_hash,
+                                json.dumps(meta, ensure_ascii=False),
+                                str(vec),
+                                tokens_text,
+                            ),
+                        )
+                        if cur.rowcount > 0:
+                            saved += 1
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning("청크 저장 실패 (건너뜀) — index %d: %s", i, e)
         finally:
             conn.close()
-
         return saved
 
     @staticmethod

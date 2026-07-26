@@ -5,7 +5,8 @@ from typing import ClassVar
 
 import httpx
 import numpy as np
-from openai import AsyncOpenAI
+
+from phase1.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +49,8 @@ class SkillEntry:
 
 
 class PmSkillsLoader:
-    def __init__(self, openai_client: AsyncOpenAI):
-        self._client = openai_client
+    def __init__(self, embedding_service: EmbeddingService):
+        self._embedder = embedding_service
         self._skills: list[SkillEntry] = []
 
     async def load(self) -> None:
@@ -69,16 +70,22 @@ class PmSkillsLoader:
         if not self._skills:
             return ""
 
-        resp = await self._client.embeddings.create(
-            model="text-embedding-3-small", input=query
-        )
-        query_vec = np.array(resp.data[0].embedding, dtype=np.float32)
+        try:
+            vec = await self._embedder.embed_query(query)
+            query_vec = np.array(vec, dtype=np.float32)
+        except Exception as e:
+            logger.warning("PM 스킬 쿼리 임베딩 실패 — 스킬 없이 진행: %s", e)
+            return ""
 
         scored = sorted(
             self._skills,
             key=lambda s: self._cosine(query_vec, s.embedding),
             reverse=True,
         )[:top_k]
+
+        logger.info("━━━ PM 스킬 RAG 선택 결과 (상위 %d/%d) ━━━", len(scored), len(self._skills))
+        for i, s in enumerate(scored, 1):
+            logger.info("  [%d] %s (similarity: %.3f)", i, s.slug, self._cosine(query_vec, s.embedding))
 
         parts = ["\n\n---\n## 관련 PM 방법론 (적용 필수)",
                  "아래는 이 프로젝트에 가장 관련된 PM 프레임워크입니다. 산출물 생성 시 실제로 적용하세요.\n"]
@@ -87,15 +94,18 @@ class PmSkillsLoader:
         return "\n".join(parts)
 
     async def _fetch_all(self) -> list[tuple[str, str]]:
+        semaphore = asyncio.Semaphore(10)
+
         async def fetch_one(slug: str) -> tuple[str, str] | None:
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    r = await client.get(RAW_BASE.format(slug=slug))
-                    if r.status_code == 200 and r.text.strip():
-                        return (slug, r.text.strip())
-            except Exception as e:
-                logger.warning("PM 스킬 fetch 실패: %s — %s", slug, e)
-            return None
+            async with semaphore:
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        r = await client.get(RAW_BASE.format(slug=slug))
+                        if r.status_code == 200 and r.text.strip():
+                            return (slug, r.text.strip())
+                except Exception as e:
+                    logger.warning("PM 스킬 fetch 실패: %s — %s", slug, e)
+                return None
 
         results = await asyncio.gather(*[fetch_one(s) for s in SKILL_SLUGS])
         return [r for r in results if r is not None]
@@ -106,12 +116,9 @@ class PmSkillsLoader:
             batch = raw_skills[i:i + batch_size]
             texts = [content for _, content in batch]
             try:
-                resp = await self._client.embeddings.create(
-                    model="text-embedding-3-small", input=texts
-                )
-                for j, (slug, content) in enumerate(batch):
-                    vec = np.array(resp.data[j].embedding, dtype=np.float32)
-                    self._skills.append(SkillEntry(slug=slug, content=content, embedding=vec))
+                vecs = await self._embedder.embed(texts)
+                for (slug, content), vec in zip(batch, vecs):
+                    self._skills.append(SkillEntry(slug=slug, content=content, embedding=np.array(vec, dtype=np.float32)))
             except Exception as e:
                 logger.warning("PM 스킬 임베딩 실패 (배치 %d): %s", i // batch_size, e)
 

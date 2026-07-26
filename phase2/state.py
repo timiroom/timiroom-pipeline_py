@@ -38,6 +38,12 @@ class PipelineState:
     last_validation_error: str = ""
     validated: bool = False
 
+    # QA 에이전트 결과 (선택적 재시도용 카테고리별 결함 + 품질 점수)
+    qa_quality_score: float = 0.0
+    qa_db_issues: list[str] = field(default_factory=list)
+    qa_api_issues: list[str] = field(default_factory=list)
+    qa_prd_issues: list[str] = field(default_factory=list)
+
     # Search 에이전트
     market_research: str = ""
 

@@ -7,6 +7,9 @@ pydantic-settings>=2.5.0
 # OpenAI
 openai>=1.50.0
 
+# LangGraph (PRD 에이전트 manager/worker 서브그래프)
+langgraph>=0.2
+
 # PostgreSQL + pgvector
 psycopg2-binary>=2.9.10
 pgvector>=0.3.0
