@@ -40,10 +40,6 @@ class Settings(BaseSettings):
     rag_min_results: int = 5
     rag_threshold_step: float = 0.1
 
-    # ── Agent 타임아웃 (초) ───────────────────────────────────────
-    agent_stream_timeout: int = 90
-    agent_sync_timeout: int = 60
-
     # ── 검증 ─────────────────────────────────────────────────────
     validation_max_retry: int = 3
 

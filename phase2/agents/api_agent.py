@@ -9,7 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
-from phase2.feature_coverage import uncovered_features, missing_features_note
+from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note
 from phase2.json_utils import try_parse_json, has_suspicious_script
 from phase2.state import PipelineState
 
@@ -32,25 +32,37 @@ _PRESENCE_PENALTY = 0.0
 # temp=1.0은 실행마다 편차를 키우므로 이 단계만 낮춰 완성도/재현성을 높인다.
 _PLAN_TEMPERATURE = 0.4
 
+# plan 생성 배치 크기 — 한 번에 담당할 기능 수.
+# 기능 전체(21개)를 한 프롬프트에 넣으면 EXAONE이 요구량의 1/3 수준에서 멈춘다(실측 12/42).
+_PLAN_BATCH_SIZE = 4
+_ENDPOINTS_PER_FEATURE = 2
+_AUTH_ENDPOINT_COUNT = 4  # 회원가입/로그인/토큰갱신/로그아웃
+
+_AUTHENTICATION_DESC = (
+    "JWT Bearer 토큰 방식. 로그인 시 발급받은 accessToken을 "
+    "Authorization: Bearer <token> 헤더로 전송한다."
+)
+
 WORKER_SYSTEM = "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."
 
 MANAGER_SYSTEM = """당신은 시니어 백엔드 아키텍트 겸 API manager입니다.
 JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."""
 
 PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
-아래 지시사항과 컨텍스트를 바탕으로 이 서비스에 필요한 전체 REST API 엔드포인트 목록(스켈레톤)과
-인증 방식을 설계하세요. 상세 스펙(requestBody/successResponse/errorCodes)은 이후 단계에서 채울 것이므로
+아래 지시사항과 컨텍스트를 바탕으로, **담당 기능들**에 필요한 REST API 엔드포인트 목록(스켈레톤)을
+설계하세요. 상세 스펙(requestBody/successResponse/errorCodes)은 이후 단계에서 채울 것이므로
 지금은 엔드포인트의 method/path/description/인증 필요 여부만 결정하세요.
 
 설계 규칙:
-- 회원가입, 로그인, 토큰 갱신, 로그아웃 등 인증 흐름에 필요한 엔드포인트를 반드시 포함
-- RESTful 설계: 명사형 복수형 경로, 반드시 영문 소문자·숫자·하이픈(-)만 사용 (예: /api/v1/book-clubs)
+{auth_rule}- RESTful 설계: 명사형 복수형 경로, 반드시 영문 소문자·숫자·하이픈(-)만 사용 (예: /api/v1/book-clubs)
 - path에 한글, 공백, 괄호(), 콜론(:), 쉼표 등은 절대 사용 금지 — 기능명이 한글이어도
   의미를 압축한 영문 리소스명으로 직접 번역해서 사용 (예: "재료 등록(바코드 스캔)" 기능 → /api/v1/ingredients, 절대 /api/v1/재료-등록-(바코드-스캔) 처럼 쓰지 말 것)
-- 아래 기능들 각각에 대해 실제로 필요한 조회·생성·수정·삭제 엔드포인트를 빠짐없이 설계
+- **담당 기능 하나하나마다** 실제로 필요한 조회·생성·수정·삭제 엔드포인트를 빠짐없이 설계
+- description은 반드시 "기능명: 설명" 형태로 시작해 어느 기능에 대응하는지 드러낼 것
 - 목록 조회 엔드포인트는 페이지네이션이 필요함을 description에 명시
-- 최소 {min_endpoints}개 이상의 엔드포인트를 설계하세요
-
+- 담당 기능은 {feature_count}개이므로 최소 {min_endpoints}개 이상의 엔드포인트가 나와야 합니다
+- 담당 기능 밖의 엔드포인트는 만들지 마세요 (다른 담당자가 설계합니다)
+{existing_note}
 응답 형식 (JSON만):
 {{
   "plan": [
@@ -60,8 +72,7 @@ PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
       "description": "기능명: 이 API가 하는 일 한 줄 설명",
       "authRequired": true 또는 false
     }}
-  ],
-  "authentication": "JWT Bearer 토큰 방식. 로그인 후 accessToken을 Authorization: Bearer {{token}} 헤더로 전송."
+  ]
 }}
 
 지시사항:
@@ -70,9 +81,26 @@ PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
 컨텍스트 (DB 스키마 포함):
 {context}
 
-기능 목록:
+담당 기능 목록 ({feature_count}개):
 {feature_str}
 """
+
+_AUTH_RULE = (
+    "- 회원가입, 로그인, 토큰 갱신, 로그아웃 등 인증 흐름에 필요한 엔드포인트를 반드시 포함\n"
+)
+
+
+def _existing_paths_note(paths: list[str] | None) -> str:
+    """이미 설계된 'METHOD path' 목록을 프롬프트에 주입 — 배치 간 중복 설계를 줄인다.
+    배치들이 서로 모르는 채 같은 리소스를 설계하면 병합 시 중복 제거로 총 개수가 깎인다
+    (실측: 배치 3개 목표 24개 → 병합 후 11개)."""
+    if not paths:
+        return ""
+    listed = "\n".join(f"  - {p}" for p in paths)
+    return (
+        "\n- ⚠️ 아래는 이미 설계된 엔드포인트입니다. 똑같은 method+path를 다시 만들지 말고,\n"
+        "  담당 기능에 필요한데 아직 없는 것만 새로 설계하세요:\n" + listed + "\n"
+    )
 
 ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
 아래 엔드포인트 스켈레톤 1개에 대한 상세 REST API 스펙을 JSON으로 작성하세요.
@@ -84,9 +112,16 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
 - authRequired: {auth_required}
 
 설계 규칙:
-- requestBody와 successResponse는 반드시 문자열로 작성 (객체 금지)
-- 목록 조회 엔드포인트라면 requestBody에 page, size 쿼리 파라미터 포함
+- requestBody와 successResponse는 반드시 문자열로 작성 (객체 금지).
+  각 필드를 "필드명: 타입 — 설명" 형태로 쉼표로 이어서 나열한다.
+- 쿼리 파라미터·경로 파라미터는 requestBody가 아니라 parameters 배열에 넣는다.
+  GET·DELETE처럼 본문이 없는 메서드의 requestBody는 정확히 "없음" 이라고만 쓴다.
+- 목록 조회 엔드포인트라면 parameters에 page, size를 반드시 포함하고,
+  정렬·필터가 필요하면 그것도 파라미터로 추가한다
+- 경로에 {{id}} 같은 자리표시자가 있으면 parameters에 in="path"로 반드시 포함
+- successResponse는 DB 스키마의 실제 컬럼명과 어긋나지 않게 작성
 - errorCodes는 "코드 — 설명" 형식으로 2개 이상 작성
+- 위 지시문의 예시 문구("없으면 없음", "필드명" 등)를 값에 그대로 옮겨 쓰지 말 것 — 실제 내용만
 
 응답 형식 (JSON만, method/path/description/authRequired는 위 값 그대로 유지):
 {{
@@ -94,8 +129,11 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
   "path": "{path}",
   "description": "{description}",
   "authRequired": {auth_required},
-  "requestBody": "field1: 타입 (설명) — 없으면 없음",
-  "successResponse": "field1: 타입 — 반환 데이터 설명",
+  "parameters": [
+    {{"in": "query 또는 path", "name": "파라미터명", "type": "string/integer/boolean", "required": true 또는 false, "description": "설명"}}
+  ],
+  "requestBody": "본문이 없으면 없음",
+  "successResponse": "반환 필드들",
   "errorCodes": "401 — 인증 실패, 404 — 리소스 없음"
 }}
 
@@ -203,60 +241,121 @@ class ApiAgent:
             status_message="API 에이전트 완료 — API 스펙 생성",
         )
 
-    async def _manager_plan_node(self, state: dict) -> dict:
-        ctx = state["ctx"]
-        min_endpoints = max(4, len(ctx["feature_list"]) * 2)
+    async def _plan_batch(
+        self, ctx: dict, batch: list[str], batch_idx: int, with_auth: bool,
+        existing_paths: list[str] | None = None,
+    ) -> list[dict]:
+        """기능 몇 개만 담당하는 plan 배치 하나를 생성한다.
+
+        기능 21개에 엔드포인트 42개를 한 번에 요구하면 EXAONE이 12개쯤에서 멈춰
+        (실측) 레시피·알림·장보기 같은 기능군이 통째로 빠진 채 통과됐다. 담당 범위를
+        좁히면 요구 개수가 배치당 8~10개로 내려가 실제로 채워진다."""
+        min_endpoints = len(batch) * _ENDPOINTS_PER_FEATURE + (_AUTH_ENDPOINT_COUNT if with_auth else 0)
         prompt = PLAN_PROMPT.format(
             instruction=ctx["instruction"],
             context=ctx["context"],
-            feature_str=ctx["feature_str"],
+            feature_str="- " + "\n- ".join(batch),
+            feature_count=len(batch),
             min_endpoints=min_endpoints,
+            auth_rule=_AUTH_RULE if with_auth else "",
+            existing_note=_existing_paths_note(existing_paths),
         )
+        label = f"API_MANAGER_PLAN_{batch_idx}"
 
-        data = None
-        best: dict | None = None
-        best_uncovered = None
+        best: list[dict] = []
         for attempt in range(3):
-            raw = await self._call(prompt, max_tokens=16384, system=MANAGER_SYSTEM, enable_thinking=False, temperature=_PLAN_TEMPERATURE)
+            raw = await self._call(
+                prompt, max_tokens=8192, system=MANAGER_SYSTEM,
+                enable_thinking=False, temperature=_PLAN_TEMPERATURE,
+            )
             if ctx.get("dump"):
-                ctx["dump"].log_raw("API_MANAGER_PLAN", attempt + 1, raw)
+                ctx["dump"].log_raw(label, attempt + 1, raw)
             candidate = try_parse_json(raw)
-            bad_paths = _invalid_paths(candidate.get("plan")) if candidate and isinstance(candidate.get("plan"), list) else []
-            plan_list = candidate.get("plan") if candidate and isinstance(candidate.get("plan"), list) else []
-            missing = uncovered_features(ctx["feature_list"], [ep.get("description", "") for ep in plan_list if isinstance(ep, dict)])
-            if best_uncovered is None or len(missing) < best_uncovered:
-                best, best_uncovered = candidate, len(missing)
-            if (
-                candidate and isinstance(candidate.get("plan"), list)
-                and len(candidate["plan"]) >= min_endpoints
-                and not has_suspicious_script(candidate)
-                and not bad_paths
-                and not missing
-            ):
-                data = candidate
+            if not (candidate and isinstance(candidate.get("plan"), list)) or has_suspicious_script(candidate):
+                logger.warning("%s 파싱 실패/오염 (attempt %d) — 재생성", label, attempt + 1)
+                continue
+            plan_list = [ep for ep in candidate["plan"] if isinstance(ep, dict)]
+            missing = uncovered_features(batch, [ep.get("description", "") for ep in plan_list])
+            if len(plan_list) > len(best):
+                best = plan_list
+            if len(plan_list) >= min_endpoints and not _invalid_paths(plan_list) and not missing:
+                return plan_list
+            logger.warning(
+                "%s 개수 부족/경로 오류/커버리지 미달 (attempt %d) — %d/%d개, 미반영 기능: %s — 재생성",
+                label, attempt + 1, len(plan_list), min_endpoints, missing,
+            )
+        logger.warning("%s 재생성 한도 도달 — 최선의 결과(%d개)로 진행", label, len(best))
+        return best
+
+    @staticmethod
+    def _merge_plans(batches: list[list[dict]]) -> list[dict]:
+        """배치별 plan을 'METHOD path' 기준으로 중복 제거하며 합친다."""
+        merged, seen = [], set()
+        for plan in batches:
+            for ep in plan:
+                if not isinstance(ep, dict):
+                    continue
+                key = (str(ep.get("method", "")).upper(), str(ep.get("path", "")).rstrip("/"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(ep)
+        return merged
+
+    async def _manager_plan_node(self, state: dict) -> dict:
+        ctx = state["ctx"]
+        feature_list = ctx["feature_list"] or []
+        min_endpoints = max(4, len(feature_list) * _ENDPOINTS_PER_FEATURE)
+
+        # 기능을 배치로 쪼개 병렬 설계 — 배치당 요구 개수가 작아야 EXAONE이 실제로 채운다
+        batches = [
+            feature_list[i:i + _PLAN_BATCH_SIZE]
+            for i in range(0, len(feature_list), _PLAN_BATCH_SIZE)
+        ] or [[]]
+        logger.info("API manager_plan — 기능 %d개를 %d개 배치로 분할", len(feature_list), len(batches))
+
+        results = await asyncio.gather(*[
+            self._plan_batch(ctx, batch, i + 1, with_auth=(i == 0))
+            for i, batch in enumerate(batches)
+        ])
+        plan = self._merge_plans(results)
+
+        # 배치들이 서로 모르는 채 같은 리소스를 설계해 병합 시 중복 제거로 개수가 깎인다.
+        # 흔적이 없는 기능(uncovered)뿐 아니라 엔드포인트가 부족한 기능(undercovered)까지
+        # 모아, 이미 설계된 경로를 알려주고 '없는 것만' 추가로 받아낸다. 최대 2라운드.
+        for round_ in range(2):
+            descriptions = [ep.get("description", "") for ep in plan]
+            missing = uncovered_features(feature_list, descriptions)
+            thin = undercovered_features(feature_list, descriptions, _ENDPOINTS_PER_FEATURE)
+            need = missing + [f for f in thin if f not in missing]
+            if not need or len(plan) >= min_endpoints:
                 break
             logger.warning(
-                "API manager_plan 파싱 실패/개수 부족/경로 오류/기능 커버리지 미달 (attempt %d) — %d/%d개, "
-                "잘못된 경로: %s, 미반영 기능: %s — 재생성",
-                attempt + 1, len(plan_list), min_endpoints, bad_paths, missing,
+                "API manager_plan 보충 %d라운드 — 현재 %d/%d개, 미반영 %d개·부족 %d개: %s",
+                round_ + 1, len(plan), min_endpoints, len(missing), len(thin), need,
             )
+            topup = await self._plan_batch(
+                ctx, need, len(batches) + round_ + 1, with_auth=False,
+                existing_paths=[f"{ep.get('method')} {ep.get('path')}" for ep in plan],
+            )
+            merged = self._merge_plans([plan, topup])
+            if len(merged) == len(plan):
+                logger.warning("API manager_plan 보충 %d라운드 — 새 엔드포인트 없음, 중단", round_ + 1)
+                break
+            plan = merged
 
-        if not data:
-            data = best
-            if best_uncovered:
-                logger.warning("API manager_plan — 커버리지 기준 미달이지만 재생성 한도 도달, 최선의 결과로 진행")
-        if not data:
+        if not plan:
             logger.error("API manager_plan 최종 실패 — feature_list 기반 fallback 스켈레톤 사용")
-            data = self._fallback_plan(ctx["feature_list"])
-        elif _invalid_paths(data.get("plan")):
+            plan = self._fallback_plan(feature_list)["plan"]
+        elif _invalid_paths(plan):
             logger.warning("API manager_plan — 경로 형식 오류가 남아있어 강제 살균 적용")
-            data["plan"] = _sanitize_plan_paths(data["plan"])
+            plan = _sanitize_plan_paths(plan)
 
-        plan = data.get("plan") or self._fallback_plan(ctx["feature_list"])["plan"]
-        authentication = data.get("authentication") or "JWT Bearer 토큰"
+        if len(plan) < min_endpoints:
+            logger.warning("API manager_plan — 엔드포인트 %d/%d개로 목표 미달", len(plan), min_endpoints)
 
-        logger.info("API manager_plan 완료 — 엔드포인트 %d개 계획", len(plan))
-        return {"plan": plan, "authentication": authentication}
+        logger.info("API manager_plan 완료 — 엔드포인트 %d개 계획 (목표 %d개)", len(plan), min_endpoints)
+        return {"plan": plan, "authentication": _AUTHENTICATION_DESC}
 
     def _fallback_plan(self, feature_list: list[str]) -> dict:
         plan = [
@@ -491,6 +590,111 @@ def _is_garbage_endpoint(ep: dict) -> bool:
     return False
 
 
+_PATH_PARAM_RE = re.compile(r'\{(\w+)\}')
+_BODYLESS_METHODS = {"GET", "DELETE", "HEAD"}
+# 프롬프트 응답 형식 예시가 통째로 복사돼 나온 값 — 내용이 없으므로 기본값으로 교체
+_SPEC_ECHO_EXACT = {
+    "field1: 타입 (설명) — 없으면 없음",
+    "field1: 타입 — 반환 데이터 설명",
+    "필드명: 타입 — 설명",
+    "본문이 없으면 없음",
+    "반환 필드들",
+    "없으면 없음",
+}
+# 실제 내용 뒤에 예시 문구만 눌어붙은 경우 (실측: "barcode: 문자열 (바코드 번호 — 스캔 시 입력, 없으면 없음)")
+# — 문구만 떼어내고 나머지 내용은 살린다
+_SPEC_ECHO_TAIL_RE = re.compile(r'[,;]?\s*(?:—\s*)?없으면\s*없음')
+_EMPTY_PARENS_RE = re.compile(r'\(\s*\)')
+
+
+def _normalize_parameters(ep: dict) -> None:
+    """parameters 배열을 정규화하고, path에 있는 {id} 자리표시자를 빠짐없이 채운다.
+    프론트(ApiSpecPanel)가 이미 이 구조를 렌더링하는데 백엔드가 한 번도 채우지 않아
+    쿼리 파라미터가 requestBody 문자열에 뭉뚱그려져 있었다."""
+    raw = ep.get("parameters")
+    params: list[dict] = []
+    seen: set[str] = set()
+    for p in raw if isinstance(raw, list) else []:
+        if isinstance(p, str):
+            p = {"name": p}
+        if not isinstance(p, dict) or not str(p.get("name") or "").strip():
+            continue
+        name = str(p["name"]).strip()
+        if name in seen:
+            continue
+        seen.add(name)
+        location = str(p.get("in") or "").strip().lower()
+        params.append({
+            "in": location if location in ("query", "path", "header") else "query",
+            "name": name,
+            "type": str(p.get("type") or "string").strip(),
+            "required": bool(p.get("required", False)),
+            "description": str(p.get("description") or "").strip(),
+        })
+
+    for name in _PATH_PARAM_RE.findall(str(ep.get("path") or "")):
+        if name in seen:
+            continue
+        seen.add(name)
+        params.append({
+            "in": "path", "name": name,
+            "type": "integer" if name.lower().endswith("id") else "string",
+            "required": True, "description": f"{name} 값",
+        })
+
+    if params:
+        ep["parameters"] = params
+    else:
+        ep.pop("parameters", None)
+
+
+# "page: 정수 — 페이지 번호" 처럼 나열된 한 항목에서 이름과 타입을 뽑는다
+_BODY_FIELD_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]{0,39})\s*[:：]\s*([^—(]*)')
+_MAX_SALVAGED_PARAMS = 8
+
+
+def _param_type(raw: str) -> str:
+    t = raw.strip().lower()
+    if any(k in t for k in ("정수", "숫자", "int", "number", "long")):
+        return "integer"
+    if any(k in t for k in ("불리언", "bool")):
+        return "boolean"
+    return "string"
+
+
+def _body_to_query_params(text: str) -> list[dict]:
+    """본문 없는 메서드의 requestBody에 뭉뚱그려진 필드 나열을 쿼리 파라미터로 회수.
+    (실측: GET /api/v1/ingredients 의 page·size·category 가 requestBody 문자열에 들어 있었다)
+    형식을 못 읽는 항목은 조용히 건너뛴다 — 최선 노력 복구."""
+    salvaged = []
+    for chunk in text.split(","):
+        match = _BODY_FIELD_RE.match(chunk)
+        if not match:
+            continue
+        salvaged.append({
+            "in": "query",
+            "name": match.group(1),
+            "type": _param_type(match.group(2)),
+            "required": False,
+            "description": chunk.strip(),
+        })
+        if len(salvaged) >= _MAX_SALVAGED_PARAMS:
+            break
+    return salvaged
+
+
+def _clean_spec_field(value, fallback: str) -> str:
+    """프롬프트 예시 문구가 그대로 복사된 값을 걸러낸다.
+    값 전체가 예시면 기본값으로 바꾸고, 실제 내용 뒤에 예시 문구만 붙었으면 그 부분만 떼어낸다."""
+    text = str(value or "").strip()
+    if not text or text in _SPEC_ECHO_EXACT:
+        return fallback
+    cleaned = _SPEC_ECHO_TAIL_RE.sub("", text)
+    cleaned = _EMPTY_PARENS_RE.sub("", cleaned)
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip(" ,;—-")
+    return cleaned or fallback
+
+
 def _normalize_endpoints(endpoints: list) -> list:
     """manager 패치/QA 재작성으로 유입된 불완전 엔드포인트에 필수 필드 기본값을 채우고,
     내용이 통째로 오염된(추론/메타텍스트 유출) 엔드포인트는 드롭한다.
@@ -509,11 +713,21 @@ def _normalize_endpoints(endpoints: list) -> list:
         ep.setdefault("authRequired", True)
         if not str(ep.get("description") or "").strip():
             ep["description"] = f"{ep.get('method')} {ep.get('path')}"
-        if not str(ep.get("requestBody") or "").strip():
-            ep["requestBody"] = "없음"
-        if not str(ep.get("successResponse") or "").strip():
-            ep["successResponse"] = "success: boolean"
-        if not str(ep.get("errorCodes") or "").strip():
-            ep["errorCodes"] = "401 — 인증 실패, 500 — 서버 오류"
+        body = _clean_spec_field(ep.get("requestBody"), "없음")
+        if str(ep["method"]).upper() in _BODYLESS_METHODS and body != "없음":
+            # 본문 없는 메서드에 필드가 나열돼 있으면 쿼리 파라미터로 회수한 뒤 본문은 비운다
+            salvaged = _body_to_query_params(body)
+            if salvaged:
+                existing = ep.get("parameters") if isinstance(ep.get("parameters"), list) else []
+                ep["parameters"] = list(existing) + salvaged
+                logger.info(
+                    "API %s %s — requestBody의 필드 %d개를 쿼리 파라미터로 회수",
+                    ep["method"], ep["path"], len(salvaged),
+                )
+            body = "없음"
+        ep["requestBody"] = body
+        _normalize_parameters(ep)
+        ep["successResponse"] = _clean_spec_field(ep.get("successResponse"), "success: boolean")
+        ep["errorCodes"] = _clean_spec_field(ep.get("errorCodes"), "401 — 인증 실패, 500 — 서버 오류")
         out.append(ep)
     return out

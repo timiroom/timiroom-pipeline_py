@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
@@ -9,9 +10,52 @@ from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
-_MAX_FEATURE_NAME_LEN = 60
+# 길이는 손상 신호로는 약하다 — 아래 패턴 검사가 스크램블을 직접 잡으므로, 정상적인 긴
+# 기능명(괄호 안 상세 설명 포함)이 잘려 DBA·API가 참고할 정보를 잃지 않도록 여유를 둔다.
+# (실측: '보유 재료 기반 레시피 추천 (AI 기반 재료 조합 분석, 조리 시간, 난이도, ...)' 62자가
+#  멀쩡한데도 부연이 통째로 잘렸다)
+_MAX_FEATURE_NAME_LEN = 100
 _MIN_MEANINGFUL_CHAR_RATIO = 0.5
 _MAX_HYPHEN_SEGMENTS = 4
+_MAX_HYPHEN_CHAIN = 3
+_MIN_TRIMMED_NAME_LEN = 4
+
+_HANGUL = "가-힣"
+# EXAONE 토큰 손상 패턴 (전부 실측 사례)
+# - '푸0일 전 푸시 알림'  : 한글 낱말 사이에 숫자가 끼어듦. '1일 전', '20-30대'처럼
+#                          숫자가 낱말 앞·뒤에 오는 정상 표기는 걸리지 않는다.
+_DIGIT_IN_HANGUL_RE = re.compile(rf"[{_HANGUL}]\d+[{_HANGUL}]")
+# - '누Guest 재료 기반'   : 한글 바로 뒤에 영문이 붙음. 반대 방향(영문 뒤 한글 조사,
+#                          예: 'API를', 'OCR로')은 정상 한국어 표기라 검사하지 않는다.
+_HANGUL_THEN_LATIN_RE = re.compile(rf"[{_HANGUL}][A-Za-z]")
+# - '_recipe_auto_suggest_via_ingredients_' : 내부 식별자가 기능명 자리로 유출
+_IDENTIFIER_LIKE_RE = re.compile(r"^[A-Za-z0-9]*_[A-Za-z0-9_]*$")
+
+
+def _corruption_reason(name: str) -> str | None:
+    """손상으로 판단되는 이유. 정상이면 None."""
+    if len(name) > _MAX_FEATURE_NAME_LEN:
+        return "길이 초과"
+    if has_suspicious_script(name):
+        return "스크립트 오염"
+    meaningful = sum(1 for ch in name if ch.isalnum())
+    non_space = sum(1 for ch in name if not ch.isspace())
+    if non_space and meaningful / non_space < _MIN_MEANINGFUL_CHAR_RATIO:
+        return "기호 비율 과다"
+    if name.count("-") > _MAX_HYPHEN_SEGMENTS:
+        return "하이픈 과다"
+    # 공백 없이 하이픈으로만 이어붙인 이름은 정상 한국어 기능명이 아니다
+    # (실측: '기구-재물-현황-한다그-보'). 괄호 부연을 떼어낸 뒤에도 이 검사가 걸리므로
+    # 통짜로 스크램블된 이름이 '복구됨'으로 살아남지 않는다.
+    if name.count("-") >= _MAX_HYPHEN_CHAIN and " " not in name:
+        return "하이픈 연결 나열"
+    if _IDENTIFIER_LIKE_RE.match(name):
+        return "식별자 유출"
+    if _DIGIT_IN_HANGUL_RE.search(name):
+        return "한글 사이 숫자 혼입"
+    if _HANGUL_THEN_LATIN_RE.search(name):
+        return "한글 뒤 영문 혼입"
+    return None
 
 
 def _is_plausible_feature(name) -> bool:
@@ -19,18 +63,30 @@ def _is_plausible_feature(name) -> bool:
     (예: '기구-재물-현황-한다그-보(목록-밀동-2 엘드폰)' 같은 실제 관찰된 손상 사례)"""
     if not isinstance(name, str) or not name.strip():
         return False
+    return _corruption_reason(name.strip()) is None
+
+
+def repair_feature_name(name) -> str | None:
+    """손상된 기능명을 살릴 수 있으면 살리고, 못 살리면 None.
+
+    손상은 주로 괄호 안 부연 설명에서 발생한다
+    (실측: '유통기한 등록 및 임박 알림 (푸0일 전 푸시 알림, 위젯 노출)').
+    이럴 때 기능 자체를 버리면 그 기능이 PRD·DB·API에서 통째로 사라지므로,
+    괄호 앞부분이 멀쩡하면 부연만 떼어내고 기능은 유지한다."""
+    if not isinstance(name, str) or not name.strip():
+        return None
     stripped = name.strip()
-    if len(stripped) > _MAX_FEATURE_NAME_LEN:
-        return False
-    if has_suspicious_script(stripped):
-        return False
-    meaningful = sum(1 for ch in stripped if ch.isalnum())
-    non_space = sum(1 for ch in stripped if not ch.isspace())
-    if non_space and meaningful / non_space < _MIN_MEANINGFUL_CHAR_RATIO:
-        return False
-    if stripped.count("-") > _MAX_HYPHEN_SEGMENTS:
-        return False
-    return True
+    reason = _corruption_reason(stripped)
+    if reason is None:
+        return stripped
+
+    head = stripped.split("(", 1)[0].strip(" ,-–—")
+    if len(head) >= _MIN_TRIMMED_NAME_LEN and _corruption_reason(head) is None:
+        logger.warning("PM 기능명 부연 손상(%s) — 괄호 이후 제거: %r → %r", reason, stripped, head)
+        return head
+
+    logger.warning("PM 기능명 손상(%s) — 제외: %r", reason, stripped)
+    return None
 
 # EXAONE 모델 카드 권장 샘플링 파라미터
 # https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
@@ -121,11 +177,24 @@ class PmAgent:
         feature_list, dba_instruction, api_instruction = self._extract(data)
 
         if feature_list:
-            kept = [f for f in feature_list if _is_plausible_feature(f)]
-            dropped = [f for f in feature_list if f not in kept]
-            if dropped:
-                logger.warning("PM featureList — 손상 의심 항목 %d개 제외: %s", len(dropped), dropped)
-            feature_list = kept
+            # 손상된 이름은 먼저 복구를 시도하고(대개 괄호 안 부연만 깨져 있다),
+            # 복구 불가능한 것만 제외한다 — 통째로 버리면 그 기능이 산출물 전체에서 사라진다
+            repaired, dropped, seen = [], 0, set()
+            for f in feature_list:
+                name = repair_feature_name(f)
+                if name is None:
+                    dropped += 1
+                    continue
+                if name in seen:  # 부연 제거로 앞 항목과 같아질 수 있다
+                    continue
+                seen.add(name)
+                repaired.append(name)
+            if dropped or len(repaired) != len(feature_list):
+                logger.warning(
+                    "PM featureList 정리 — %d개 → %d개 (복구 불가 %d개 제외)",
+                    len(feature_list), len(repaired), dropped,
+                )
+            feature_list = repaired
 
         # 파싱 완전 실패 또는 전량 필터링 시 기존 state의 feature_list 유지
         if not feature_list:

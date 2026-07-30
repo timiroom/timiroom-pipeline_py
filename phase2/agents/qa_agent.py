@@ -6,8 +6,11 @@ from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
-from phase2.agents.dba_agent import _to_array_schema, min_table_count, sanitize_tables
+from phase2.agents.dba_agent import (
+    _to_array_schema, dedupe_meta_tables, min_table_count, reconcile_fk_types, sanitize_tables,
+)
 from phase2.agents.api_agent import _normalize_endpoints
+from phase2.agents.prd_agent import reconcile_core_features
 from phase2.feature_coverage import uncovered_features
 from phase2.json_utils import try_parse_json
 from phase2.state import PipelineState
@@ -159,29 +162,33 @@ JSON:
 """
 
 
-def _count_items(domain: str, data) -> int | None:
-    """도메인별 '핵심 항목 수'를 센다 — reviewer의 fixed가 JSON 잘림으로 원본보다
-    비정상적으로 축소되었는지 판단하기 위한 최소한의 결정론적 크기 검증."""
+_PRD_COUNTED_FIELDS = ("coreFeatures", "kpi", "userPersonas", "releaseSchedule", "goals")
+
+
+def _count_items_per_field(domain: str, data) -> dict[str, int]:
+    """축소 판정을 섹션별로 하기 위한 필드별 항목 수.
+    PRD를 합계로만 보면 coreFeatures가 2개 줄어도 kpi가 2개 늘어 상쇄되어 통과한다
+    (실측: coreFeatures 9 → 7). 필드 하나라도 줄면 축소로 본다."""
     if not isinstance(data, dict):
-        return None
+        return {}
     if domain == "db":
         tables = data.get("tables")
-        if isinstance(tables, (list, dict)):
-            return len(tables)
-        return 0
+        return {"tables": len(tables) if isinstance(tables, (list, dict)) else 0}
     if domain == "api":
         endpoints = data.get("endpoints")
-        return len(endpoints) if isinstance(endpoints, list) else 0
+        return {"endpoints": len(endpoints) if isinstance(endpoints, list) else 0}
     if domain == "prd":
-        # 최상위 키 개수(len(data))는 coreFeatures 리스트가 통째로 비워져도 변하지 않아
-        # 축소를 못 잡는다. 개수에 민감한 실제 콘텐츠 리스트 섹션의 항목 총합을 센다.
-        total = 0
-        for field in ("coreFeatures", "kpi", "userPersonas", "releaseSchedule", "goals"):
-            val = data.get(field)
-            if isinstance(val, list):
-                total += len(val)
-        return total
-    return None
+        return {f: len(v) for f in _PRD_COUNTED_FIELDS if isinstance(v := data.get(f), list)}
+    return {}
+
+
+def _shrunk_fields(orig: dict[str, int], new: dict[str, int]) -> dict[str, tuple[int, int]]:
+    """원본에 있던 필드 중 항목 수가 줄어든 것만 추린다. 원본에 없던 필드는 판단하지 않는다."""
+    return {
+        field: (count, new[field])
+        for field, count in orig.items()
+        if count and field in new and new[field] < count
+    }
 
 
 class _QaGraphState(TypedDict, total=False):
@@ -269,11 +276,11 @@ class QaAgent:
         result = await self._graph.ainvoke(graph_input)
 
         # DBA와 동일한 결정론적 백스톱을 QA 최종 db에도 적용 — 리뷰 재작성이 문장형 테이블명이나
-        # 컬럼 0개 테이블을 재발시킬 수 있으므로 마지막 출력 직전에 한 번 더 정규화한다.
+        # 컬럼 0개 테이블, FK 타입 불일치를 재발시킬 수 있으므로 마지막 출력 직전에 한 번 더 정규화한다.
         db_draft = result.get("db_draft", "") or "{}"
         db_parsed = try_parse_json(db_draft)
         if isinstance(db_parsed, dict) and isinstance(db_parsed.get("tables"), list):
-            db_parsed["tables"] = sanitize_tables(db_parsed["tables"])
+            db_parsed["tables"] = reconcile_fk_types(dedupe_meta_tables(sanitize_tables(db_parsed["tables"])))
             db_draft = json.dumps(db_parsed, ensure_ascii=False)
 
         # API도 동일 — 리뷰 재작성이 필드 없는 불완전 엔드포인트를 남길 수 있어 최종 보강
@@ -282,6 +289,16 @@ class QaAgent:
         if isinstance(api_parsed, dict) and isinstance(api_parsed.get("endpoints"), list):
             api_parsed["endpoints"] = _normalize_endpoints(api_parsed["endpoints"])
             api_draft = json.dumps(api_parsed, ensure_ascii=False)
+
+        # PRD도 동일 — 리뷰 재작성이 우선순위를 전부 P0으로 되돌리거나 비워둘 수 있어
+        # MVP 범위 기준 재배정을 최종 출력 직전에 한 번 더 적용한다
+        prd_draft = result.get("prd_draft", "") or "{}"
+        prd_parsed = try_parse_json(prd_draft)
+        if isinstance(prd_parsed, dict) and isinstance(prd_parsed.get("coreFeatures"), list):
+            prd_parsed["coreFeatures"] = reconcile_core_features(
+                prd_parsed["coreFeatures"], prd_parsed.get("mvpScope"),
+            )
+            prd_draft = json.dumps(prd_parsed, ensure_ascii=False)
 
         # LLM 리뷰가 놓쳤을 수 있는 결함을 결정론적 체크로 최종본에 대해 한 번 더 검증 —
         # LLM 판정만으로는 매 실행마다 탐지율 편차가 크므로 이를 보완한다.
@@ -302,7 +319,7 @@ class QaAgent:
         ]
         prd_issues += [
             i for i in self._check_prd_completeness(
-                try_parse_json(result.get("prd_draft", "")), len(state.feature_list),
+                try_parse_json(prd_draft), len(state.feature_list),
             )
             if i not in prd_issues
         ]
@@ -327,7 +344,7 @@ class QaAgent:
         return state.copy(
             db_schema=db_draft,
             api_spec=api_draft,
-            prd_document=result["prd_draft"],
+            prd_document=prd_draft,
             qa_quality_score=quality_score,
             qa_db_issues=db_issues,
             qa_api_issues=api_issues,
@@ -386,15 +403,19 @@ class QaAgent:
                 if isinstance(fixed_data, dict):
                     if domain == "db":
                         fixed_data = _to_array_schema(fixed_data)
-                    orig_count = _count_items(domain, try_parse_json(draft))
-                    new_count = _count_items(domain, fixed_data)
                     # QA는 정합성 교정 단계이지 가지치기 단계가 아니다 — 항목 수가 원본보다
                     # 줄어드는 것은 (EXAONE 재생성 시 테이블/엔드포인트/기능 누락) 항상 결함으로
                     # 취급하고 원본을 유지한다. 원본과 같거나 많을 때만 수정본을 채택한다.
-                    if orig_count and new_count is not None and new_count < orig_count:
+                    # 합계가 아니라 섹션별로 비교해야 한 섹션의 누락이 다른 섹션 증가에 가려지지 않는다.
+                    shrunk = _shrunk_fields(
+                        _count_items_per_field(domain, try_parse_json(draft)),
+                        _count_items_per_field(domain, fixed_data),
+                    )
+                    if shrunk:
                         logger.warning(
-                            "%s reviewer의 fixed가 원본보다 항목이 줄어듦(%d → %d, EXAONE 누락 추정) — 원본 유지",
-                            domain, orig_count, new_count,
+                            "%s reviewer의 fixed가 원본보다 항목이 줄어듦(%s, EXAONE 누락 추정) — 원본 유지",
+                            domain,
+                            ", ".join(f"{f} {o}→{n}" for f, (o, n) in shrunk.items()),
                         )
                     else:
                         fixed = json.dumps(fixed_data, ensure_ascii=False)

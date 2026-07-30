@@ -60,6 +60,34 @@ def uncovered_features(feature_list: list, haystack_texts: list) -> list[str]:
     return uncovered
 
 
+def undercovered_features(feature_list: list, per_item_texts: list, minimum: int) -> list[str]:
+    """기능별로 '매칭되는 항목 수'를 세어 minimum에 못 미치는 기능만 반환.
+
+    uncovered_features가 "흔적이 0인 기능"만 잡는 데 비해, 이건 "엔드포인트가 1개뿐이라
+    조회만 되고 생성·수정이 없는" 식의 얕은 커버리지를 잡는다. 토큰 매칭 기반이므로
+    정확한 판정이 아니라 보충 생성을 유도하는 힌트로만 쓴다."""
+    feature_list = feature_list or []
+    texts = [t for t in per_item_texts if isinstance(t, str)]
+    tokens_per_feature = [_feature_tokens(f) for f in feature_list]
+
+    doc_freq: dict[str, int] = {}
+    for tokens in tokens_per_feature:
+        for tok in tokens:
+            doc_freq[tok] = doc_freq.get(tok, 0) + 1
+    n = len(feature_list) or 1
+    generic = {tok for tok, freq in doc_freq.items() if freq / n > _GENERIC_TOKEN_DOC_FREQ_RATIO}
+
+    under = []
+    for feature, tokens in zip(feature_list, tokens_per_feature):
+        if not tokens:
+            continue
+        match_pool = (tokens - generic) or tokens
+        hits = sum(1 for text in texts if any(tok in text for tok in match_pool))
+        if hits < minimum:
+            under.append(feature)
+    return under
+
+
 def missing_features_note(missing: list[str], target_label: str) -> str:
     """리뷰 프롬프트에 주입할 '누락 기능' 힌트 텍스트. missing이 비어있으면 빈 문자열."""
     if not missing:

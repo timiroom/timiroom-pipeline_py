@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 # 섹션별 최소 항목 수 — SECTION_PROMPTS가 스스로 요구하는 기준과 동일.
 # _generate_section에서 이 기준 미달 시 파싱 성공이라도 재생성을 강제한다.
+# coreFeatures 생성 배치 크기 — 한 worker가 담당할 기능 수.
+# 기능 전체를 한 호출에 넣으면 출력이 잘려 3회 재생성이 모두 실패한다(실측 21개).
+_CORE_FEATURE_BATCH_SIZE = 5
+
 _SECTION_MIN_COUNTS: dict[str, dict[str, int]] = {
     "goalsKpi": {"kpi": 7},
     "userPersonas": {"userPersonas": 3},
@@ -395,9 +399,32 @@ def _has_runaway_text(node) -> bool:
 
 
 def _merge_sections(a: dict, b: dict) -> dict:
+    """섹션 결과 병합. 같은 키가 양쪽 다 리스트면 이어붙인다 —
+    coreFeatures는 기능 배치별로 여러 worker가 나눠 만들므로 덮어쓰면 안 된다."""
     merged = dict(a or {})
-    merged.update(b or {})
+    for key, value in (b or {}).items():
+        prev = merged.get(key)
+        if isinstance(prev, list) and isinstance(value, list):
+            merged[key] = prev + value
+        else:
+            merged[key] = value
     return merged
+
+
+_VALID_PRIORITIES = ("P0", "P1", "P2")
+_MOSCOW_TO_PRIORITY = {"MUST": "P0", "SHOULD": "P1", "COULD": "P2", "WONT": "P2", "WON'T": "P2"}
+_PRIORITY_RE = re.compile(r'^P\s*([0-2])$')
+
+
+def _normalize_priority(value) -> str | None:
+    """P0/P1/P2 또는 MoSCoW 표기를 P0/P1/P2로 정규화. 알아볼 수 없으면 None."""
+    text = str(value or "").strip().upper()
+    if text in _VALID_PRIORITIES:
+        return text
+    if text in _MOSCOW_TO_PRIORITY:
+        return _MOSCOW_TO_PRIORITY[text]
+    match = _PRIORITY_RE.match(text)
+    return f"P{match.group(1)}" if match else None
 
 
 def _fallback_section(section_key: str, feature_list: list[str], user_query: str) -> dict:
@@ -438,8 +465,15 @@ def _fallback_section(section_key: str, feature_list: list[str], user_query: str
             for i in range(1, 7)
         ]}
     if section_key == "coreFeatures":
+        # priority를 비워 두는 것이 핵심 — 예전엔 여기서 "P0"를 박아 넣어서 생성이 실패한
+        # 기능까지 전부 최우선으로 표기됐다. 비워두면 뒤의 MVP 범위 기반 재배정이 채운다.
         return {"coreFeatures": [
-            {"name": f, "description": f"{f} 기능", "priority": "P0", "requirements": [f"{f}를 처리한다"]}
+            {
+                "name": f,
+                "description": f"{f} — 자동 생성에 실패하여 상세 설명이 채워지지 않았습니다. 수동 보완이 필요합니다.",
+                "priority": "",
+                "requirements": [f"{f} 관련 상세 요구사항 — 자동 생성 실패, 수동 보완 필요"],
+            }
             for f in features
         ]}
     return {}
@@ -514,10 +548,15 @@ class PrdAgent:
                 # coreFeatures 누락 시 fallback — feature_list로 최소 구성
                 if not parsed.get("coreFeatures"):
                     logger.warning("coreFeatures 누락 — feature_list로 fallback 구성")
-                    parsed["coreFeatures"] = [
-                        {"name": f, "description": f"{f} 기능", "priority": "P0", "requirements": [f"{f}를 처리한다"]}
-                        for f in state.feature_list
-                    ]
+                    parsed.update(_fallback_section("coreFeatures", state.feature_list, state.user_query))
+                else:
+                    # 배치 병합 과정에서 같은 기능이 두 번 들어왔거나 껍데기가 섞였을 수 있어 정리
+                    parsed["coreFeatures"] = self._dedup_list(
+                        self._drop_empty_features(parsed["coreFeatures"])
+                    )
+
+                # 우선순위는 항상 마지막에 정리 — MVP 범위가 확정된 뒤라야 도출할 수 있다
+                self._reconcile_priorities(parsed.get("coreFeatures"), parsed.get("mvpScope"))
                 prd_document = json.dumps(parsed, ensure_ascii=False)
 
             logger.info("PRD 에이전트 완료 — %d chars", len(prd_document))
@@ -539,6 +578,9 @@ class PrdAgent:
         ctx = state["ctx"]
         sends = []
         for section_key, template in SECTION_PROMPTS.items():
+            if section_key == "coreFeatures":
+                sends.extend(self._core_feature_sends(ctx, template))
+                continue
             prompt = template.format(
                 market_data=ctx["market_data"],
                 rollback_section=ctx["rollback_section"],
@@ -556,11 +598,45 @@ class PrdAgent:
             }))
         return sends
 
+    def _core_feature_sends(self, ctx: dict, template: str) -> list[Send]:
+        """coreFeatures만 기능 배치로 쪼개 여러 worker에 나눠 맡긴다.
+
+        기능 21개 × (description 100자 + requirements 60자)를 한 호출에 요구하면 출력이 잘려
+        3회 재생성이 전부 파싱 실패하고, 결국 우선순위가 전부 P0인 자리표시자 fallback이
+        통째로 들어갔다(실측). 배치당 {n}개면 요구 분량이 토큰 예산 안에 들어온다.
+        """.replace("{n}", str(_CORE_FEATURE_BATCH_SIZE))
+        features = ctx.get("feature_list") or []
+        batches = [
+            features[i:i + _CORE_FEATURE_BATCH_SIZE]
+            for i in range(0, len(features), _CORE_FEATURE_BATCH_SIZE)
+        ] or [[]]
+        logger.info("PRD coreFeatures — 기능 %d개를 %d개 배치로 분할", len(features), len(batches))
+
+        sends = []
+        for i, batch in enumerate(batches):
+            prompt = template.format(
+                market_data=ctx["market_data"],
+                rollback_section=ctx["rollback_section"],
+                user_query=ctx["user_query"],
+                feature_str="- " + "\n- ".join(batch) if batch else ctx["feature_str"],
+                feature_count=len(batch) or ctx["feature_count"],
+            )
+            sends.append(Send("worker", {
+                "section": "coreFeatures",
+                "label_suffix": f"_{i + 1}",
+                "prompt": prompt,
+                "dump": ctx.get("dump"),
+                "feature_list": batch,
+                "feature_count": len(batch),
+                "user_query": ctx["user_query"],
+            }))
+        return sends
+
     async def _worker_node(self, state: dict) -> dict:
         section = state["section"]
         dump = state.get("dump")
         feature_count = state.get("feature_count") or 0
-        label = f"PRD_{section}"
+        label = f"PRD_{section}{state.get('label_suffix', '')}"
 
         min_counts = dict(_SECTION_MIN_COUNTS.get(section, {}))
         if section == "coreFeatures" and feature_count:
@@ -825,6 +901,92 @@ class PrdAgent:
         return out
 
     @classmethod
+    def _best_overlap(cls, tokens: set, candidates: list[set]) -> float:
+        """tokens와 후보들 중 가장 잘 맞는 것의 겹침 비율 (짧은 쪽 기준)."""
+        best = 0.0
+        for cand in candidates:
+            denom = min(len(tokens), len(cand))
+            if denom:
+                best = max(best, len(tokens & cand) / denom)
+        return best
+
+    @staticmethod
+    def _drop_empty_features(core_features) -> list:
+        """이름이 비어 있는 coreFeatures 항목 제거.
+        실측: {"name":"","description":"","requirements":[]} 껍데기가 최종 PRD까지 나갔고,
+        우선순위 재배정이 거기에 P1까지 붙여 정상 항목처럼 보이게 만들었다."""
+        if not isinstance(core_features, list):
+            return core_features
+        kept = [
+            f for f in core_features
+            if isinstance(f, dict) and str(f.get("name") or "").strip()
+        ]
+        if len(kept) != len(core_features):
+            logger.warning(
+                "coreFeatures 빈 항목 %d개 제거 (%d → %d)",
+                len(core_features) - len(kept), len(core_features), len(kept),
+            )
+        return kept
+
+    @classmethod
+    def _reconcile_priorities(cls, core_features, mvp_scope) -> None:
+        """coreFeatures.priority를 정규화하고, 구분이 없거나 비어 있으면 MVP 범위에서 도출한다.
+
+        실측: 21개 기능이 전부 P0로 표기됐다 — coreFeatures 생성이 실패해 priority를 P0로
+        박아둔 fallback이 통째로 들어갔기 때문이다. mvpScope(included/excluded)는 정상적으로
+        생성되므로 이를 MoSCoW 기준으로 삼는다: MVP 포함=P0(Must), 언급 없음=P1(Should),
+        제외=P2(Could). LLM이 이미 우선순위를 실제로 구분해 놓았다면 그 판단을 존중하고
+        비어 있는 항목만 채운다. 원본을 제자리 수정."""
+        if not isinstance(core_features, list) or not core_features:
+            return
+
+        items = [f for f in core_features if isinstance(f, dict)]
+        resolved = {}
+        for item in items:
+            priority = _normalize_priority(item.get("priority"))
+            resolved[id(item)] = priority
+            if priority:
+                item["priority"] = priority
+
+        distinct = {p for p in resolved.values() if p}
+        # 구분이 전혀 없으면(전부 같은 값이거나 전부 비어 있음) 전량 재배정, 아니면 빈 항목만
+        targets = items if len(distinct) <= 1 else [i for i in items if not resolved[id(i)]]
+        if not targets:
+            return
+
+        included, excluded = [], []
+        if isinstance(mvp_scope, dict):
+            included = [x for x in (mvp_scope.get("included") or []) if isinstance(x, str) and x.strip()]
+            excluded = [x for x in (mvp_scope.get("excluded") or []) if isinstance(x, str) and x.strip()]
+        if not included and not excluded:
+            logger.warning(
+                "coreFeatures 우선순위 구분 없음(%s)이지만 mvpScope가 비어 도출 불가 — 그대로 둠",
+                distinct or "(전부 미지정)",
+            )
+            return
+
+        inc_tokens = [cls._label_tokens(x) for x in included]
+        exc_tokens = [cls._label_tokens(x) for x in excluded]
+        counts = {"P0": 0, "P1": 0, "P2": 0}
+        for item in targets:
+            tokens = cls._label_tokens(item.get("name") or "")
+            inc_score = cls._best_overlap(tokens, inc_tokens)
+            exc_score = cls._best_overlap(tokens, exc_tokens)
+            if max(inc_score, exc_score) < cls._DEDUP_OVERLAP:
+                priority = "P1"          # 어느 쪽에도 명시되지 않음 → Should
+            elif inc_score >= exc_score:
+                priority = "P0"          # MVP 포함 → Must
+            else:
+                priority = "P2"          # MVP 제외 → Could
+            item["priority"] = priority
+            counts[priority] += 1
+
+        logger.warning(
+            "coreFeatures 우선순위 %d개를 MVP 범위 기준으로 재배정 (기존 구분: %s) — %s",
+            len(targets), distinct or "없음", counts,
+        )
+
+    @classmethod
     def _dedup_section_fields(cls, data: dict, min_counts: dict | None) -> dict:
         """섹션 데이터의 개수-민감 리스트 필드에서 재탕을 제거 (개수 판정 전에 호출)."""
         if not isinstance(data, dict):
@@ -869,3 +1031,11 @@ class PrdAgent:
         if state.prd_feedback_from_api:
             parts.append(f"API 에이전트 피드백:\n{state.prd_feedback_from_api}")
         return "\n".join(parts)
+
+
+def reconcile_core_features(core_features, mvp_scope) -> list:
+    """coreFeatures 정리(빈 항목 제거 + 우선순위 재배정)의 모듈 레벨 진입점 —
+    QA 최종 백스톱에서 재사용한다. (dba_agent.reconcile_fk_types와 동일한 역할)"""
+    cleaned = PrdAgent._drop_empty_features(core_features)
+    PrdAgent._reconcile_priorities(cleaned, mvp_scope)
+    return cleaned
