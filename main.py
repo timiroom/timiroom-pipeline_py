@@ -214,12 +214,14 @@ from routers.orchestration import router as orchestration_router
 from routers.recommendation import router as recommendation_router
 from routers.agent import router as agent_router
 from routers.chat import router as chat_router
+from routers.document import router as document_router
 from routers.rag import router as rag_router
 
 app.include_router(orchestration_router)
 app.include_router(recommendation_router)
 app.include_router(agent_router)
 app.include_router(chat_router)
+app.include_router(document_router)
 app.include_router(rag_router)
 
 register_exception_handlers(app)
