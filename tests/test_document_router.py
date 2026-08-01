@@ -5,6 +5,7 @@
 """
 import asyncio
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -54,8 +55,15 @@ def _stage(kwargs: str) -> str:
 
 @pytest.fixture(autouse=True)
 def _no_main_import(monkeypatch):
-    """_exaone_endpoint_id가 main을 import하지 않게 막는다."""
+    """라우터가 진짜 main을 import하지 못하게 가짜 모듈을 꽂는다.
+
+    main을 import하면 앱 전역이 통째로 뜬다 — DB 연결, Kafka, Ko-Reranker 모델 로딩까지.
+    로컬에서는 느리게나마(실측 70초) 성공해서 통과했지만, .env도 네트워크도 없는 CI에서는
+    import 자체가 실패해 TestClient가 500을 돌려주고, 반쯤 초기화된 백그라운드 스레드가
+    종료 후 스트림에 쓰면서 'lost sys.stderr'까지 냈다.
+    """
     monkeypatch.setattr(doc, "_exaone_endpoint_id", lambda: "stub-endpoint")
+    monkeypatch.setitem(sys.modules, "main", SimpleNamespace(settings=None, exaone_client=None))
 
 
 API_SEC = doc._API_PROFILE.sections["endpoints"]

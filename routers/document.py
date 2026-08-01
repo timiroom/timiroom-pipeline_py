@@ -1543,8 +1543,6 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
 
     doc_type: prd | features | api | erd
     """
-    from main import exaone_client
-
     profile = _PROFILES.get(doc_type)
     if profile is None:
         raise HTTPException(
@@ -1561,6 +1559,11 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
             status_code=413,
             detail=f"문서가 너무 큽니다 ({doc_chars:,}자). {_MAX_DOCUMENT_CHARS:,}자 이하로 줄여주세요.",
         )
+
+    # main import는 검증을 통과한 뒤에 한다. 순환 import를 피하려고 함수 안에서 하는 건데,
+    # 함수 첫 줄에 두면 잘못된 doc_type이나 크기 초과 요청 하나가 앱 전역(DB·Kafka·리랭커)
+    # 초기화를 끌고 들어온다 — 거절할 요청이 무거운 부팅을 트리거할 이유가 없다.
+    from main import exaone_client
 
     # history는 최근 몇 턴까지만 — 문서 본문이 이미 크므로 대화까지 길어지면 컨텍스트가 넘친다
     history = [
