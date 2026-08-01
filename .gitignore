@@ -51,3 +51,6 @@ logs/
 uploads/
 tmp/
 temp/
+
+# manual_document_edit.py 가 만드는 문서 샘플·검증 리포트 (실행마다 새로 생김)
+samples/
