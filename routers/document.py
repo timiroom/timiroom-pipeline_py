@@ -7,8 +7,12 @@
 
 동작 방식 — 4단계 호출:
   1) 분류    : 요청이 '질문(chat)'인지 '수정(edit)'인지 판별하고, 수정이면 대상 섹션을 고른다.
-  2) 범위    : 리스트 섹션이면 손댈 '항목'까지 좁힌다. (전체 재작성이면 건너뜀)
+  2) 범위    : 리스트 섹션이면 손댈 '항목'과 연산(edit/add/remove)까지 좁힌다.
   3) 재작성  : 고른 항목(또는 섹션)만 다시 쓴다. 나머지는 원본 객체를 그대로 재사용한다.
+               - edit  : 고른 항목만 재작성해 제자리에 끼워 넣는다
+               - remove: 모델을 부르지 않고 Python에서 해당 항목만 뺀다
+               - add   : 새 항목만 만들게 하고 기존 목록 뒤에 이어붙인다
+               셋 다 기존 항목 객체가 모델을 거치지 않으므로 변형될 수 없다.
   4) 제안문  : 확정된 변경 내용을 근거로 "무엇을 어떤 값으로 바꾸는지" 문장을 만든다.
 
 한 번의 호출로 "JSON Patch 경로를 직접 만들어라"고 시키지 않는 이유는 EXAONE이
@@ -28,7 +32,7 @@ from openai import InternalServerError, APITimeoutError, APIConnectionError
 from pydantic import BaseModel, Field
 
 from common.api_response import ok
-from phase2.json_utils import try_parse_json, has_suspicious_script
+from phase2.json_utils import try_parse_json, has_suspicious_script, find_json_syntax_leak
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +48,30 @@ _PRESENCE_PENALTY = 0.0
 # 사용자가 "전체 다 고쳐줘"라고 해도 diff가 검토 불가능할 만큼 커지지 않게 막는다.
 _MAX_TARGET_SECTIONS = 3
 
+# 한 섹션에서 항목 단위로 동시에 재작성할 수 있는 항목 수 상한.
+# 항목마다 EXAONE 호출이 하나씩 나가므로, 상한이 없으면 20개짜리 목록에서
+# 20개 호출이 한꺼번에 뜬다(섹션 3개면 60개). 검토 가능한 diff 크기와도 맞물린다.
+_MAX_TARGET_ITEMS = 5
+
 # 분류 단계에 넣을 섹션 미리보기 길이 — 문서 전체를 넣으면 토큰이 폭발한다.
 _PREVIEW_CHARS = 300
 
 _MIN_REWRITE_TOKENS = 8000
 _MAX_REWRITE_TOKENS = 16000
+
+# 섹션 전체 재작성을 시도할 수 있는 원본 크기 상한(문자).
+# 교체본은 원본보다 길어지는데 출력은 _MAX_REWRITE_TOKENS에 묶여 있어서,
+# 이 선을 넘으면 어떤 예산을 잡아도 응답이 잘린다(finish_reason="length").
+# 3번 다 잘릴 게 뻔한 호출을 던지느니 시작 전에 접는다.
+_MAX_REWRITE_CHARS = 12000
+
+# 요청 문서 크기 상한(직렬화 문자 수). 넘으면 프롬프트가 컨텍스트를 넘겨
+# EXAONE이 400을 뱉는다 — 재시도 대상이 아니라 그대로 실패하므로 입구에서 막는다.
+_MAX_DOCUMENT_CHARS = 60000
+
+# 프롬프트에 실을 직전 대화 — 턴 수와 턴당 길이 모두 제한한다.
+_MAX_HISTORY_TURNS = 6
+_HISTORY_TURN_CHARS = 800
 
 # 라벨 키를 지정하지 않은(또는 맞지 않는) 중첩 객체에 쓰는 렌더링 기본값
 _GENERIC_LABEL_KEYS = ("name", "metric", "milestone", "title", "persona")
@@ -195,6 +218,158 @@ _ERD_PROFILE = DocProfile(
         ),
     },
 )
+
+# ── ERD 섹션 간 정합 ─────────────────────────────────────────────────
+# tables와 relationships는 별개 섹션이지만 서로를 참조한다. 테이블 이름을 바꾸거나
+# 테이블을 지우면 관계 문자열이 옛 이름을 가리킨 채 남는다(실측: settlement_records를
+# 지웠는데 "spaces (1:N) settlement_records" 2개가 그대로 남았다).
+#
+# 모델에게 "관계도 같이 고쳐라"고 시키지 않는다 — 이건 문자열 치환이라 Python이
+# 정확하고, LLM에 맡기면 멀쩡한 관계까지 다시 쓰다 흘린다.
+
+_RELATION_RE = re.compile(r"^(.+?)\s*\((1:1|1:N|N:1|N:M)\)\s*(.+?)$")
+
+
+def _table_renames(before: list, after: list) -> tuple[dict[str, str], set[str]]:
+    """(바뀐 이름 매핑, 사라진 테이블 이름).
+
+    이름 매핑은 길이가 같을 때만 자리로 짝지어 뽑는다. 항목이 추가·삭제되면
+    자리 대응이 깨져서 엉뚱한 테이블을 '이름이 바뀐 것'으로 오인하기 때문이다.
+    """
+    def names(tables):
+        return [t.get("name") for t in tables if isinstance(t, dict) and t.get("name")]
+
+    renames: dict[str, str] = {}
+    if len(before) == len(after):
+        for b, a in zip(before, after):
+            if not (isinstance(b, dict) and isinstance(a, dict)):
+                continue
+            old, new = b.get("name"), a.get("name")
+            if old and new and old != new:
+                renames[old] = new
+
+    gone = set(names(before)) - set(names(after)) - set(renames)
+    return renames, gone
+
+
+def _singular(name: str) -> str:
+    """FK 컬럼 접두사를 만들기 위한 단수형 (dba_agent._table_name_variants와 같은 규칙)."""
+    if name.endswith("ies"):
+        return name[:-3] + "y"
+    if name.endswith("s") and not name.endswith("ss"):
+        return name[:-1]
+    return name
+
+
+def _identifier_renames(renames: dict[str, str]) -> list[tuple[str, str]]:
+    """테이블 개명 → 문서 안에서 함께 바뀌어야 할 식별자 쌍.
+
+    바꾸는 것은 딱 세 가지뿐이다. `spaces_id` / `space_id` / `spaces`.
+    단수형(`space`)만 따로 바꾸지 않는 이유가 중요하다 — `space_schedules`는
+    이름이 겹칠 뿐 전혀 다른 테이블인데, 단수형을 치환 대상에 넣으면 그것까지
+    `venue_schedules`로 망가진다. 마찬가지로 `is_space_owner`는 FK가 아니라
+    그냥 이름에 space가 든 컬럼이라 건드리면 안 된다.
+
+    긴 것부터 적용해야 `space_id`를 바꾸기 전에 `spaces`가 먼저 걸리지 않는다.
+    """
+    pairs: list[tuple[str, str]] = []
+    for old, new in renames.items():
+        pairs.append((f"{old}_id", f"{new}_id"))
+        old_s, new_s = _singular(old), _singular(new)
+        if old_s != old:
+            pairs.append((f"{old_s}_id", f"{new_s}_id"))
+        pairs.append((old, new))
+    return sorted(set(pairs), key=lambda p: -len(p[0]))
+
+
+def _token_sub(text: str, pairs: list[tuple[str, str]]) -> str:
+    """식별자 경계에서만 치환한다. `_`는 경계로 본다 —
+    `idx_reservations_space_id` 의 뒤쪽 `space_id`는 바꾸되,
+    `space_schedules` 안의 `space`는 (그런 쌍이 없으므로) 건드리지 않는다."""
+    if not isinstance(text, str):
+        return text
+    for old, new in pairs:
+        text = re.sub(rf"(?<![A-Za-z0-9]){re.escape(old)}(?![A-Za-z0-9])", new, text)
+    return text
+
+
+def _sync_fk_references(tables: list, renames: dict[str, str]) -> tuple[list, list[str]]:
+    """테이블 개명을 FK 컬럼명·제약·인덱스 문자열에 반영한다. (새 목록, 바뀐 내역).
+
+    원본 dict를 제자리에서 고치지 않는다 — 항목 단위 수정 경로는 손대지 않은 테이블의
+    원본 객체를 그대로 재사용하므로, 제자리 수정은 before까지 같이 바꿔 diff를 지워버린다.
+    """
+    if not isinstance(tables, list) or not renames:
+        return tables, []
+
+    pairs = _identifier_renames(renames)
+    fk_forms = {}
+    for old, new in renames.items():
+        fk_forms[f"{old}_id"] = f"{new}_id"
+        old_s, new_s = _singular(old), _singular(new)
+        if old_s != old:
+            fk_forms[f"{old_s}_id"] = f"{new_s}_id"
+
+    changes: list[str] = []
+    out = []
+    for table in tables:
+        if not isinstance(table, dict):
+            out.append(table)
+            continue
+        name = table.get("name")
+        new_table = dict(table)
+
+        columns = []
+        for col in table.get("columns") or []:
+            if not isinstance(col, dict):
+                columns.append(col)
+                continue
+            new_col = dict(col)
+            # 컬럼명은 FK 형태와 '정확히' 같을 때만 바꾼다
+            if col.get("name") in fk_forms:
+                new_col["name"] = fk_forms[col["name"]]
+                changes.append(f"{name}.{col['name']} → {new_col['name']}")
+            if isinstance(col.get("constraints"), str):
+                fixed = _token_sub(col["constraints"], pairs)
+                if fixed != col["constraints"]:
+                    new_col["constraints"] = fixed
+                    changes.append(f"{name}.{new_col['name']} 제약")
+            columns.append(new_col)
+        if columns:
+            new_table["columns"] = columns
+
+        indexes = table.get("indexes")
+        if isinstance(indexes, list):
+            fixed_idx = [_token_sub(i, pairs) for i in indexes]
+            if fixed_idx != indexes:
+                new_table["indexes"] = fixed_idx
+                changes.append(f"{name} 인덱스")
+
+        out.append(new_table)
+    return out, changes
+
+
+def _sync_relationships(relationships, renames: dict[str, str], gone: set[str]) -> list:
+    """관계 문자열의 테이블 이름을 갱신하고, 사라진 테이블을 가리키는 관계는 버린다."""
+    if not isinstance(relationships, list):
+        return relationships
+
+    synced = []
+    for rel in relationships:
+        if not isinstance(rel, str):
+            synced.append(rel)
+            continue
+        m = _RELATION_RE.match(rel.strip())
+        if not m:
+            synced.append(rel)
+            continue
+
+        left, kind, right = m.group(1).strip(), m.group(2), m.group(3).strip()
+        if left in gone or right in gone:
+            continue  # 참조 대상이 문서에서 사라졌다 — 관계도 성립하지 않는다
+        synced.append(f"{renames.get(left, left)} ({kind}) {renames.get(right, right)}")
+    return synced
+
 
 _PROFILES: dict[str, DocProfile] = {
     "prd": _PRD_PROFILE,
@@ -401,6 +576,41 @@ def _drop_duplicate_items(sec: SectionSpec, baseline, items):
     return kept, dropped
 
 
+def _revert_colliding_edits(
+    sec: SectionSpec, key: str, baseline: list, merged: list, touched: list[int],
+) -> tuple[list, list[int]]:
+    """수정 결과가 '다른 기존 항목'과 같은 라벨이 되면 그 수정만 원본으로 되돌린다.
+
+    실측 두 가지:
+      - "spaces-2가 spaces랑 중복이에요" → 모델이 spaces-2를 spaces로 고쳐 써서 2개가 됨
+      - "검색 API에 필터 넣어주세요" → 모델이 엉뚱하게 POST /api/v1/spaces 의 method를
+        GET으로 바꿔 GET /api/v1/spaces 와 같은 항목이 됨
+
+    중복된 쪽을 지우는 방식으로 처리하면 공간 등록 API가 문서에서 사라진다 —
+    사용자가 요청하지 않은 삭제다. 수정을 되돌리면 최악이라도 '그 항목이 안 고쳐졌을 뿐'이
+    된다. 진짜 삭제 요청은 operation="remove" 경로가 따로 처리한다.
+
+    반환: (정리된 목록, 실제로 남은 변경 인덱스)
+    """
+    base_labels = {_norm_label(_item_label_of(sec, item)) for item in baseline}
+    reverted = []
+    for i in touched:
+        own = _norm_label(_item_label_of(sec, baseline[i]))
+        new = _norm_label(_item_label_of(sec, merged[i]))
+        # 자기 라벨을 유지했거나 완전히 새로운 라벨이면 문제없다.
+        # 다른 기존 항목이 이미 쓰고 있던 라벨을 가져간 경우만 되돌린다.
+        if new and new != own and new in base_labels:
+            merged[i] = baseline[i]
+            reverted.append(i)
+
+    if reverted:
+        logger.warning(
+            "섹션 %s — 항목 %s 의 수정이 다른 기존 항목과 같은 이름이 되어 원본으로 되돌림",
+            key, reverted,
+        )
+    return merged, [i for i in touched if merged[i] != baseline[i]]
+
+
 def _same_shape(before, after) -> bool:
     """원본과 교체본의 최상위 자료 구조가 같은지. 문자열/숫자는 서로 허용."""
     if isinstance(before, list):
@@ -408,6 +618,80 @@ def _same_shape(before, after) -> bool:
     if isinstance(before, dict):
         return isinstance(after, dict)
     return not isinstance(after, (list, dict))
+
+
+def _entry_key(entry) -> str:
+    """중첩 리스트 항목(컬럼·파라미터 등)을 가리키는 이름."""
+    if isinstance(entry, dict):
+        label, _ = _dict_label(entry, ())
+        return _norm_label(label)
+    return _norm_label(entry) if isinstance(entry, str) else ""
+
+
+def _reconcile_with_original(before, after, known_keys: set | None = None) -> tuple:
+    """교체본을 원본의 키 구성에 맞춘다. (정리본, 무엇을 손봤는지) 반환.
+
+    두 가지를 한 번에 한다.
+      - 흘린 필드는 원본 값으로 되살린다
+      - 섹션 스키마에 없는 키는 떨어낸다 (실측: EXAONE이 엔드포인트에 `}{.;/ / / /`
+        라는 키를 값 `'[]: ,,, ,,,'` 과 함께 만들어 붙였다. 값만 검사하는 오염 탐지기는
+        이런 쓰레기 '키'를 못 본다.)
+
+    known_keys는 같은 섹션의 **다른 항목들이 쓰고 있는 키**의 합집합이다. 이 항목에
+    없던 키라도 형제 항목에 있으면 정당한 필드다 — 원본 users에 indexes가 없어도
+    다른 테이블에 있으면 "인덱스 추가해줘"가 성립한다. 중첩 리스트 안쪽에서도 같은
+    원리를 쓴다 — 그 리스트의 원본 항목들이 쓰는 키가 그 자리의 스키마다.
+
+    K-EXAONE은 컬럼이 15개쯤 되는 항목을 다시 쓸 때 매번 '다른' 필드를 한두 개씩
+    흘린다(실측: 3회 재시도가 전부 서로 다른 필드를 빠뜨림). 거부하고 재생성해봐야
+    같은 일이 반복되므로 결과가 없다 — 모델이 바꾼 값은 그대로 두고, 언급조차 없이
+    사라진 필드만 원본에서 되돌리는 편이 정확하고 확실하다.
+
+    중첩 리스트가 짧아진 경우도 되살린다. 처음에는 "컬럼 하나 빼줘"를 존중하려고
+    길이가 다르면 손대지 않았는데, 실측에서 '컬럼 추가' 요청에 users 테이블이
+    19개 → 3개로 잘려 나온 채 통과했다. 자리(index)가 아니라 **이름**으로 짝지어
+    사라진 항목만 뒤에 되돌려 붙이므로, 순서가 바뀌거나 항목이 늘어난 경우에도 안전하다.
+    """
+    restored: list[str] = []
+    top_allowed = (known_keys or set()) | (set(before) if isinstance(before, dict) else set())
+
+    def walk(b, a, path: str, allowed: set | None):
+        if isinstance(b, dict) and isinstance(a, dict):
+            merged = {}
+            for key, value in a.items():
+                if key in b:
+                    merged[key] = walk(b[key], value, f"{path}{key}.", None)
+                elif allowed is not None and key not in allowed:
+                    restored.append(f"-{path}{key}")  # 이 자리 스키마에 없는 키 — 떨어냄
+                else:
+                    merged[key] = value
+            for key, value in b.items():
+                if key not in merged:
+                    merged[key] = value
+                    restored.append(f"{path}{key}")
+            return merged
+
+        if isinstance(b, list) and isinstance(a, list):
+            keys_after = {_entry_key(x) for x in a}
+            merged = list(a)
+            for entry in b:
+                name = _entry_key(entry)
+                if name and name not in keys_after:
+                    merged.append(entry)
+                    restored.append(f"{path.rstrip('.')}[{name}]")
+            # 같은 리스트의 원본 항목들이 쓰는 키가 이 자리의 스키마다.
+            # 실측: parameters 항목 하나에 `descriptiontion:string, "required": ...}, {`
+            # 라는 키가 통째로 생겨났다 — 최상위만 검사하면 이런 건 빠져나간다.
+            entry_keys = {k for x in b if isinstance(x, dict) for k in x}
+            by_name = {_entry_key(x): x for x in b if _entry_key(x)}
+            return [
+                walk(by_name[_entry_key(x)], x, path, entry_keys) if _entry_key(x) in by_name else x
+                for x in merged
+            ]
+
+        return a
+
+    return walk(before, after, "", top_allowed), restored
 
 
 def _token_budget(current, attempt: int) -> int:
@@ -423,6 +707,23 @@ def _token_budget(current, attempt: int) -> int:
 
 
 # ── EXAONE 호출 ──────────────────────────────────────────────────────
+
+def _messages(system: str, prompt: str, history: list[dict] | None = None) -> list[dict]:
+    """system + 직전 대화 + 이번 프롬프트.
+
+    대화를 분류 단계에만 넣으면 "아니 그거 말고 더 짧게" 같은 후속 요청에서
+    재작성 단계가 무엇을 가리키는지 몰라 헛돈다. 다만 문서 본문이 이미 크므로
+    턴 수와 턴당 길이를 모두 잘라서 싣는다.
+    """
+    messages = [{"role": "system", "content": system}]
+    for turn in (history or [])[-_MAX_HISTORY_TURNS:]:
+        content = turn["content"]
+        if len(content) > _HISTORY_TURN_CHARS:
+            content = content[:_HISTORY_TURN_CHARS] + "…"
+        messages.append({"role": turn["role"], "content": content})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
 
 async def _call_exaone(client, messages: list[dict], max_tokens: int) -> tuple[str, str]:
     """EXAONE 호출 (재시도 3회). (본문, finish_reason)을 함께 돌려준다.
@@ -494,9 +795,7 @@ async def _classify(client, profile: DocProfile, document: dict, instruction: st
         instruction=instruction,
         max_targets=_MAX_TARGET_SECTIONS,
     )
-    messages = [{"role": "system", "content": _CLASSIFY_SYSTEM}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": prompt})
+    messages = _messages(_CLASSIFY_SYSTEM, prompt, history)
 
     raw, finish_reason = await _call_exaone(client, messages, max_tokens=1500)
     node = try_parse_json(raw)
@@ -551,29 +850,37 @@ _SCOPE_PROMPT = """## 섹션: {key} ({label})
 ## 사용자 요청
 {instruction}
 
-## 판단 기준
-- 기존 항목의 내용만 고치면 되는 요청 → scope="item", indices에 해당 번호
-  (예: "예약 완료율 목표가 이상해요", "3번 설명 더 자세히", "users 테이블에 컬럼 추가")
-- 항목을 추가·삭제하거나 목록 전체를 다시 짜야 하는 요청 → scope="list", indices는 빈 배열
-  (예: "엔드포인트 3개 더 추가해줘", "전부 다시 써줘", "리텐션 지표 빼줘")
+## scope — 기존 목록에서 특정 항목을 지목할 수 있는가
+- "item": 기존 항목을 지목한 요청. indices에 그 항목의 번호를 넣으세요.
+  (내용 수정: "예약 완료율 목표가 이상해요", "3번 설명 더 자세히")
+  (삭제: "리텐션 지표 빼줘", "users 테이블 삭제해줘")
+- "list": 항목을 새로 만들어 달라거나 목록 전체를 다시 짜야 하는 요청. indices는 빈 배열.
+  (예: "엔드포인트 3개 더 추가해줘", "전부 다시 써줘")
 
 ## operation — 목록의 길이가 어떻게 바뀌어야 하는가
-- "remove": 항목을 빼달라는 요청일 때만 (예: "~ 삭제해줘", "~ 빼줘")
-- "add"   : 항목을 새로 추가해달라는 요청일 때 (예: "~ 추가해줘", "3개 더 만들어줘")
+- "remove": 항목을 빼달라는 요청일 때만. scope는 "item"이고, indices에 뺄 항목 번호를 넣으세요.
+            ("~ 삭제해줘", "~ 빼줘", "A가 B랑 중복이니 정리해줘" — 중복 정리는 한쪽을 빼는 것입니다)
+- "add"   : 항목을 새로 추가해달라는 요청일 때 (예: "~ 추가해줘", "3개 더 만들어줘"). scope는 "list".
 - "edit"  : 그 외 전부. 기존 항목의 내용만 바뀌고 개수는 그대로여야 합니다.
 
 ## 출력 형식
 {{"scope": "item", "indices": [3], "operation": "edit"}}
 또는
+{{"scope": "item", "indices": [2], "operation": "remove"}}
+또는
 {{"scope": "list", "indices": [], "operation": "add"}}
 
-indices는 위 목록의 번호입니다. 요청과 직접 관련된 항목만 고르세요.
+indices는 위 '현재 항목 목록'에 적힌 번호이며 1번부터 시작합니다. 최대 {max_items}개까지,
+요청과 직접 관련된 항목만 고르세요.
 확실하지 않으면 가장 관련이 깊은 항목 하나만 고르고, operation은 "edit"으로 두세요."""
 
 
 def _item_labels(sec: SectionSpec, items: list) -> str:
+    """모델에게 보여줄 항목 목록. 번호는 1부터 — 사용자가 "3번"이라고 말할 때의
+    번호와 같아야 모델이 엉뚱한 항목을 지목하지 않는다. 내부 인덱스는 0부터이므로
+    파싱할 때 1을 뺀다(_select_item_indices)."""
     lines = []
-    for i, item in enumerate(items):
+    for i, item in enumerate(items, start=1):
         if isinstance(item, dict):
             text, _ = _dict_label(item, sec.label_keys)
             text = text or "(제목 없음)"
@@ -585,24 +892,52 @@ def _item_labels(sec: SectionSpec, items: list) -> str:
     return "\n".join(lines)
 
 
+# 전체 재작성이 불가능한 큰 목록에서 모델이 "목록 전체" 판정을 내렸을 때 덧붙이는 지시.
+# 이게 없으면 "검색 API에 필터 더 넣어주세요" 같은 명백한 단일 항목 수정도
+# scope="list"로 떨어져 크기 한도에 막히고 아무 제안도 못 만든다(실측).
+_SCOPE_FORCE_ITEM_NOTE = """
+
+## 중요
+이 목록은 너무 커서 전체를 다시 쓸 수 없습니다.
+scope는 반드시 "item"으로 하고, 요청과 가장 관련이 깊은 항목의 번호를 최소 하나 고르세요.
+정말 어떤 항목과도 관련이 없을 때만 빈 배열을 두세요."""
+
+
 async def _select_item_indices(
     client, sec: SectionSpec, key: str, items: list, instruction: str,
+    history: list[dict] | None = None, force_item: bool = False,
 ) -> tuple[list[int] | None, str]:
-    """(손댈 항목의 인덱스, operation)을 반환. 목록 전체를 다시 짜야 하면 인덱스는 None.
+    """(손댈 항목의 0-based 인덱스, operation)을 반환. 목록 전체를 다시 짜야 하면 인덱스는 None.
 
     operation은 목록 길이가 줄어도 되는지 판정하는 데 쓴다 — "remove"가 아닌데
     항목이 사라지면 모델이 목록을 흘린 것으로 본다. 판정에 실패하면 가장 보수적인
     "edit"으로 두어 축소를 허용하지 않는다.
+
+    force_item은 '전체 재작성이 불가능한 크기'라는 뜻이다. 이때 모델이 목록 전체를
+    고르면 그 경로는 막다른 길이므로, 항목을 고르라고 못 박아 한 번 더 묻는다.
     """
+    indices, operation = await _ask_scope(client, sec, key, items, instruction, history, note="")
+    if force_item and indices is None and operation != "add":
+        logger.info("섹션 %s — 전체 재작성 불가 크기인데 목록 전체 판정 — 항목 지정을 요구해 재질의", key)
+        retry_indices, retry_operation = await _ask_scope(
+            client, sec, key, items, instruction, history, note=_SCOPE_FORCE_ITEM_NOTE,
+        )
+        if retry_indices is not None:
+            return retry_indices, retry_operation
+    return indices, operation
+
+
+async def _ask_scope(
+    client, sec: SectionSpec, key: str, items: list, instruction: str,
+    history: list[dict] | None, note: str,
+) -> tuple[list[int] | None, str]:
     prompt = _SCOPE_PROMPT.format(
         key=key, label=sec.label,
         items=_item_labels(sec, items),
         instruction=instruction,
-    )
-    messages = [
-        {"role": "system", "content": _SCOPE_SYSTEM},
-        {"role": "user", "content": prompt},
-    ]
+        max_items=_MAX_TARGET_ITEMS,
+    ) + note
+    messages = _messages(_SCOPE_SYSTEM, prompt, history)
     try:
         raw, _ = await _call_exaone(client, messages, max_tokens=500)
     except Exception as e:
@@ -628,7 +963,7 @@ async def _select_item_indices(
     for n in raw_indices:
         # EXAONE이 문자열 "3"으로 주는 경우가 있어 정수 변환을 시도한다
         try:
-            idx = int(n)
+            idx = int(n) - 1  # 프롬프트는 1-based, 내부는 0-based
         except (TypeError, ValueError):
             continue
         if 0 <= idx < len(items) and idx not in indices:
@@ -637,6 +972,14 @@ async def _select_item_indices(
     if not indices:
         logger.warning("섹션 %s 범위=item이지만 유효 인덱스 없음 — 전체 재작성으로 진행", key)
         return None, operation
+
+    if len(indices) > _MAX_TARGET_ITEMS:
+        # 항목마다 호출이 하나씩 나가므로 상한을 넘으면 잘라낸다
+        logger.warning(
+            "섹션 %s 대상 항목이 %d개 — 상한 %d개로 자름",
+            key, len(indices), _MAX_TARGET_ITEMS,
+        )
+        indices = indices[:_MAX_TARGET_ITEMS]
     return indices, operation
 
 
@@ -652,7 +995,7 @@ JSON 하나만 출력하세요. 설명·인사말·마크다운 코드블록 금
 - 원본과 완전히 동일한 키 구성으로 출력하세요. 키를 빼거나 새로 만들지 마세요.
 - placeholder($name, {value}, "기능명" 등)를 값으로 쓰지 마세요."""
 
-_ITEM_REWRITE_PROMPT = """## 수정할 항목 — {key}({label}) 목록의 {index}번
+_ITEM_REWRITE_PROMPT = """## 수정할 항목 — {key}({label}) 목록의 {number}번
 
 ## 이 목록의 형식 규격
 {spec}
@@ -700,17 +1043,17 @@ value는 이 섹션의 **전체 교체본**입니다. 바뀐 부분만 담지 �
 수정된 내용을 반영한 완전한 값을 담으세요."""
 
 
-async def _rewrite_item(client, sec: SectionSpec, key: str, index: int, item, instruction: str):
-    """리스트 항목 하나만 재작성. 실패하면 None."""
+async def _rewrite_item(
+    client, sec: SectionSpec, key: str, index: int, item, instruction: str,
+    history: list[dict] | None = None, known_keys: set | None = None,
+):
+    """리스트 항목 하나만 재작성. 실패하면 None. index는 0-based(표시는 1-based)."""
     prompt = _ITEM_REWRITE_PROMPT.format(
-        key=key, label=sec.label, index=index, spec=sec.spec,
+        key=key, label=sec.label, number=index + 1, spec=sec.spec,
         current=json.dumps(item, ensure_ascii=False, indent=2),
         instruction=instruction,
     )
-    messages = [
-        {"role": "system", "content": _ITEM_REWRITE_SYSTEM},
-        {"role": "user", "content": prompt},
-    ]
+    messages = _messages(_ITEM_REWRITE_SYSTEM, prompt, history)
 
     for attempt in range(3):
         raw, finish_reason = await _call_exaone(client, messages, max_tokens=2500)
@@ -718,7 +1061,9 @@ async def _rewrite_item(client, sec: SectionSpec, key: str, index: int, item, in
             logger.warning("섹션 %s 항목 %d 응답 잘림 (attempt %d) — 재생성", key, index, attempt + 1)
             continue
 
-        node = try_parse_json(raw)
+        # strict=True — 잘리거나 깨진 JSON을 '부분 복구'해서 받으면 원본의 멀쩡한
+        # 내용이 조각으로 교체된다. 편집 경로에서는 복구본 대신 재생성이 맞다.
+        node = try_parse_json(raw, strict=True)
         if not isinstance(node, dict) or "value" not in node:
             logger.warning("섹션 %s 항목 %d 파싱 실패 (attempt %d)", key, index, attempt + 1)
             continue
@@ -727,9 +1072,23 @@ async def _rewrite_item(client, sec: SectionSpec, key: str, index: int, item, in
         if has_suspicious_script(value):
             logger.warning("섹션 %s 항목 %d 스크립트 오염 (attempt %d)", key, index, attempt + 1)
             continue
+        leak = find_json_syntax_leak(value)
+        if leak:
+            logger.warning(
+                "섹션 %s 항목 %d 값에 JSON 조각이 섞임 (attempt %d) — 재생성 | %.120s",
+                key, index, attempt + 1, leak,
+            )
+            continue
         if not _same_shape(item, value):
             logger.warning("섹션 %s 항목 %d 타입 불일치 (attempt %d)", key, index, attempt + 1)
             continue
+
+        value, fixed = _reconcile_with_original(item, value, known_keys)
+        if fixed:
+            logger.warning(
+                "섹션 %s 항목 %d 키 구성을 원본에 맞춤 (%d건, - 는 떨어낸 키): %s",
+                key, index, len(fixed), fixed[:6],
+            )
 
         # 항목 하나짜리 리스트로 감싸 기존 필수 키 검증을 그대로 재사용
         cleaned, dropped = _clean_section(sec, [value])
@@ -741,7 +1100,122 @@ async def _rewrite_item(client, sec: SectionSpec, key: str, index: int, item, in
     return None
 
 
-async def _rewrite_section(client, profile: DocProfile, key: str, current, instruction: str):
+_ADD_ITEMS_SYSTEM = """당신은 10년 경력의 시니어 PM 겸 소프트웨어 아키텍트입니다.
+기존 문서 목록에 **새로 덧붙일 항목만** 작성합니다.
+
+JSON 하나만 출력하세요. 설명·인사말·마크다운 코드블록 금지.
+
+절대 규칙:
+- 새로 추가할 항목만 출력하세요. 기존 항목은 절대 다시 쓰지 마세요.
+- 아래 '기존 항목 예시'와 완전히 동일한 키 구성으로 출력하세요.
+- 기존 목록에 이미 있는 것과 같은 항목을 만들지 마세요.
+- placeholder($name, {value}, "기능명" 등)를 값으로 쓰지 마세요."""
+
+_ADD_ITEMS_PROMPT = """## 항목을 추가할 목록: {key} ({label})
+
+## 이 목록의 형식 규격
+{spec}
+
+## 이미 있는 항목 ({count}개) — 중복 금지
+{items}
+
+## 기존 항목 예시 (이 키 구성을 그대로 따르세요)
+{example}
+
+## 사용자 요청
+{instruction}
+
+## 출력 형식
+{{"value": [<새로 추가할 항목들>]}}
+
+value에는 **새 항목만** 담으세요. 기존 항목을 포함하면 문서가 망가집니다.
+개수를 지정하지 않았다면 요청에 맞는 만큼만, 많아도 {max_add}개 이내로 만드세요."""
+
+# 추가 요청 한 번에 만들 수 있는 항목 수 상한 — diff 검토 가능성과 토큰 예산 둘 다.
+_MAX_ADDED_ITEMS = 10
+
+
+async def _add_items(
+    client, sec: SectionSpec, key: str, baseline: list, instruction: str,
+    history: list[dict] | None = None,
+) -> list | None:
+    """새 항목만 생성해서 돌려준다. 실패하면 None.
+
+    목록 전체를 다시 쓰게 하지 않는 이유는 두 가지다.
+    (1) 엔드포인트 20개짜리 목록은 교체본이 _MAX_REWRITE_TOKENS를 넘어 매번 잘린다.
+    (2) 기존 항목을 모델 손에 다시 맡길 이유가 없다 — 프롬프트에는 라벨만 넣고
+        기존 항목 객체는 Python에서 그대로 이어붙이므로 변형될 수 없다.
+    """
+    example = next((it for it in baseline if isinstance(it, dict)), baseline[0] if baseline else None)
+    prompt = _ADD_ITEMS_PROMPT.format(
+        key=key, label=sec.label, spec=sec.spec,
+        count=len(baseline),
+        items=_item_labels(sec, baseline),
+        example=json.dumps(example, ensure_ascii=False, indent=2),
+        instruction=instruction,
+        max_add=_MAX_ADDED_ITEMS,
+    )
+    messages = _messages(_ADD_ITEMS_SYSTEM, prompt, history)
+
+    for attempt in range(3):
+        max_tokens = min(_MAX_REWRITE_TOKENS, 4000 * (attempt + 1))
+        raw, finish_reason = await _call_exaone(client, messages, max_tokens=max_tokens)
+        if finish_reason == "length":
+            logger.warning("섹션 %s 항목 추가 응답 잘림 (attempt %d) — 예산 늘려 재생성", key, attempt + 1)
+            continue
+
+        node = try_parse_json(raw, strict=True)
+        if not isinstance(node, dict) or "value" not in node:
+            logger.warning("섹션 %s 항목 추가 파싱 실패 (attempt %d)", key, attempt + 1)
+            continue
+
+        value = node["value"]
+        # 항목 하나만 달랑 준 경우도 받아준다
+        if not isinstance(value, list):
+            value = [value]
+        if has_suspicious_script(value):
+            logger.warning("섹션 %s 항목 추가 스크립트 오염 (attempt %d)", key, attempt + 1)
+            continue
+        leak = find_json_syntax_leak(value)
+        if leak:
+            logger.warning(
+                "섹션 %s 새 항목 값에 JSON 조각이 섞임 (attempt %d) — 재생성 | %.120s",
+                key, attempt + 1, leak,
+            )
+            continue
+
+        # 기존 항목과 모양이 다른 것은 버린다 (문자열 목록에 dict가 섞이는 등)
+        shaped = [v for v in value if example is None or _same_shape(example, v)]
+        cleaned, dropped = _clean_section(sec, shaped)
+        if dropped:
+            logger.warning("섹션 %s 새 항목 중 %d개가 필수 필드 누락 — 제외", key, dropped)
+        if not cleaned:
+            logger.warning("섹션 %s 항목 추가가 쓸 만한 항목을 못 만듦 (attempt %d)", key, attempt + 1)
+            continue
+
+        # 기존 항목과 라벨이 겹치는 것은 '추가'가 아니라 중복이므로 버린다
+        existing = {_norm_label(_item_label_of(sec, it)) for it in baseline}
+        fresh = []
+        for it in cleaned[:_MAX_ADDED_ITEMS]:
+            label = _norm_label(_item_label_of(sec, it))
+            if label and label in existing:
+                logger.info("섹션 %s 새 항목 %r 은 이미 있음 — 제외", key, label)
+                continue
+            existing.add(label)
+            fresh.append(it)
+
+        if not fresh:
+            logger.warning("섹션 %s 새 항목이 전부 기존과 중복 (attempt %d)", key, attempt + 1)
+            continue
+        return fresh
+
+    return None
+
+
+async def _rewrite_section(
+    client, profile: DocProfile, key: str, current, instruction: str,
+    history: list[dict] | None = None,
+):
     sec = profile.sections[key]
 
     # 원본은 절대 손대지 않고 그대로 모델에 넘긴다.
@@ -762,15 +1236,41 @@ async def _rewrite_section(client, profile: DocProfile, key: str, current, instr
     # 나머지 항목은 원본 객체를 그대로 재사용하므로 절대 변형되지 않는다.
     operation = "edit"
     if isinstance(baseline, list) and baseline:
-        indices, operation = await _select_item_indices(client, sec, key, baseline, instruction)
+        # 전체 재작성이 불가능한 크기인지 먼저 알아야 범위 판정을 그에 맞게 몰 수 있다
+        oversized = len(json.dumps(baseline, ensure_ascii=False, indent=2)) > _MAX_REWRITE_CHARS
+        indices, operation = await _select_item_indices(
+            client, sec, key, baseline, instruction, history, force_item=oversized,
+        )
+
+        # 삭제는 모델에게 목록을 다시 쓰게 할 일이 아니다. 뺄 항목을 골랐으면
+        # 나머지는 원본 객체 그대로 남기고 Python에서 지운다.
+        if operation == "remove" and indices:
+            drop = set(indices)
+            merged = [item for i, item in enumerate(baseline) if i not in drop]
+            logger.info("섹션 %s — 항목 %s 삭제 (%d → %d개)", key, sorted(drop), len(baseline), len(merged))
+            return merged
+
+        # 추가도 마찬가지 — 새 항목만 만들게 하고 기존 항목 뒤에 이어붙인다.
+        if operation == "add":
+            fresh = await _add_items(client, sec, key, baseline, instruction, history)
+            if fresh:
+                logger.info("섹션 %s — 새 항목 %d개 추가 (%d → %d개)",
+                            key, len(fresh), len(baseline), len(baseline) + len(fresh))
+                return list(baseline) + fresh
+            logger.warning("섹션 %s — 항목 추가 실패 — 전체 재작성으로 폴백", key)
+            indices = None
+
         if indices is not None:
             logger.info("섹션 %s — 항목 단위 수정 대상 %s", key, indices)
+            # 같은 섹션의 다른 항목들이 쓰는 키 = 이 섹션의 정당한 필드 목록
+            known_keys = {k for it in baseline if isinstance(it, dict) for k in it}
             results = await asyncio.gather(*[
-                _rewrite_item(client, sec, key, i, baseline[i], instruction) for i in indices
+                _rewrite_item(client, sec, key, i, baseline[i], instruction, history, known_keys)
+                for i in indices
             ], return_exceptions=True)
 
             merged = list(baseline)
-            changed = 0
+            changed = []
             for i, result in zip(indices, results):
                 if isinstance(result, Exception):
                     logger.error("섹션 %s 항목 %d 재작성 오류: %s", key, i, result)
@@ -779,21 +1279,35 @@ async def _rewrite_section(client, profile: DocProfile, key: str, current, instr
                     continue
                 if result != baseline[i]:
                     merged[i] = result
-                    changed += 1
+                    changed.append(i)
 
             if changed:
+                merged, changed = _revert_colliding_edits(sec, key, baseline, merged, changed)
+            if changed:
+                logger.info("섹션 %s — 항목 %s 수정 완료 (%d개 유지)", key, changed, len(merged))
                 return merged
             logger.warning("섹션 %s — 항목 단위 수정이 아무것도 바꾸지 못함 — 전체 재작성으로 폴백", key)
 
+    current_json = (
+        json.dumps(baseline, ensure_ascii=False, indent=2) if baseline is not None else "(비어 있음)"
+    )
+
+    # 교체본이 출력 한도에 들어갈 수 없는 크기면 시작하지 않는다. 그대로 진행하면
+    # 세 번 다 finish_reason="length"로 잘려 시간과 토큰만 쓰고 같은 자리에 온다.
+    if len(current_json) > _MAX_REWRITE_CHARS:
+        logger.warning(
+            "섹션 %s 원본이 %d자로 전체 재작성 한도(%d자)를 넘음 — 재작성 포기 "
+            "(항목 단위 수정/추가/삭제로는 처리 가능)",
+            key, len(current_json), _MAX_REWRITE_CHARS,
+        )
+        return None
+
     prompt = _REWRITE_PROMPT.format(
         key=key, label=sec.label, spec=sec.spec,
-        current=json.dumps(baseline, ensure_ascii=False, indent=2) if baseline is not None else "(비어 있음)",
+        current=current_json,
         instruction=instruction,
     )
-    messages = [
-        {"role": "system", "content": _REWRITE_SYSTEM},
-        {"role": "user", "content": prompt},
-    ]
+    messages = _messages(_REWRITE_SYSTEM, prompt, history)
 
     for attempt in range(3):
         max_tokens = _token_budget(baseline, attempt)
@@ -808,7 +1322,7 @@ async def _rewrite_section(client, profile: DocProfile, key: str, current, instr
             )
             continue
 
-        node = try_parse_json(raw)
+        node = try_parse_json(raw, strict=True)
         if not isinstance(node, dict) or "value" not in node:
             logger.warning("섹션 %s 재작성 파싱 실패 (attempt %d, finish=%s)", key, attempt + 1, finish_reason)
             continue
@@ -816,6 +1330,13 @@ async def _rewrite_section(client, profile: DocProfile, key: str, current, instr
         value = node["value"]
         if has_suspicious_script(value):
             logger.warning("섹션 %s 스크립트 오염 감지 (attempt %d) — 재생성", key, attempt + 1)
+            continue
+        leak = find_json_syntax_leak(value)
+        if leak:
+            logger.warning(
+                "섹션 %s 값에 JSON 조각이 섞임 (attempt %d) — 재생성 | %.120s",
+                key, attempt + 1, leak,
+            )
             continue
         if baseline is not None and not _same_shape(baseline, value):
             logger.warning(
@@ -926,13 +1447,14 @@ def _fallback_proposal(edits: list[dict]) -> str:
     return f"{', '.join(summaries)}을(를) 수정하려 합니다. 아래 변경 내용을 확인해 주세요. 진행할까요?"
 
 
-async def _build_proposal(client, profile: DocProfile, instruction: str, edits: list[dict]) -> str:
-    messages = [
-        {"role": "system", "content": _PROPOSAL_SYSTEM},
-        {"role": "user", "content": _PROPOSAL_PROMPT.format(
-            doc_label=profile.label, instruction=instruction, changes=_changes_digest(edits),
-        )},
-    ]
+async def _build_proposal(
+    client, profile: DocProfile, instruction: str, edits: list[dict],
+    history: list[dict] | None = None,
+) -> str:
+    prompt = _PROPOSAL_PROMPT.format(
+        doc_label=profile.label, instruction=instruction, changes=_changes_digest(edits),
+    )
+    messages = _messages(_PROPOSAL_SYSTEM, prompt, history)
     try:
         raw, _ = await _call_exaone(client, messages, max_tokens=800)
         node = try_parse_json(raw)
@@ -944,6 +1466,62 @@ async def _build_proposal(client, profile: DocProfile, instruction: str, edits: 
     except Exception as e:
         logger.warning("제안문 생성 실패: %s — 결정론적 문구로 대체", e)
     return _fallback_proposal(edits)
+
+
+def _append_relationship_sync(profile: DocProfile, document: dict, edits: list[dict]) -> None:
+    """tables 수정이 관계에 미치는 영향을 같은 제안에 실어 준다 — edits를 제자리 수정.
+
+    이름이 바뀌거나 사라진 테이블을 관계 문자열에 반영한다. 사용자가 승인 버튼을
+    한 번 누르면 두 섹션이 함께 적용되므로, 문서가 어긋난 중간 상태로 남지 않는다.
+    """
+    table_edit = next((e for e in edits if e["section"] == "tables"), None)
+    if table_edit is None:
+        return
+
+    before_tables = table_edit["before"] if isinstance(table_edit["before"], list) else []
+    after_tables = table_edit["after"] if isinstance(table_edit["after"], list) else []
+    renames, gone = _table_renames(before_tables, after_tables)
+    if not renames and not gone:
+        return
+
+    # 테이블 이름이 바뀌었으면 그 테이블을 가리키는 FK 컬럼·제약·인덱스도 따라가야 한다.
+    # 관계 문자열과 같은 이유로 모델이 아니라 Python이 한다 — 식별자 치환이라 정확하고,
+    # 모델에 맡기면 손대지 않아야 할 테이블까지 다시 쓰다 흘린다.
+    if renames:
+        synced_tables, fk_changes = _sync_fk_references(after_tables, renames)
+        if fk_changes:
+            logger.info("ERD 정합 — FK 참조 %d곳 갱신: %s", len(fk_changes), fk_changes[:6])
+            table_edit["after"] = synced_tables
+            table_edit["diff"] = _build_diff(
+                table_edit["before"], synced_tables, profile.sections["tables"].label_keys,
+            )
+
+    # relationships가 이번 요청으로 이미 수정됐다면 그 결과 위에 얹는다
+    rel_edit = next((e for e in edits if e["section"] == "relationships"), None)
+    base = rel_edit["after"] if rel_edit else document.get("relationships")
+    synced = _sync_relationships(base, renames, gone)
+    if synced == base:
+        return
+
+    logger.info(
+        "ERD 정합 — 테이블 이름 변경 %s, 삭제 %s → 관계 %d개 → %d개",
+        renames or "없음", sorted(gone) or "없음",
+        len(base) if isinstance(base, list) else 0, len(synced),
+    )
+
+    sec = profile.sections["relationships"]
+    if rel_edit:
+        rel_edit["after"] = synced
+        rel_edit["diff"] = _build_diff(rel_edit["before"], synced, sec.label_keys)
+    else:
+        original = document.get("relationships")
+        edits.append({
+            "section": "relationships",
+            "label": sec.label,
+            "before": original,
+            "after": synced,
+            "diff": _build_diff(original, synced, sec.label_keys),
+        })
 
 
 # ── 엔드포인트 ───────────────────────────────────────────────────────
@@ -974,10 +1552,20 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
             detail=f"지원하지 않는 문서 종류입니다: {doc_type} (가능: {', '.join(_PROFILES)})",
         )
 
-    # history는 최근 6턴까지만 — 문서 본문이 이미 크므로 대화까지 길어지면 컨텍스트가 넘친다
+    # 문서가 컨텍스트에 들어갈 수 있는 크기인지 먼저 본다. 넘으면 EXAONE이 400을 뱉는데
+    # 재시도 대상이 아니라 그대로 실패하므로, 여기서 이유가 분명한 응답으로 끊는다.
+    doc_chars = len(json.dumps(req.document, ensure_ascii=False))
+    if doc_chars > _MAX_DOCUMENT_CHARS:
+        logger.warning("문서편집 입력이 너무 큼(%s): %d자 > %d자", doc_type, doc_chars, _MAX_DOCUMENT_CHARS)
+        raise HTTPException(
+            status_code=413,
+            detail=f"문서가 너무 큽니다 ({doc_chars:,}자). {_MAX_DOCUMENT_CHARS:,}자 이하로 줄여주세요.",
+        )
+
+    # history는 최근 몇 턴까지만 — 문서 본문이 이미 크므로 대화까지 길어지면 컨텍스트가 넘친다
     history = [
         {"role": t.role, "content": t.content}
-        for t in req.history[-6:]
+        for t in req.history[-_MAX_HISTORY_TURNS:]
         if t.role in ("user", "assistant") and t.content.strip()
     ]
 
@@ -996,7 +1584,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
 
     # 대상 섹션을 병렬로 재작성 — 섹션끼리 의존이 없으므로 순차로 돌 이유가 없다
     results = await asyncio.gather(*[
-        _rewrite_section(exaone_client, profile, key, req.document.get(key), req.instruction)
+        _rewrite_section(exaone_client, profile, key, req.document.get(key), req.instruction, history)
         for key in decision["targets"]
     ], return_exceptions=True)
 
@@ -1024,6 +1612,9 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
             "diff": diff,
         })
 
+    if doc_type == "erd":
+        _append_relationship_sync(profile, req.document, edits)
+
     if not edits:
         return ok({
             "intent": "chat",
@@ -1034,7 +1625,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
 
     # 재작성이 끝난 뒤에 제안문을 만든다 — 실제 적용될 변경만 근거로 삼으므로
     # "이렇게 바꾸겠습니다"라고 말한 내용과 최종 결과가 어긋나지 않는다
-    proposal = await _build_proposal(exaone_client, profile, req.instruction, edits)
+    proposal = await _build_proposal(exaone_client, profile, req.instruction, edits, history)
 
     logger.info(
         "문서편집 제안 생성 (%s) — %d개 섹션: %s",

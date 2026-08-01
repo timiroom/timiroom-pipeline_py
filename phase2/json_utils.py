@@ -30,8 +30,54 @@ def has_suspicious_script(node) -> bool:
     return False
 
 
-def try_parse_json(raw: str) -> dict | list | None:
-    """마크다운·태그 제거 후 JSON 파싱. 깨진 경우 복구 시도."""
+# 산문에는 나올 수 없고 JSON 구조가 새어 든 경우에만 나오는 형태만 본다:
+#   `},` `}:` (닫는 중괄호 뒤 구분자)   `{:` `[:` (여는 괄호 바로 뒤 콜론)
+#
+# **중괄호만** 본다. 대괄호를 구분자와 함께 잡으려다 두 번 데였다(둘 다 실측):
+#   - "favorites: [공간 객체 배열], total: number"  → `],` 오탐
+#   - "['projector', 'screen'] 등 장비 보유 여부"   → `']` 오탐
+# 파라미터 설명에 예시 값 목록을 적는 건 아주 정상적인 문서다. 반면 산문에 중괄호가
+# 구분자와 붙어 나오는 일은 없어서, `}` 쪽은 넓게 잡아도 안전하다 — 실제 모델 출력
+# 24개 파일(원본 4 + 승인된 편집 결과 20)을 훑어 오탐 0, 진짜 오염 1건만 걸렸다.
+# 오탐은 곧 재생성 반복이고 사용자에겐 '제안 없음'으로 보이므로 데이터 손실만큼 나쁘다.
+_JSON_SYNTAX_LEAK_RE = re.compile(r'\}\s*[,:]|[{\[]\s*:')
+
+
+def find_json_syntax_leak(node) -> str | None:
+    """값 문자열 안에 JSON 문법 조각이 남아 있으면 그 문자열을 돌려준다.
+
+    깨진 응답을 _close_brackets/_salvage_last_valid_boundary가 '복구'하면
+    닫히지 않은 문자열이 뒤따르는 JSON 문법을 통째로 삼켜 이런 값이 만들어진다
+    (실측: "DEFAULT_FALSE'}, {: : NOT NULL"). 구조는 멀쩡해 보여서 타입·필수키
+    검증을 그대로 통과하므로 값 자체를 봐야 잡힌다. 무엇이 걸렸는지 로그에
+    남길 수 있도록 bool이 아니라 해당 문자열을 반환한다.
+    """
+    if isinstance(node, str):
+        return node if _JSON_SYNTAX_LEAK_RE.search(node) else None
+    if isinstance(node, dict):
+        # 키도 본다 — 실측: 파라미터 객체에 `descriptiontion:string, "required": ...}, {`
+        # 라는 키가 통째로 생겨났다. 값만 훑으면 이런 건 영영 안 걸린다.
+        for k in node:
+            if isinstance(k, str) and _JSON_SYNTAX_LEAK_RE.search(k):
+                return k
+        return next((hit for v in node.values() if (hit := find_json_syntax_leak(v))), None)
+    if isinstance(node, list):
+        return next((hit for v in node if (hit := find_json_syntax_leak(v))), None)
+    return None
+
+
+def has_json_syntax_leak(node) -> bool:
+    return find_json_syntax_leak(node) is not None
+
+
+def try_parse_json(raw: str, *, strict: bool = False) -> dict | list | None:
+    """마크다운·태그 제거 후 JSON 파싱. 깨진 경우 복구 시도.
+
+    strict=True면 '내용을 잃을 수 있는' 복구 단계(5~7)를 건너뛰고 None을 돌려준다.
+    문서 편집처럼 이미 멀쩡한 원본을 교체하는 경로에서는 부분 복구가 곧 데이터 손실이라,
+    복구본을 받느니 None을 받고 재생성하는 편이 안전하다. 생성 파이프라인은
+    기본값(strict=False)을 그대로 써서 '전체 폐기보다 부분 성공'을 유지한다.
+    """
     raw = _truncate_at_repetition(raw)
     text = _strip_markdown(raw)
     text = _find_json_start(text)
@@ -85,6 +131,12 @@ def try_parse_json(raw: str) -> dict | list | None:
                     no_trail = fixed
                     continue
             break
+
+    # 여기까지는 문법 교정만 했고 내용을 버리거나 지어내지 않았다.
+    # 아래 단계들은 잘린 응답을 '그럴듯하게' 메우므로 편집 경로에서는 쓰면 안 된다.
+    if strict:
+        logger.debug("try_parse_json(strict): 무손실 단계로 복구 실패 — 재생성 필요")
+        return None
 
     # 5) 누락된 쉼표 삽입: "value" "key" → "value", "key"
     add_comma = re.sub(r'("(?:[^"\\]|\\.)*"|\d+|true|false|null|\]|\})\s+("|\[|\{)', r'\1, \2', no_trail)
