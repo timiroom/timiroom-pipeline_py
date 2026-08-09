@@ -22,6 +22,10 @@ class SemanticChunkingService:
     """
 
     def __init__(self, embedder: EmbeddingService, max_chunk_size: int = 512, chunk_overlap: int = 64):
+        if max_chunk_size <= 0:
+            raise ValueError("max_chunk_size는 1 이상이어야 합니다")
+        if chunk_overlap < 0 or chunk_overlap >= max_chunk_size:
+            raise ValueError("chunk_overlap은 0 이상 max_chunk_size 미만이어야 합니다")
         self._embedder = embedder
         self._max_size = max_chunk_size
         self._overlap = chunk_overlap
@@ -30,8 +34,14 @@ class SemanticChunkingService:
         logger.debug("Semantic Chunking 시작 — 문서 길이: %d chars", len(text))
 
         sentences = self._split_sentences(text)
-        if len(sentences) <= 1:
-            return [self._build_chunk(text, metadata)]
+        if not sentences:
+            return []
+        if len(sentences) == 1:
+            return (
+                self._split_by_size(sentences[0], metadata)
+                if len(sentences[0]) > self._max_size
+                else [self._build_chunk(sentences[0], metadata)]
+            )
 
         embeddings = await self._embed_sentences(sentences)
         boundaries = self._detect_boundaries(embeddings)
@@ -79,9 +89,9 @@ class SemanticChunkingService:
         while start < len(text):
             end = min(start + self._max_size, len(text))
             result.append(self._build_chunk(text[start:end], metadata))
+            if end >= len(text):
+                break
             start = end - self._overlap
-            if start < 0:
-                start = 0
         return result
 
     def _build_chunk(self, content: str, metadata: dict) -> DocumentChunk:

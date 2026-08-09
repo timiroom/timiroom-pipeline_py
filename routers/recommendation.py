@@ -28,18 +28,18 @@ def _services() -> tuple[
 async def tech_stack(req: TechStackRequest) -> dict:
     svc, _, _ = _services()
     result = await svc.recommend(req.project_name, req.project_description, req.platform)
-    return ok(result.model_dump())
+    return ok(result.model_dump(by_alias=True))
 
 
 @router.post("/persona")
 async def persona(req: PersonaRecommendationRequest) -> dict:
     _, svc, _ = _services()
     result = await svc.recommend(req)
-    return ok(result.model_dump())
+    return ok(result.model_dump(by_alias=True))
 
 
 @router.post("/features")
 async def features(req: FeatureRecommendationRequest) -> dict:
     _, _, svc = _services()
     result = await svc.recommend(req)
-    return ok(result.model_dump())
+    return ok(result.model_dump(by_alias=True))

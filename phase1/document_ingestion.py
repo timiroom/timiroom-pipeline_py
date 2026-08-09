@@ -65,43 +65,63 @@ class DocumentIngestionService:
         if not texts:
             return 0
         embeddings = await self._embedder.embed(texts)
+        if len(embeddings) != len(texts):
+            raise RuntimeError(
+                f"임베딩 개수 불일치: texts={len(texts)}, embeddings={len(embeddings)}"
+            )
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._store_to_db, texts, embeddings, metadata)
 
     def _store_to_db(self, texts: list[str], embeddings: list[list[float]], metadata: dict) -> int:
+        if len(texts) != len(embeddings):
+            raise ValueError("texts와 embeddings 개수가 다릅니다")
         conn = self._get_conn()
         saved = 0
         try:
             with conn.cursor() as cur:
                 for i, (text, vec) in enumerate(zip(texts, embeddings)):
-                    try:
-                        meta = {**metadata, "chunk_index": i}
-                        tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
-                        content_hash = hashlib.md5(text.encode()).hexdigest()
-                        cur.execute(
-                            f"""
-                            INSERT INTO {self._document_table} (id, content, content_hash, metadata, embedding, tokens)
-                            VALUES (%s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
-                            ON CONFLICT (content_hash) DO NOTHING
-                            """,
-                            (
-                                str(uuid.uuid4()),
-                                text,
-                                content_hash,
-                                json.dumps(meta, ensure_ascii=False),
-                                str(vec),
-                                tokens_text,
-                            ),
-                        )
-                        if cur.rowcount > 0:
-                            saved += 1
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning("청크 저장 실패 (건너뜀) — index %d: %s", i, e)
+                    meta = {**metadata, "chunk_index": i}
+                    tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
+                    content_hash = self._content_hash(text, metadata)
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self._document_table} (id, content, content_hash, metadata, embedding, tokens)
+                        VALUES (%s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
+                        ON CONFLICT (content_hash) DO NOTHING
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            text,
+                            content_hash,
+                            json.dumps(meta, ensure_ascii=False),
+                            str(vec),
+                            tokens_text,
+                        ),
+                    )
+                    if cur.rowcount > 0:
+                        saved += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
         return saved
+
+    @staticmethod
+    def _content_hash(text: str, metadata: dict) -> str:
+        """Deduplicate source documents globally, but pipeline outputs per run.
+
+        Kafka-generated artifacts must retain their own pipeline metadata even when
+        two runs produce identical text. Source ingestion without a pipeline_id
+        keeps the original global content deduplication behavior.
+        """
+        pipeline_id = str((metadata or {}).get("pipeline_id") or "").strip()
+        doc_type = str((metadata or {}).get("type") or "").strip()
+        # 문서 유형은 검색 가능성에 직접 영향을 주므로 같은 본문이라도 유형이
+        # 다르면 별도 문서로 보존한다. 파이프라인 산출물은 실행 단위도 격리한다.
+        scope = f"{pipeline_id}\0{doc_type}\0"
+        return hashlib.md5(f"{scope}{text}".encode()).hexdigest()
 
     @staticmethod
     def _split_fixed(text: str, size: int) -> list[str]:

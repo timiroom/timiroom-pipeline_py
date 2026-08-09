@@ -12,11 +12,11 @@ class TechStackRequest(BaseModel):
 
 
 class TechStackResponse(BaseModel):
-    frontend: list[str] = []
-    backend: list[str] = []
-    database: list[str] = []
-    devops: list[str] = []
-    mobile: list[str] = []
+    frontend: list[str] = Field(default_factory=list)
+    backend: list[str] = Field(default_factory=list)
+    database: list[str] = Field(default_factory=list)
+    devops: list[str] = Field(default_factory=list)
+    mobile: list[str] = Field(default_factory=list)
 
     @classmethod
     def default_for(cls, platform: str) -> "TechStackResponse":
@@ -59,7 +59,7 @@ class RecommendedPersona(BaseModel):
 
 
 class PersonaRecommendationResponse(BaseModel):
-    personas: list[RecommendedPersona] = []
+    personas: list[RecommendedPersona] = Field(default_factory=list)
 
     @classmethod
     def empty(cls) -> "PersonaRecommendationResponse":
@@ -96,7 +96,7 @@ class RecommendedFeature(BaseModel):
 
 
 class FeatureRecommendationResponse(BaseModel):
-    features: list[RecommendedFeature] = []
+    features: list[RecommendedFeature] = Field(default_factory=list)
 
     @classmethod
     def empty(cls) -> "FeatureRecommendationResponse":

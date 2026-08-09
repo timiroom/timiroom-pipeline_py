@@ -23,9 +23,16 @@ class Settings(BaseSettings):
     exaone_api_key: str = ""
     exaone_endpoint_id: str = ""
 
+    # ── 비-AI 공식 자료 검색 ─────────────────────────────────────
+    kosis_api_key: str = ""
+    law_open_api_oc: str = ""
+    public_source_urls: str = ""
+    public_source_domains: str = "kosis.kr,law.go.kr,data.go.kr,go.kr,or.kr,ac.kr"
+    public_source_timeout_seconds: float = 8.0
+
     # ── PostgreSQL ────────────────────────────────────────────────
     db_url: str = "postgresql://localhost:5432/timiroom"
-    # 기존 Spring 임베딩(vector(1024))과 Solar(vector(4096))를 분리할 수 있다.
+    # 기존 Spring 임베딩과 Solar(vector(1024))는 테이블명으로 분리할 수 있다.
     rag_document_table: str = "document_chunks"
 
     # ── Kafka ─────────────────────────────────────────────────────
@@ -59,6 +66,12 @@ class Settings(BaseSettings):
 
     def get_allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]
+
+    def get_public_source_urls(self) -> list[str]:
+        return [url.strip() for url in self.public_source_urls.split(",") if url.strip()]
+
+    def get_public_source_domains(self) -> list[str]:
+        return [domain.strip() for domain in self.public_source_domains.split(",") if domain.strip()]
 
     def get_rag_document_table(self) -> str:
         return validate_sql_identifier(self.rag_document_table)

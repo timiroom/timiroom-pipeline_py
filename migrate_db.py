@@ -1,4 +1,4 @@
-"""Solar 4096차원 RAG 테이블과 RL 테이블을 멱등 생성한다.
+"""Solar 1024차원 RAG 테이블과 RL 테이블을 멱등 생성한다.
 
 기존 Spring 파이프라인의 ``document_chunks``(vector(1024))는 건드리지 않는다.
 NAS 배포에서는 RAG_DOCUMENT_TABLE=document_chunks_ko를 사용한다.
@@ -25,7 +25,7 @@ def main() -> None:
                         content      TEXT NOT NULL,
                         content_hash TEXT UNIQUE,
                         metadata     JSONB DEFAULT '{{}}'::jsonb,
-                        embedding    vector(4096),
+                        embedding    vector(1024),
                         tokens       TSVECTOR
                     )
                     """
@@ -42,10 +42,10 @@ def main() -> None:
                 (table_name,),
             )
             row = cur.fetchone()
-            if not row or row[0] != 4096:
+            if not row or row[0] != 1024:
                 raise RuntimeError(
-                    f"{table_name}.embedding은 vector(4096)이어야 합니다. "
-                    "기존 vector(1024) 테이블을 변경하지 말고 "
+                    f"{table_name}.embedding은 vector(1024)이어야 합니다. "
+                    "기존 Spring 파이프라인의 document_chunks 테이블을 변경하지 말고 "
                     "RAG_DOCUMENT_TABLE=document_chunks_ko를 사용하세요."
                 )
 
@@ -85,8 +85,13 @@ def main() -> None:
                 )
                 """
             )
+            # CREATE TABLE IF NOT EXISTS는 이미 존재하는(구버전 스키마) 테이블에
+            # 새로 추가된 컬럼을 반영하지 않으므로 별도로 보정한다.
+            cur.execute(
+                "ALTER TABLE rl_search_log ADD COLUMN IF NOT EXISTS avg_cohere_score DOUBLE PRECISION"
+            )
 
-    print(f"DB migration complete: {table_name} (vector(4096))")
+    print(f"DB migration complete: {table_name} (vector(1024))")
 
 
 if __name__ == "__main__":

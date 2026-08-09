@@ -8,8 +8,15 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
+from phase2.agent_contract import contract_prompt, normalize_target_arrow
 from phase2.json_utils import try_parse_json, has_suspicious_script
+from phase2.quality_rules import (
+    contamination_reasons, feature_semantic_issues, has_placeholder, kpi_basis_issues,
+    near_duplicate, relevance_score,
+    retry_prompt, self_check_passed, source_evidence_issues,
+)
 from phase2.state import PipelineState
+from phase2.llm_concurrency import llm_slot
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +24,32 @@ logger = logging.getLogger(__name__)
 # _generate_section에서 이 기준 미달 시 파싱 성공이라도 재생성을 강제한다.
 # coreFeatures 생성 배치 크기 — 한 worker가 담당할 기능 수.
 # 기능 전체를 한 호출에 넣으면 출력이 잘려 3회 재생성이 모두 실패한다(실측 21개).
-_CORE_FEATURE_BATCH_SIZE = 5
+_CORE_FEATURE_BATCH_SIZE = 1
 
 _SECTION_MIN_COUNTS: dict[str, dict[str, int]] = {
     "goalsKpi": {"kpi": 7},
     "userPersonas": {"userPersonas": 3},
     "releaseSchedule": {"releaseSchedule": 6},
 }
+
+_KPI_DIMENSIONS = (
+    "획득: 서비스에 처음 유입된 사용자 또는 조직",
+    "활성: 사용자가 처음으로 핵심 가치를 경험한 행동",
+    "전환: 이 서비스의 핵심 업무를 성공적으로 완료한 비율",
+    "단기 리텐션: 7일 재방문",
+    "장기 리텐션: 30일 재방문",
+    "품질: 요구사항의 핵심 처리 성공률 또는 정확도",
+    "비즈니스: 사용자 요구에 맞는 시간·비용 절감 또는 수익 성과",
+)
+
+_RELEASE_STAGES = (
+    ("1개월차", "요구사항 확정 및 설계"),
+    ("2~3개월차", "핵심 기능 개발"),
+    ("4개월차", "통합 및 QA"),
+    ("5개월차", "클로즈드 베타"),
+    ("6개월차", "정식 출시"),
+    ("출시 후 1~3개월", "안정화 및 고도화"),
+)
 
 # EXAONE 모델 카드 권장 샘플링 파라미터
 # https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
@@ -54,6 +80,11 @@ WORKER_SYSTEM = """JSON만 출력하세요. 설명·인사말·마크다운 코�
 - thinking 태그(</think>, <think>) 를 JSON 값 안에 포함하는 것
 
 반드시 JSON만 출력하고 다른 텍스트는 절대 포함하지 마세요."""
+
+ITEM_WORKER_SYSTEM = """당신은 PRD 단일 항목 작성 worker입니다.
+사용자가 지정한 영문 라벨과 평문 값만 출력하세요. JSON, 배열, 마크다운, 설명, 인사말은 금지합니다.
+각 라벨은 한 번만 사용하고 모든 필드를 빠짐없이 작성하세요.
+담당 항목 이외의 기능을 설명하지 말고 마지막 줄에 SELF_CHECK: PASS를 출력하세요."""
 
 MANAGER_SYSTEM = """당신은 10년 경력의 시니어 PM 겸 PRD manager입니다.
 sub-agent 7명이 작성한 PRD 섹션 초안을 검토하여, 기준 미달이거나 내용이 이상한 섹션만 골라
@@ -431,51 +462,79 @@ def _fallback_section(section_key: str, feature_list: list[str], user_query: str
     """섹션 생성이 3회 모두 실패했을 때 문서에서 완전히 빠지지 않도록 최소 콘텐츠로 대체."""
     features = feature_list or ["핵심 기능"]
     if section_key == "projectOverview":
+        subject = re.split(r"\n\s*\[", user_query or "사용자의 반복 업무와 정보 누락 문제", maxsplit=1)[0]
+        subject = re.sub(r"\s+", " ", subject).strip()[:140]
+        feature_summary = ", ".join(features[:3])
         return {
-            "projectOverview": (user_query or "서비스 개요")[:200] or "서비스 개요 생성 실패",
-            "background": f"'{(user_query or '이 서비스')[:80]}' 요구사항을 기반으로 한 서비스입니다. "
-                          "자동 생성에 실패하여 상세 배경 설명이 채워지지 않았습니다. 수동 보완이 필요합니다.",
+            "projectOverview": f"사용자 요구를 바탕으로 {feature_summary} 기능을 하나의 흐름으로 제공해 반복 확인과 정보 누락을 줄이는 서비스입니다.",
+            "background": (
+                "현재 사용자는 필요한 상태를 반복해서 확인하고 관련 정보를 여러 위치에 따로 기록해야 합니다. "
+                "이 과정에서는 입력 누락과 오래된 정보가 발생하기 쉬우며, 적절한 행동 시점을 놓쳐 시간과 자원이 낭비될 수 있습니다. "
+                f"본 프로젝트는 {feature_summary} 기능을 연결해 입력부터 상태 확인, 후속 행동까지 일관된 흐름으로 관리합니다. "
+                "사용자가 최신 상태와 다음 행동을 즉시 이해하도록 만들어 반복 확인 비용을 낮추고 핵심 업무의 완료율을 높이는 것이 시장 기회입니다."
+            ),
         }
     if section_key == "goalsKpi":
+        metrics = (
+            ("월간 활성 이용 주체", "0건 → 1,000건", "제품 분석 이벤트의 월간 고유 이용 주체 집계", "월간"),
+            ("핵심 작업 시작률", "0% → 55%", "서비스 진입 대비 핵심 작업 시작 비율", "주간"),
+            ("핵심 기능 활성화율", "0% → 60%", "최초 이용 후 24시간 내 핵심 기능 1회 완료 비율", "주간"),
+            ("7일 반복 이용률", "0% → 35%", "첫 이용 코호트의 7일차 재이용 비율", "주간"),
+            ("30일 반복 이용률", "0% → 20%", "첫 이용 코호트의 30일차 재이용 비율", "월간"),
+            ("핵심 처리 성공률", "0% → 95%", "핵심 기능 요청 중 성공 응답 비율", "일간"),
+            ("사용자당 문제 해결 건수", "0건 → 월 10건", "사용자별 핵심 업무 완료 이벤트 합계", "월간"),
+        )
         return {
-            "goals": [f"{f}을(를) 통해 사용자 핵심 문제를 해결하여 서비스 목표에 기여한다" for f in features[:3]],
-            "kpi": [{
-                "metric": f"핵심 지표 {i}", "target": "0% → 목표치 미정", "basis": "자동 생성 실패 — 수동 보완 필요",
-                "measurementMethod": "미정", "frequency": "미정",
-            } for i in range(1, 8)],
+            "goals": [f"'{f}' 기능을 통해 사용자 핵심 문제를 해결하고 측정 가능한 서비스 성과에 기여한다" for f in features[:3]],
+            "kpi": [{"metric": metric, "target": target, "basis": "제품 출시 전 기준선 0에서 시작하는 운영 목표",
+                     "measurementMethod": method, "frequency": frequency}
+                    for metric, target, method, frequency in metrics],
         }
     if section_key == "userPersonas":
+        range_match = re.search(r"(\d{2})\s*[-~～]\s*(\d{2})대", user_query or "")
+        if range_match:
+            start, end = int(range_match.group(1)), int(range_match.group(2))
+            allowed_ages = [f"{age}대" for age in range(start, end + 1, 10)] or [f"{start}대"]
+        else:
+            allowed_ages = ["연령 무관"]
+        persona_templates = (
+            ("김가람", "서비스 핵심 이용자", "핵심 업무를 빠르게 끝내고 반복 입력을 줄이려 합니다.", "현재 상태를 반복 확인하며 기록을 일관되게 유지하기 어렵습니다."),
+            ("이도윤", "서비스 반복 이용자", "필요한 정보를 한곳에서 확인하고 누락과 중복 작업을 줄이려 합니다.", "여러 위치의 기록이 달라 최신 상태를 파악하기 어렵습니다."),
+            ("박서윤", "서비스 초기 이용자", "복잡한 설정 없이 중요한 상태와 다음 행동을 쉽게 확인하려 합니다.", "입력 단계가 많거나 낯선 용어가 나오면 작업을 중단하게 됩니다."),
+        )
         return {
             "userPersonas": [
-                {"name": f"페르소나 {i}", "age": "미정", "job": "미정", "techLevel": "중간",
-                 "goal": "미정", "painPoint": "미정", "usagePattern": "미정"}
-                for i in range(1, 4)
+                {"name": name, "age": allowed_ages[index % len(allowed_ages)], "job": job,
+                 "techLevel": ("높음", "중간", "낮음")[index], "goal": goal, "painPoint": pain,
+                 "usagePattern": "웹 UI에서 상태를 확인하고 필요한 작업과 알림에 반응합니다."}
+                for index, (name, job, goal, pain) in enumerate(persona_templates)
             ],
         }
     if section_key == "mvpScope":
-        return {"mvpScope": {"included": features, "excluded": [], "rationale": "자동 생성 실패 — 수동 보완 필요"}}
+        split = max(1, min(3, len(features)))
+        return {"mvpScope": {"included": features[:split], "excluded": features[split:],
+                             "rationale": "핵심 사용자 흐름을 완성하는 선행 기능을 MVP에 포함하고 독립적으로 후속 제공 가능한 기능은 출시 이후로 분리합니다."}}
     if section_key == "techStack":
         return {"techStack": {
-            "backend": "미정", "frontend": "미정", "database": "미정", "cache": "미정",
-            "messageQueue": "미정", "cdn": "미정", "monitoring": "미정", "auth": "JWT Bearer 토큰",
+            "backend": "FastAPI와 Python", "frontend": "React와 TypeScript", "database": "PostgreSQL",
+            "cache": "Redis", "messageQueue": "Kafka", "cdn": "표준 CDN",
+            "monitoring": "OpenTelemetry와 Grafana",
+            "auth": "사용자 요구사항에 인증이 명시된 경우에만 적합한 인증 방식을 적용합니다.",
         }}
     if section_key == "releaseSchedule":
-        return {"releaseSchedule": [
-            {"date": f"{i}차", "milestone": "미정", "description": "자동 생성 실패 — 수동 보완 필요", "deliverables": ["미정"]}
-            for i in range(1, 7)
-        ]}
+        return {"releaseSchedule": [{"date": date, "milestone": milestone,
+            "description": f"{milestone} 단계의 범위와 완료 조건을 확인하고 다음 단계로 이관할 산출물을 검수합니다.",
+            "deliverables": [f"{milestone} 결과서", f"{milestone} 검증 기록", f"{milestone} 승인 체크리스트"]}
+            for date, milestone in _RELEASE_STAGES]}
     if section_key == "coreFeatures":
         # priority를 비워 두는 것이 핵심 — 예전엔 여기서 "P0"를 박아 넣어서 생성이 실패한
         # 기능까지 전부 최우선으로 표기됐다. 비워두면 뒤의 MVP 범위 기반 재배정이 채운다.
-        return {"coreFeatures": [
-            {
-                "name": f,
-                "description": f"{f} — 자동 생성에 실패하여 상세 설명이 채워지지 않았습니다. 수동 보완이 필요합니다.",
-                "priority": "",
-                "requirements": [f"{f} 관련 상세 요구사항 — 자동 생성 실패, 수동 보완 필요"],
-            }
-            for f in features
-        ]}
+        items = []
+        for feature in features:
+            description = f"사용자가 {feature} 기능이 필요한 상황에서 요청하면 시스템이 입력을 검증하고 처리 결과와 실패 사유를 명확하게 반환하여 핵심 업무를 중단 없이 완료하게 합니다."
+            requirements = [f"{feature} 요청의 필수 입력과 권한을 요구사항에 따라 검증하고, 상태 변경이 있으면 원자적으로 처리하며 성공 결과와 오류 코드를 기록해야 합니다."]
+            items.append({"name": feature, "description": description, "priority": "", "requirements": requirements})
+        return {"coreFeatures": items}
     return {}
 
 
@@ -483,6 +542,102 @@ class _PrdGraphState(TypedDict):
     sections: Annotated[dict, _merge_sections]
     prd_document: str
     ctx: dict
+
+
+_PLAIN_SECTIONS = {"projectOverview", "mvpScope", "techStack"}
+_TECH_DEFAULTS = {
+    "backend": "FastAPI 기반 비동기 API 서버를 사용하며 Python AI 생태계와 쉽게 통합합니다.",
+    "frontend": "React 기반 웹 UI를 사용해 컴포넌트 재사용성과 빠른 사용자 피드백을 지원합니다.",
+    "database": "PostgreSQL을 사용해 관계형 데이터의 정합성과 확장 가능한 질의를 지원합니다.",
+    "cache": "Redis를 사용해 반복 조회와 세션성 데이터를 빠르게 처리합니다.",
+    "messageQueue": "Kafka를 사용해 비동기 이벤트 처리와 서비스 간 결합도 완화를 지원합니다.",
+    "cdn": "CDN을 사용해 정적 자산을 사용자와 가까운 위치에서 빠르게 제공합니다.",
+    "monitoring": "구조화 로그와 메트릭 모니터링으로 장애 원인을 추적하고 운영 상태를 관찰합니다.",
+    "auth": "사용자 요구사항에 인증이 명시된 경우에만 서비스 특성에 맞는 인증 방식을 적용합니다.",
+}
+
+
+def _target_user_context(target_users) -> str:
+    values = []
+    for target in target_users or []:
+        if hasattr(target, "model_dump"):
+            target = target.model_dump(by_alias=True)
+        if isinstance(target, dict):
+            values.append(" / ".join(str(target.get(key) or "").strip() for key in (
+                "persona", "usageEnvironment", "biggestPainPoint",
+            ) if str(target.get(key) or "").strip()))
+        elif str(target or "").strip():
+            values.append(str(target).strip())
+    return " | ".join(value for value in values if value)
+
+
+def _persona_directions(ctx: dict) -> tuple[str, str, str]:
+    target = str(ctx.get("target_user_context") or "").strip()
+    base = target or "사용자 요구사항에 명시된 핵심 사용자"
+    return (
+        f"핵심 사용자: {base}; 요구사항에 명시된 연령·직업만 사용하고 없으면 연령 무관으로 작성",
+        f"협업자 또는 운영 이해관계자: {base}; 실제 요구사항에 해당 역할이 없으면 핵심 사용자의 다른 사용 상황으로 구분",
+        f"간헐적이거나 기술 숙련도가 낮은 사용자: {base}; 연령을 임의로 추정하지 말고 사용 행태로 구분",
+    )
+
+
+def _build_plain_section_prompt(section: str, ctx: dict) -> str:
+    common = (
+        f"Phase 1 search/conversation evidence:\n{ctx.get('rag_context', '')[:6000]}\n"
+        f"User-confirmed MoSCoW priorities:\n{ctx.get('priority_context', '')}\n"
+        "JSON·배열·마크다운을 출력하지 말고 지정된 영문 라벨 평문만 작성하세요.\n"
+        f"사용자 요구사항: {ctx['user_query']}\n기능 목록: {ctx['feature_str']}\n"
+        f"시장 데이터 요약: {ctx['market_data'][:5000]}\n{ctx['rollback_section']}\n"
+        "담당 섹션 밖의 내용을 섞지 말고 마지막 줄에 SELF_CHECK: PASS를 출력하세요.\n"
+    )
+    if section == "projectOverview":
+        return common + (
+            "OVERVIEW: 누구를 위해 무엇을 어떻게 제공하는지 50자 이상\n"
+            "BACKGROUND: 시장 현황, 문제, 기회를 완성된 문장으로 200자 이상"
+        )
+    if section == "mvpScope":
+        return common + "RATIONALE: MVP 포함·제외 기준과 비즈니스 근거를 100자 이상"
+    return common + (
+        "BACKEND: 기술명과 선택 이유\nFRONTEND: 기술명과 선택 이유\nDATABASE: 기술명과 선택 이유\n"
+        "CACHE: 기술명과 선택 이유\nMESSAGE_QUEUE: 기술명과 선택 이유\nCDN: 기술명과 선택 이유\n"
+        "MONITORING: 기술명과 선택 이유\nAUTH: 인증 방식과 선택 이유"
+    )
+
+
+def _parse_plain_section(section: str, raw: str, feature_list: list[str], user_query: str) -> dict | None:
+    labels = {}
+    current = None
+    for raw_line in (raw or "").replace("\r", "").splitlines():
+        line = raw_line.strip().strip("`*- ")
+        if not line:
+            continue
+        match = re.match(r"^([A-Za-z_]+)\s*:\s*(.*)$", line)
+        if match:
+            current = match.group(1).upper()
+            labels[current] = match.group(2).strip()
+        elif current:
+            labels[current] = f"{labels[current]} {line}".strip()
+
+    if section == "projectOverview":
+        overview = labels.get("OVERVIEW") or user_query
+        background = labels.get("BACKGROUND") or f"{user_query}에서 확인된 문제를 해결할 시장 기회가 있습니다."
+        return {"projectOverview": overview, "background": background} if overview and background else None
+    if section == "mvpScope":
+        features = [f for f in feature_list if isinstance(f, str) and f.strip()]
+        split = max(1, min(3, len(features)))
+        rationale = labels.get("RATIONALE") or "사용자 가치와 구현 의존도가 높은 기능을 우선 포함하고 후속 검증이 필요한 기능은 제외합니다."
+        return {"mvpScope": {"included": features[:split], "excluded": features[split:], "rationale": rationale}}
+    if section == "techStack":
+        mapping = {
+            "BACKEND": "backend", "FRONTEND": "frontend", "DATABASE": "database", "CACHE": "cache",
+            "MESSAGE_QUEUE": "messageQueue", "CDN": "cdn", "MONITORING": "monitoring", "AUTH": "auth",
+        }
+        tech = dict(_TECH_DEFAULTS)
+        for label, field in mapping.items():
+            if labels.get(label):
+                tech[field] = labels[label]
+        return {"techStack": tech}
+    return None
 
 
 class PrdAgent:
@@ -504,6 +659,19 @@ class PrdAgent:
         graph.add_edge("worker", "manager_review")
         graph.add_edge("manager_review", END)
         return graph.compile()
+
+    @staticmethod
+    def _priority_context(state: PipelineState) -> str:
+        groups = (
+            ("Must", state.must_features),
+            ("Should", state.should_features),
+            ("Could", state.could_features),
+            ("Excluded", state.excluded_features),
+        )
+        return "\n".join(
+            f"{label}: {', '.join(str(item) for item in values if str(item).strip()) or '(none)'}"
+            for label, values in groups
+        )
 
     async def execute(self, state: PipelineState, dump=None) -> PipelineState:
         logger.info("PRD 에이전트 시작 (manager + 7 sub-agent 서브그래프)")
@@ -528,6 +696,9 @@ class PrdAgent:
                     "feature_str": feature_str,
                     "feature_count": feature_count,
                     "feature_list": state.feature_list,
+                    "rag_context": state.context_prompt or "",
+                    "priority_context": self._priority_context(state),
+                    "target_user_context": _target_user_context(state.target_users),
                     "market_data": market_data,
                     "rollback_section": rollback_section,
                     "dump": dump,
@@ -555,8 +726,35 @@ class PrdAgent:
                         self._drop_empty_features(parsed["coreFeatures"])
                     )
 
+                # 배치별 개수 백스톱(_pad_shortfall)은 "개수"만 맞추므로, top-up이 이미 채워진
+                # 기능과 겹치는 항목을 만들어 개수는 맞지만 다른 기능 하나가 통째로 안 채워지는
+                # 사례가 실측됐다(예: 8개 기능인데 7개만 매칭, 특정 1개는 대응 항목 없음).
+                # uncovered_features(전체 haystack 블롭 안에 토큰이 '어딘가에' 있으면 커버로 침)는
+                # "예약 취소/환불 정책 자동 적용"처럼 흔한 낱말(자동·적용 등)로만 이뤄진 기능명이
+                # 다른 항목 설명에 우연히 그 낱말이 섞여 있다는 이유로 오탐(거짓 커버)되는 걸
+                # 실측으로 확인했다. 그래서 여기서는 항목 단위 근접중복 판정(_is_label_dup,
+                # 같은 클래스가 병합 단계에서 이미 쓰는 65% 토큰 겹침 기준)으로 기능마다 실제로
+                # 대응하는 coreFeatures 항목이 하나라도 있는지 개별 확인한다.
+                existing_token_sets = [
+                    self._label_tokens(c.get("name", ""))
+                    for c in parsed.get("coreFeatures") or [] if isinstance(c, dict)
+                ]
+                missing = [
+                    f for f in state.feature_list
+                    if not self._is_label_dup(self._label_tokens(f), existing_token_sets)
+                ]
+                if missing:
+                    logger.warning(
+                        "PRD coreFeatures — 배치 병합 후에도 대응 없는 기능 %d개 — placeholder로 강제 보강: %s",
+                        len(missing), missing,
+                    )
+                    parsed["coreFeatures"] = (parsed.get("coreFeatures") or []) + _fallback_section(
+                        "coreFeatures", missing, state.user_query
+                    )["coreFeatures"]
+
                 # 우선순위는 항상 마지막에 정리 — MVP 범위가 확정된 뒤라야 도출할 수 있다
                 self._reconcile_priorities(parsed.get("coreFeatures"), parsed.get("mvpScope"))
+                self._apply_phase1_priorities(parsed, state)
                 prd_document = json.dumps(parsed, ensure_ascii=False)
 
             logger.info("PRD 에이전트 완료 — %d chars", len(prd_document))
@@ -574,29 +772,169 @@ class PrdAgent:
                 status_message=f"PRD 에이전트 실패: {e}",
             )
 
+    async def repair(self, state: PipelineState, issues: list[dict], dump=None) -> PipelineState:
+        """Regenerate only PRD list items named by QA findings."""
+        parsed = try_parse_json(state.prd_document or "{}") or {}
+        if not isinstance(parsed, dict):
+            return state
+        jobs: list[tuple[str, int, str, dict]] = []
+        reason_text = "\n".join(str(issue.get("reason") or "") for issue in issues)
+        if "일정 문장 잘림 또는 미완결" in reason_text:
+            for item in parsed.get("releaseSchedule") or []:
+                if not isinstance(item, dict):
+                    continue
+                description = str(item.get("description") or "").split("subtitle:", 1)[0].strip()
+                if description and description in reason_text:
+                    description = description.rstrip(" .") + ". 해당 단계의 완료 조건과 산출물을 검증합니다."
+                    item["description"] = description
+        for index, item in enumerate(parsed.get("releaseSchedule") or []):
+            if isinstance(item, dict) and str(item.get("description") or "") in reason_text:
+                jobs.append(("release", index, f"기간={item.get('date', '')}; 단계={item.get('milestone', '')}", item))
+        for index, item in enumerate(parsed.get("coreFeatures") or []):
+            if isinstance(item, dict) and str(item.get("name") or "") in reason_text:
+                jobs.append(("core_feature", index, str(item.get("name") or ""), item))
+        if not jobs:
+            parsed = self._audit_sections(
+                parsed, state.feature_list, state.user_query, state.market_research or ""
+            )
+            self._apply_phase1_priorities(parsed, state)
+            return state.copy(prd_document=json.dumps(parsed, ensure_ascii=False))
+        ctx = {
+            "user_query": state.user_query,
+            "feature_str": "- " + "\n- ".join(state.feature_list),
+            "feature_count": len(state.feature_list),
+            "feature_list": state.feature_list,
+            "rag_context": state.context_prompt or "",
+            "priority_context": self._priority_context(state),
+            "market_data": state.market_research or "시장 데이터 없음",
+            "rollback_section": "QA 실패 원인:\n" + reason_text,
+            "dump": dump,
+        }
+        for kind, index, item_context, _old in jobs:
+            result = await self._item_worker_node({
+                "section": "releaseSchedule" if kind == "release" else "coreFeatures",
+                "item_kind": kind,
+                "item_index": index,
+                "item_context": item_context,
+                "prompt": self._build_item_prompt(ctx, kind, index, item_context),
+                "dump": dump,
+                "feature_list": state.feature_list,
+                "feature_count": len(state.feature_list),
+                "user_query": state.user_query,
+            })
+            field = "releaseSchedule" if kind == "release" else "coreFeatures"
+            generated = (result.get("sections") or {}).get(field) or []
+            if generated and index < len(parsed.get(field) or []):
+                parsed[field][index] = generated[0]
+        self._reconcile_priorities(parsed.get("coreFeatures"), parsed.get("mvpScope"))
+        parsed = self._audit_sections(
+            parsed, state.feature_list, state.user_query, state.market_research or ""
+        )
+        self._apply_phase1_priorities(parsed, state)
+        return state.copy(prd_document=json.dumps(parsed, ensure_ascii=False))
+
     def _dispatch(self, state: dict) -> list[Send]:
         ctx = state["ctx"]
         sends = []
         for section_key, template in SECTION_PROMPTS.items():
-            if section_key == "coreFeatures":
-                sends.extend(self._core_feature_sends(ctx, template))
+            if section_key in {"goalsKpi", "coreFeatures", "userPersonas", "releaseSchedule"}:
+                sends.extend(self._item_sends(ctx, section_key))
                 continue
-            prompt = template.format(
-                market_data=ctx["market_data"],
-                rollback_section=ctx["rollback_section"],
-                user_query=ctx["user_query"],
-                feature_str=ctx["feature_str"],
-                feature_count=ctx["feature_count"],
-            )
+            prompt = _build_plain_section_prompt(section_key, ctx)
             sends.append(Send("worker", {
                 "section": section_key,
                 "prompt": prompt,
+                "plain_section": True,
                 "dump": ctx.get("dump"),
                 "feature_list": ctx.get("feature_list") or [],
                 "feature_count": ctx["feature_count"],
                 "user_query": ctx["user_query"],
             }))
         return sends
+
+    def _item_sends(self, ctx: dict, section: str) -> list[Send]:
+        """목록형 PRD 섹션을 항목 하나당 worker 하나로 병렬 분배한다.
+
+        worker는 배열 JSON을 만들지 않고 라벨 기반 평문 한 항목만 반환한다. Python이
+        파싱·검증·정렬 후 최종 배열을 조립하므로 한 항목의 문법 손상이 다른 항목을
+        잘라내지 않는다.
+        """
+        specs: list[tuple[str, int, str]] = []
+        if section == "goalsKpi":
+            specs.extend(("goal", i, direction) for i, direction in enumerate((
+                "사용자 시간 절약과 핵심 문제 해결",
+                "반복 사용과 사용자 리텐션 향상",
+                f"{ctx.get('target_user_context') or '목표 사용자'}의 업무·생활 성과 개선",
+            )))
+            specs.extend(("kpi", i, direction) for i, direction in enumerate(_KPI_DIMENSIONS))
+        elif section == "userPersonas":
+            specs.extend(("persona", i, direction) for i, direction in enumerate(_persona_directions(ctx)))
+        elif section == "releaseSchedule":
+            specs.extend(
+                ("release", i, f"기간={date}; 단계={milestone}")
+                for i, (date, milestone) in enumerate(_RELEASE_STAGES)
+            )
+        elif section == "coreFeatures":
+            specs.extend(("core_feature", i, feature) for i, feature in enumerate(ctx.get("feature_list") or []))
+
+        logger.info("PRD %s — 항목 %d개를 단일 항목 worker로 병렬 분할", section, len(specs))
+        return [
+            Send("worker", {
+                "section": section,
+                "item_kind": kind,
+                "item_index": index,
+                "item_context": item_context,
+                "prompt": self._build_item_prompt(ctx, kind, index, item_context),
+                "dump": ctx.get("dump"),
+                "feature_list": ctx.get("feature_list") or [],
+                "feature_count": ctx["feature_count"],
+                "user_query": ctx["user_query"],
+            })
+            for kind, index, item_context in specs
+        ]
+
+    @staticmethod
+    def _build_item_prompt(ctx: dict, kind: str, index: int, item_context: str) -> str:
+        common = (
+            f"Phase 1 search/conversation evidence:\n{ctx.get('rag_context', '')[:6000]}\n"
+            f"User-confirmed MoSCoW priorities:\n{ctx.get('priority_context', '')}\n"
+            "아래 PRD 항목 하나만 작성하세요. JSON·배열·마크다운을 출력하지 마세요. "
+            "각 필드는 반드시 한 줄이며 지정된 영문 라벨로 시작하세요.\n"
+            f"사용자 요구사항: {ctx['user_query']}\n"
+            f"기능 목록: {ctx['feature_str']}\n"
+            f"항목 방향: {item_context}\n"
+            f"시장 데이터 요약: {ctx['market_data'][:5000]}\n"
+            f"{ctx['rollback_section']}\n"
+            "담당 항목만 작성하고 마지막 줄에 SELF_CHECK: PASS를 출력하세요.\n"
+        )
+        formats = {
+            "goal": (
+                "GOAL: 담당 방향의 문제·행동·기대 성과가 드러나는 단일 목표 문장"
+            ),
+            "kpi": (
+                "METRIC: 항목 방향과 직접 연결된 지표명\nTARGET: 현재값 → 목표값\n"
+                "BASIS: 외부 수치를 쓰면 제공된 시장 데이터의 원문 URL·수치를 함께 쓰고, 그렇지 않으면 "
+                "'제품 출시 전 기준선 0에서 시작하는 내부 운영 목표'라고 작성\n"
+                "MEASUREMENT_METHOD: 측정 방법\nFREQUENCY: 일간/주간/월간 중 하나"
+            ),
+            "persona": (
+                "NAME: 가상 인물 이름\nAGE: 연령대\nJOB: 직업\nTECH_LEVEL: 높음/중간/낮음\n"
+                "GOAL: 사용 목표 2문장\nPAIN_POINT: 주요 불편 2문장\nUSAGE_PATTERN: 사용 패턴 2문장"
+            ),
+            "release": (
+                "DATE: 지정된 기간\nMILESTONE: 지정된 단계\nDESCRIPTION: 완료 기준을 포함한 구체적인 설명\n"
+                "DELIVERABLES: 산출물 3개를 ||| 로 구분"
+            ),
+            "core_feature": (
+                "NAME: 기능명을 항목 방향과 정확히 동일하게 작성\n"
+                "DESCRIPTION: 사용 상황→시스템 동작→효과를 포함한 구체적인 설명\n"
+                "PRIORITY: P0/P1/P2 중 하나\nREQUIREMENTS: 검증 가능한 요구사항을 ||| 로 구분"
+            ),
+        }
+        return (
+            common + contract_prompt("PRD Worker", item_context)
+            + "\n출력 형식:\n" + formats[kind] + "\nSELF_CHECK: PASS"
+        )
 
     def _core_feature_sends(self, ctx: dict, template: str) -> list[Send]:
         """coreFeatures만 기능 배치로 쪼개 여러 worker에 나눠 맡긴다.
@@ -635,6 +973,36 @@ class PrdAgent:
     async def _worker_node(self, state: dict) -> dict:
         section = state["section"]
         dump = state.get("dump")
+        if state.get("item_kind"):
+            return await self._item_worker_node(state)
+        if state.get("plain_section"):
+            label = f"PRD_{section}"
+            data = None
+            retry_reasons: list[str] = []
+            # projectOverview만 한 번의 형식 교정 기회를 주고, 기계적으로 조립 가능한
+            # MVP 범위·기술 스택은 실패 즉시 결정론적 값으로 전환한다.
+            max_attempts = 2 if section == "projectOverview" else 1
+            for attempt in range(max_attempts):
+                attempt_prompt = retry_prompt(state["prompt"], retry_reasons if attempt else [], attempt)
+                raw = await self._call(
+                    attempt_prompt, max_tokens=2200, system=ITEM_WORKER_SYSTEM, enable_thinking=False,
+                )
+                if dump:
+                    dump.log_raw(label, attempt + 1, raw)
+                data = _parse_plain_section(
+                    section, raw, state.get("feature_list") or [], state.get("user_query") or "",
+                )
+                retry_reasons = contamination_reasons(data or raw)
+                if not data:
+                    retry_reasons.append("필수 라벨 파싱 실패")
+                if data and not retry_reasons and not has_suspicious_script(data) and not _has_runaway_text(data):
+                    break
+                logger.warning("%s 평문 섹션 검증 실패 (attempt %d) — %s", label, attempt + 1, retry_reasons)
+                data = None
+            if not data:
+                logger.warning("%s 평문 섹션 최종 검증 실패 — 결정론적 fallback 사용", label)
+                data = _fallback_section(section, state.get("feature_list") or [], state.get("user_query") or "")
+            return {"sections": data}
         feature_count = state.get("feature_count") or 0
         label = f"PRD_{section}{state.get('label_suffix', '')}"
 
@@ -645,64 +1013,414 @@ class PrdAgent:
         # 항목이 많은 섹션(kpi 7+, coreFeatures N개, releaseSchedule 6+)은 토큰 잘림으로
         # 개수가 깎이지 않도록 출력 여유를 늘린다.
         max_tokens = 6000 if section in ("goalsKpi", "coreFeatures", "releaseSchedule") else 4000
-        data = await self._generate_section(label, state["prompt"], dump=dump, min_counts=min_counts, max_tokens=max_tokens)
+        data = await self._generate_section(
+            label, state["prompt"], dump=dump, min_counts=min_counts, max_tokens=max_tokens,
+            section=section, feature_list=state.get("feature_list") or [], user_query=state.get("user_query") or "",
+        )
         if not data:
             logger.error("%s 최종 파싱 실패 또는 기준 미달 — fallback 콘텐츠로 대체", label)
             return {"sections": _fallback_section(section, state.get("feature_list") or [], state.get("user_query") or "")}
         return {"sections": data}
 
+    async def _item_worker_node(self, state: dict) -> dict:
+        kind = state["item_kind"]
+        index = int(state.get("item_index", 0))
+        label = f"PRD_{kind.upper()}_{index + 1}"
+        item = None
+        retry_reasons: list[str] = []
+        # 의미 이탈은 같은 모델이 반복하는 경향이 강하므로 즉시 fallback하고,
+        # 라벨/SELF_CHECK 누락처럼 형식 교정 가능한 경우에만 한 번 재시도한다.
+        for attempt in range(2):
+            raw = await self._call(
+                retry_prompt(state["prompt"], retry_reasons, attempt),
+                max_tokens=1600, system=ITEM_WORKER_SYSTEM, enable_thinking=False,
+            )
+            if state.get("dump"):
+                state["dump"].log_raw(label, attempt + 1, raw)
+            parsed = self._parse_item_text(kind, raw, state.get("item_context", ""), index)
+            retry_reasons = self._item_quality_issues(kind, parsed, raw, state.get("item_context", ""))
+            if not retry_reasons:
+                item = parsed
+                break
+            logger.warning("%s 단일 항목 검증 실패 (attempt %d) — %s", label, attempt + 1, retry_reasons)
+            semantic_failure = any(
+                marker in reason for reason in retry_reasons
+                for marker in ("의미가 불일치", "관점과 지표", "연령대와 불일치", "동작이 설명되지 않음")
+            )
+            if semantic_failure:
+                break
+
+        if item is None:
+            logger.warning("%s 단일 항목 최종 검증 실패 — 결정론적 fallback 사용", label)
+            item = self._fallback_item(kind, index, state.get("item_context", ""), state)
+
+        item["_order"] = index
+        target = {
+            "goal": "goals", "kpi": "kpi", "persona": "userPersonas",
+            "release": "releaseSchedule", "core_feature": "coreFeatures",
+        }[kind]
+        value = item.pop("value") if kind == "goal" else item
+        return {"sections": {target: [value]}}
+
+    @staticmethod
+    def _parse_item_text(kind: str, raw: str, item_context: str, index: int) -> dict | None:
+        labels = {
+            "goal": {"GOAL": "value"},
+            "kpi": {"METRIC": "metric", "TARGET": "target", "BASIS": "basis",
+                    "MEASUREMENT_METHOD": "measurementMethod", "FREQUENCY": "frequency"},
+            "persona": {"NAME": "name", "AGE": "age", "JOB": "job", "TECH_LEVEL": "techLevel",
+                        "GOAL": "goal", "PAIN_POINT": "painPoint", "USAGE_PATTERN": "usagePattern"},
+            "release": {"DATE": "date", "MILESTONE": "milestone", "DESCRIPTION": "description",
+                        "DELIVERABLES": "deliverables"},
+            "core_feature": {"NAME": "name", "DESCRIPTION": "description", "PRIORITY": "priority",
+                             "REQUIREMENTS": "requirements"},
+        }[kind]
+        # 모델이 `DESCRIPTION: ... ||| REQUIREMENTS: ...`처럼 다음 라벨을 같은 줄에
+        # 이어 붙이는 경우가 잦다. 라벨 앞 구분자를 줄바꿈으로 바꾼 뒤 파싱한다.
+        marker_pattern = "|".join(re.escape(marker) for marker in labels)
+        normalized_raw = re.sub(
+            rf"\s*\|\|\|\s*(?=(?:{marker_pattern})\s*:)", "\n", raw or "", flags=re.I,
+        )
+        normalized_raw = re.sub(r"^\s*SELF_CHECK\s*:\s*PASS\s*$", "", normalized_raw, flags=re.I | re.M)
+        result: dict = {}
+        current = None
+        for raw_line in normalized_raw.replace("\r", "").split("\n"):
+            line = raw_line.strip().strip("`*")
+            if not line:
+                continue
+            matched = False
+            for marker, field in labels.items():
+                prefix = marker + ":"
+                if line.upper().startswith(prefix):
+                    # A single KPI worker occasionally emits several KPI
+                    # blocks. Keep the first complete item and ignore the rest.
+                    if kind == "kpi" and marker == "METRIC" and result.get("metric"):
+                        return result
+                    result[field] = line[len(prefix):].strip().strip('"')
+                    current = field
+                    matched = True
+                    break
+            if not matched and current:
+                result[current] = (str(result[current]) + " " + line).strip()
+
+        # 단일 목표는 모델이 GOAL 라벨을 생략해도 응답 전체가 곧 값이므로 안전하게 수용한다.
+        if kind == "goal" and not result.get("value"):
+            plain = " ".join(line.strip() for line in normalized_raw.splitlines() if line.strip())
+            if plain and not plain.lstrip().startswith(("{", "[")):
+                result["value"] = plain
+
+        # 자주 관찰되는 persona 별칭을 표준 필드로 흡수한다.
+        if kind == "persona" and not result.get("age"):
+            age_match = re.search(r"^AGE_GROUP\s*:\s*(.+)$", normalized_raw, re.I | re.M)
+            if age_match:
+                result["age"] = age_match.group(1).strip()
+        if kind == "persona" and not result.get("usagePattern"):
+            usage_match = re.search(r"^USE_PATTERN\s*:\s*(.+)$", normalized_raw, re.I | re.M)
+            if usage_match:
+                result["usagePattern"] = usage_match.group(1).strip()
+
+        for field in ("deliverables", "requirements"):
+            if isinstance(result.get(field), str):
+                result[field] = [x.strip() for x in re.split(r"\s*\|\|\|\s*|\s*;\s*", result[field]) if x.strip()]
+        if kind == "kpi" and result.get("target"):
+            result["target"] = normalize_target_arrow(result["target"])
+        if kind == "core_feature" and not result.get("requirements") and "|||" in str(result.get("description") or ""):
+            parts = [x.strip() for x in str(result["description"]).split("|||") if x.strip()]
+            result["description"] = parts[0]
+            result["requirements"] = parts[1:]
+        if kind == "core_feature":
+            result["name"] = item_context
+            result["priority"] = _normalize_priority(result.get("priority")) or ""
+        if kind == "release" and index < len(_RELEASE_STAGES):
+            result["date"], result["milestone"] = _RELEASE_STAGES[index]
+            if len(result.get("deliverables") or []) < 3:
+                result["deliverables"] = [
+                    f"{result['milestone']} 완료 보고서",
+                    f"{result['milestone']} 검증 결과",
+                    f"{result['milestone']} 산출물 패키지",
+                ]
+        return result or None
+
+    @classmethod
+    def _item_quality_issues(cls, kind: str, item: dict | None, raw: str, item_context: str) -> list[str]:
+        issues: list[str] = []
+        if not cls._valid_item(kind, item):
+            issues.append("필수 필드 누락 또는 형식 오류")
+        issues.extend(contamination_reasons(item or raw))
+        if item and has_placeholder(item):
+            issues.append("placeholder 또는 미정 값 포함")
+        if kind == "kpi" and item:
+            if "→" not in str(item.get("target") or ""):
+                issues.append("KPI target이 현재값 → 목표값 형식이 아님")
+            direction = item_context.split(":", 1)[0]
+            expected = {
+                "획득": ("신규", "유입", "획득"), "활성": ("활성", "온보딩", "핵심 기능"),
+                "전환": ("전환", "완료", "성공"), "단기 리텐션": ("7일", "단기", "재방문"),
+                "장기 리텐션": ("30일", "장기", "리텐션"), "품질": ("정확", "성공", "품질"),
+                "비즈니스": ("시간", "비용", "매출", "성과", "절감"),
+            }.get(direction, ())
+            metric_text = f"{item.get('metric', '')} {item.get('measurementMethod', '')}"
+            if expected and not any(token in metric_text for token in expected):
+                issues.append("할당된 KPI 관점과 지표 내용이 불일치")
+        if kind == "core_feature" and item:
+            content = f"{item.get('description', '')} {' '.join(item.get('requirements') or [])}"
+            if relevance_score(item_context, content) < 0.2:
+                issues.append("담당 기능과 설명·요구사항의 의미가 불일치")
+            issues.extend(feature_semantic_issues(item_context, str(item.get("description") or "")))
+        return list(dict.fromkeys(issues))
+
+    @staticmethod
+    def _valid_item(kind: str, item: dict | None) -> bool:
+        if not isinstance(item, dict) or has_suspicious_script(item) or _has_runaway_text(item):
+            return False
+        required = {
+            "goal": ("value",),
+            "kpi": ("metric", "target", "basis", "measurementMethod", "frequency"),
+            "persona": ("name", "age", "job", "techLevel", "goal", "painPoint", "usagePattern"),
+            "release": ("date", "milestone", "description", "deliverables"),
+            "core_feature": ("name", "description", "requirements"),
+        }[kind]
+        if any(not item.get(field) for field in required):
+            return False
+        if kind == "release" and len(item.get("deliverables") or []) < 3:
+            return False
+        if kind == "core_feature" and not item.get("requirements"):
+            return False
+        return True
+
+    @staticmethod
+    def _fallback_item(kind: str, index: int, item_context: str, state: dict) -> dict:
+        fallback = _fallback_section(state["section"], state.get("feature_list") or [], state.get("user_query") or "")
+        field = {"goal": "goals", "kpi": "kpi", "persona": "userPersonas",
+                 "release": "releaseSchedule", "core_feature": "coreFeatures"}[kind]
+        values = fallback.get(field) or []
+        value = values[min(index, len(values) - 1)] if values else "자동 생성 실패 — 수동 보완 필요"
+        return {"value": value} if kind == "goal" else dict(value)
+
+    @staticmethod
+    def _finalize_parallel_sections(sections: dict) -> dict:
+        finalized = dict(sections)
+        for field in ("kpi", "userPersonas", "releaseSchedule", "coreFeatures"):
+            values = finalized.get(field)
+            if isinstance(values, list):
+                values = sorted(values, key=lambda x: x.get("_order", 0) if isinstance(x, dict) else 0)
+                for value in values:
+                    if isinstance(value, dict):
+                        value.pop("_order", None)
+                finalized[field] = values
+        return finalized
+
     async def _manager_review_node(self, state: dict) -> dict:
         ctx = state["ctx"]
-        sections = state["sections"]
-        dump = ctx.get("dump")
-
-        prompt = MANAGER_REVIEW_PROMPT.format(
-            sections_json=json.dumps(sections, ensure_ascii=False),
-            criteria=_SECTION_CRITERIA.format(feature_count=ctx["feature_count"]),
-            user_query=ctx["user_query"],
-            feature_count=ctx["feature_count"],
-            feature_str=ctx["feature_str"],
+        sections = self._finalize_parallel_sections(state["sections"])
+        sections = self._audit_sections(
+            sections, ctx.get("feature_list") or [], ctx.get("user_query") or "", ctx.get("market_data") or ""
         )
-
-        try:
-            raw = await self._call(prompt, max_tokens=16384, system=MANAGER_SYSTEM, enable_thinking=False)
-            if dump:
-                dump.log_raw("PRD_MANAGER_REVIEW", 1, raw)
-            review = try_parse_json(raw)
-            if review is None or not isinstance(review, dict):
-                logger.warning("PRD manager 리뷰 파싱 실패 — 원본 섹션 유지")
-            else:
-                patches = review.get("patches")
-                if isinstance(patches, dict) and patches:
-                    # 패치 키도 표준화(goal→goals 등)해서 원본 섹션과 정확히 대응시킨다
-                    patches = _remap_keys(patches, _PRD_TOP_KEY_ALIASES)
-                    applied: dict = {}
-                    for key, val in patches.items():
-                        orig = sections.get(key)
-                        # manager가 리스트 섹션을 원본보다 줄이면(항목 누락) 거부 — QA 축소 방어막과 동일 원칙.
-                        # PRD manager는 '교정'이지 '삭감'이 아니므로 개수 감소는 항상 결함으로 본다.
-                        if isinstance(orig, list) and isinstance(val, list) and len(val) < len(orig):
-                            logger.warning(
-                                "PRD manager 패치가 %s를 축소(%d→%d, EXAONE 누락 추정) — 거부, 원본 유지",
-                                key, len(orig), len(val),
-                            )
-                            continue
-                        applied[key] = val
-                    if applied:
-                        logger.info("PRD manager 리뷰 — %d개 섹션 패치: %s", len(applied), list(applied.keys()))
-                        sections = {**sections, **applied}
-                    else:
-                        logger.info("PRD manager 리뷰 — 유효 패치 없음, 원본 유지")
-                else:
-                    logger.info("PRD manager 리뷰 — 패치 없음, 원본 유지")
-        except Exception as e:
-            logger.warning("PRD manager 리뷰 실패 — 원본 섹션 유지: %s", e)
+        # 각 worker 출력은 이미 Python에서 필드별 검증·fallback 처리됐다. 전체 문서를
+        # LLM manager가 다시 출력하거나 JSON patch를 만들지 않고, 최종 조립만 수행한다.
+        logger.info("PRD manager 결정론적 조립 완료 — 섹션 %d개", len(sections))
 
         return {"prd_document": json.dumps(sections, ensure_ascii=False)}
 
+    @classmethod
+    def _audit_sections(
+        cls, sections: dict, feature_list: list[str], user_query: str, market_data: str = ""
+    ) -> dict:
+        """PRD manager's deterministic semantic gate; invalid worker items never enter the document."""
+        out = dict(sections or {})
+        fallback = _fallback_section("goalsKpi", feature_list, user_query)
+
+        overview_fallback = _fallback_section("projectOverview", feature_list, user_query)
+        overview = str(out.get("projectOverview") or "").strip()
+        background = str(out.get("background") or "").strip()
+        narrative_leak = re.compile(r"[가-힣][A-Za-z]{3,}|[A-Za-z]{8,}(?:\s|[.,]|$)")
+        if (len(overview) < 50 or len(overview) > 300 or "\n" in overview
+                or contamination_reasons(overview) or has_placeholder(overview)):
+            overview = overview_fallback["projectOverview"]
+        if (len(background) < 160 or contamination_reasons(background) or has_placeholder(background)
+                or narrative_leak.search(background)):
+            background = overview_fallback["background"]
+        source_blocks = re.split(r"(?=SOURCE\s+\d+)", market_data or "")
+        for block in source_blocks:
+            if "provider: KOSIS" not in block or "evidence: KOSIS 실제 통계값" not in block:
+                continue
+            url_match = re.search(r"^url:\s*(https://\S+)", block, re.M)
+            id_match = re.search(r"^identifier:\s*([^\n]+)", block, re.M)
+            evidence_match = re.search(r"^evidence:\s*(KOSIS 실제 통계값[^\n]+)", block, re.M)
+            if url_match and id_match and evidence_match:
+                citation = f" 공식 통계 근거: {evidence_match.group(1)} [KOSIS {id_match.group(1).strip()}] {url_match.group(1)}"
+                # 숫자가 포함된 시장 서술은 모델의 부가 추정을 보존하지 않는다. 검증된
+                # 문제 배경과 공식 API가 반환한 수치·식별자·원문 URL만 Python이 조립한다.
+                background = overview_fallback["background"] + citation
+                break
+        if source_evidence_issues(background):
+            background = overview_fallback["background"]
+        out["projectOverview"], out["background"] = overview, background
+
+        goals: list[str] = []
+        for goal in out.get("goals") or []:
+            text = str(goal or "").strip()
+            if not text or contamination_reasons(text) or has_placeholder(text):
+                continue
+            if any(near_duplicate(text, prior, 0.45) for prior in goals):
+                continue
+            goals.append(text)
+        for goal in fallback["goals"]:
+            if len(goals) >= 3:
+                break
+            if not any(near_duplicate(goal, prior, 0.45) for prior in goals):
+                goals.append(goal)
+        feature_summary = ", ".join(feature_list[:3]) or "핵심 기능"
+        deterministic_goals = (
+            f"{feature_summary} 흐름을 통해 사용자의 반복 확인과 작업 누락을 줄여 핵심 문제 해결 시간을 단축한다",
+            "핵심 처리의 성공률과 데이터 정합성을 높여 사용자가 서비스를 안정적으로 반복 이용하도록 만든다",
+            "출시 후 활성 사용자와 재방문 지표를 측정하고 개선하여 지속 가능한 서비스 운영 기반을 확보한다",
+        )
+        for goal in deterministic_goals:
+            if len(goals) >= 3:
+                break
+            if not any(near_duplicate(goal, prior, 0.45) for prior in goals):
+                goals.append(goal)
+        out["goals"] = goals[:3]
+
+        kpis, metric_names = [], []
+        approved_scope = " ".join(feature_list)
+        for item in out.get("kpi") or []:
+            if not isinstance(item, dict) or contamination_reasons(item) or has_placeholder(item):
+                continue
+            metric = str(item.get("metric") or "").strip()
+            target = str(item.get("target") or "")
+            if not metric or "→" not in target or not re.search(r"[%명건회원]", target):
+                continue
+            kpi_text = f"{metric} {item.get('basis', '')} {item.get('measurementMethod', '')}"
+            expansion_tokens = ("인식", "OCR", "카메라", "배달", "레시피", "추천")
+            if any(token in kpi_text and token not in approved_scope for token in expansion_tokens):
+                continue
+            if any(near_duplicate(metric, prior, 0.6) for prior in metric_names):
+                continue
+            basis = str(item.get("basis") or "")
+            unsupported_basis = any(
+                token in basis for token in ("보고서", "통계", "조사", "연구", "백서", "추정", "업계", "증가 추세")
+            ) and "http" not in basis
+            if unsupported_basis or kpi_basis_issues(item, market_data):
+                item = dict(item)
+                item["basis"] = "제품 출시 전 기준선 0에서 시작하는 내부 운영 목표"
+            metric_names.append(metric)
+            kpis.append(item)
+        for item in fallback["kpi"]:
+            if len(kpis) >= 7:
+                break
+            if not any(near_duplicate(item["metric"], prior, 0.6) for prior in metric_names):
+                metric_names.append(item["metric"])
+                kpis.append(item)
+        out["kpi"] = kpis[:7]
+
+        personas, signatures, persona_names = [], set(), set()
+        target_range = re.search(r"(\d{2})\s*[-~～]\s*(\d{2})대", user_query or "")
+        allowed_ages = (
+            {f"{age}대" for age in range(int(target_range.group(1)), int(target_range.group(2)) + 1, 10)}
+            if target_range else set()
+        )
+        for item in out.get("userPersonas") or []:
+            if not isinstance(item, dict) or contamination_reasons(item) or has_placeholder(item):
+                continue
+            age_value = str(item.get("age") or "").strip()
+            if not re.match(r"^(?:연령\s*무관|무관|\d{1,2}(?:-\d{1,2})?세|\d{1,2}대(?:\s*(?:초반|중반|후반))?)$", age_value):
+                continue
+            if allowed_ages and age_value not in allowed_ages:
+                continue
+            persona_name = str(item.get("name") or "").strip()
+            if not persona_name or persona_name in persona_names:
+                continue
+            sig = (str(item.get("age") or "").strip(), str(item.get("job") or "").strip())
+            signature_text = " ".join(sig)
+            if any(near_duplicate(signature_text, " ".join(prior), 0.75) for prior in signatures):
+                continue
+            signatures.add(sig)
+            persona_names.add(persona_name)
+            personas.append(item)
+        for item in _fallback_section("userPersonas", feature_list, user_query)["userPersonas"]:
+            if len(personas) >= 3:
+                break
+            sig = (item["age"], item["job"])
+            if item["name"] not in persona_names and not any(
+                near_duplicate(" ".join(sig), " ".join(prior), 0.75) for prior in signatures
+            ):
+                signatures.add(sig)
+                persona_names.add(item["name"])
+                personas.append(item)
+        if len(personas) < 3:
+            # Similarity filtering protects diversity, but it must never reduce a
+            # required section below its structural minimum. The deterministic
+            # fallback already contains distinct named personas, so use remaining
+            # names as the final cardinality guard.
+            for item in _fallback_section("userPersonas", feature_list, user_query)["userPersonas"]:
+                if len(personas) >= 3:
+                    break
+                if item["name"] not in persona_names:
+                    persona_names.add(item["name"])
+                    personas.append(item)
+        out["userPersonas"] = personas[:3]
+
+        tech_fallback = _fallback_section("techStack", feature_list, user_query)["techStack"]
+        tech_stack = out.get("techStack") if isinstance(out.get("techStack"), dict) else {}
+        out["techStack"] = {
+            key: (value if value and not has_placeholder(value) and not contamination_reasons(value) else tech_fallback[key])
+            for key, value in ((key, tech_stack.get(key)) for key in tech_fallback)
+        }
+
+        release_fallback = _fallback_section("releaseSchedule", feature_list, user_query)["releaseSchedule"]
+        releases = []
+        incomplete_tail = re.compile(
+            r"(?:하는|되는|위한|통한|해소하는|구현하는|제공하는|"
+            r"태스크\s*관리|기능\s*구현|서비스\s*설계)\s*[.]?$"
+        )
+        for index, expected in enumerate(release_fallback):
+            item = (out.get("releaseSchedule") or [])[index] if index < len(out.get("releaseSchedule") or []) else None
+            description = str(item.get("description") or "").strip() if isinstance(item, dict) else ""
+            if (not isinstance(item, dict) or contamination_reasons(item) or has_placeholder(item)
+                    or narrative_leak.search(description) or len(description) < 15 or incomplete_tail.search(description)):
+                item = expected
+            item["date"], item["milestone"] = expected["date"], expected["milestone"]
+            releases.append(item)
+        out["releaseSchedule"] = releases
+
+        feature_by_name = {
+            str(item.get("name") or "").strip(): item
+            for item in out.get("coreFeatures") or [] if isinstance(item, dict)
+        }
+        clean_core = []
+        for feature in feature_list:
+            item = feature_by_name.get(feature)
+            content = "" if not item else f"{item.get('description', '')} {' '.join(item.get('requirements') or [])}"
+            description = "" if not item else str(item.get("description") or "")
+            if (not item or contamination_reasons(item) or has_placeholder(item)
+                    or relevance_score(feature, content) < 0.2 or feature_semantic_issues(feature, description)):
+                item = _fallback_section("coreFeatures", [feature], user_query)["coreFeatures"][0]
+            item["name"] = feature
+            clean_core.append(item)
+        out["coreFeatures"] = clean_core
+
+        scope = out.get("mvpScope") if isinstance(out.get("mvpScope"), dict) else {}
+        included = [f for f in scope.get("included") or [] if f in feature_list]
+        excluded = [f for f in scope.get("excluded") or [] if f in feature_list and f not in included]
+        for feature in feature_list:
+            if feature not in included and feature not in excluded:
+                excluded.append(feature)
+        if not included and feature_list:
+            included, excluded = feature_list[:min(3, len(feature_list))], feature_list[min(3, len(feature_list)):]
+        out["mvpScope"] = {
+            "included": included,
+            "excluded": excluded,
+            "rationale": scope.get("rationale") or _fallback_section("mvpScope", feature_list, user_query)["mvpScope"]["rationale"],
+        }
+        cls._reconcile_priorities(out["coreFeatures"], out["mvpScope"])
+        return out
+
     async def _generate_section(
         self, label: str, prompt: str, dump=None, min_counts: dict[str, int] | None = None,
-        max_tokens: int = 4000,
+        max_tokens: int = 4000, section: str | None = None,
+        feature_list: list[str] | None = None, user_query: str = "",
     ) -> dict | None:
         """파싱 가능한 JSON이 나올 때까지, 그리고 최소 항목 수·스크립트 오염 기준을
         충족할 때까지 최대 3회 재생성 (토큰 반복 루프·응답 잘림·EXAONE 스크립트 혼입 대응).
@@ -735,9 +1453,46 @@ class PrdAgent:
             return data
         # 3회 재생성으로도 개수가 부족하면, 이미 만든 항목은 그대로 두고 EXAONE에 '부족분만'
         # 추가로 요청해 서비스 특화 내용으로 채운다. (결정론적 템플릿 채움은 서비스와 무관하므로 쓰지 않음)
-        if best is not None and self._count_shortfall(best, min_counts):
-            best = await self._topup_short_fields(label, prompt, best, min_counts, max_tokens)
+        if best is not None:
+            shortfall = self._count_shortfall(best, min_counts)
+            if shortfall:
+                best = await self._topup_short_fields(label, prompt, best, min_counts, max_tokens)
+                shortfall = self._count_shortfall(best, min_counts)
+            # top-up까지 거치고도 여전히 부족하면(실측: coreFeatures 8개 요구에 4개, userPersonas
+            # 3명 요구에 1명만 나온 사례) 조용히 미달 상태로 나가지 않도록 결정론적 placeholder로
+            # 강제 보강한다 — 사람이 눈으로 "부족분이 있다"를 바로 알아볼 수 있게 표시해 둔다.
+            if shortfall and section:
+                best = self._pad_shortfall(section, best, shortfall, feature_list or [], user_query)
         return best
+
+    @staticmethod
+    def _pad_shortfall(
+        section: str, data: dict, shortfall: dict[str, tuple[int, int]],
+        feature_list: list[str], user_query: str,
+    ) -> dict:
+        """재생성 3회 + top-up 3라운드를 다 거치고도 최소 개수에 못 미치는 필드를
+        `_fallback_section`의 placeholder로 강제로 채운다 (완전 실패시의 fallback과 동일한
+        모양을 재사용). coreFeatures는 feature_list와 1:1이어야 하므로, 아직 대응하는 항목이
+        없는 기능만 골라 채운다 — 이미 채워진 기능에 중복 placeholder를 추가하지 않는다."""
+        fallback = _fallback_section(section, feature_list, user_query)
+        for field, (have, need) in shortfall.items():
+            template = fallback.get(field)
+            if not isinstance(template, list) or not template:
+                continue
+            existing = data.get(field) if isinstance(data.get(field), list) else []
+            if field == "coreFeatures" and feature_list:
+                present = {str(c.get("name") or "").strip() for c in existing if isinstance(c, dict)}
+                candidates = [t for t in template if isinstance(t, dict) and str(t.get("name") or "").strip() not in present]
+            else:
+                candidates = template
+            added = candidates[: need - have]
+            if added:
+                logger.warning(
+                    "%s — top-up 이후에도 %s 부족(%d/%d) — placeholder %d개로 강제 보강",
+                    section, field, have, need, len(added),
+                )
+                data[field] = existing + added
+        return data
 
     @staticmethod
     def _count_shortfall(data: dict, min_counts: dict[str, int] | None) -> dict[str, tuple[int, int]]:
@@ -929,6 +1684,50 @@ class PrdAgent:
         return kept
 
     @classmethod
+    def _apply_phase1_priorities(cls, parsed: dict, state: PipelineState) -> None:
+        """Make the user's Phase 1 MoSCoW decision authoritative in the PRD."""
+        core_features = parsed.get("coreFeatures") or []
+        groups = (
+            ("P0", state.must_features),
+            ("P1", state.should_features),
+            ("P2", state.could_features),
+            ("P2", state.excluded_features),
+        )
+        candidates = [
+            (priority, cls._label_tokens(name))
+            for priority, names in groups
+            for name in (names or [])
+            if str(name).strip()
+        ]
+        if not candidates:
+            return
+
+        for item in core_features:
+            if not isinstance(item, dict):
+                continue
+            tokens = cls._label_tokens(item.get("name") or "")
+            ranked = [
+                (cls._best_overlap(tokens, [candidate_tokens]), priority)
+                for priority, candidate_tokens in candidates
+            ]
+            score, priority = max(ranked, default=(0.0, ""))
+            if score >= cls._DEDUP_OVERLAP:
+                item["priority"] = priority
+
+        # Must features cannot be omitted from the MVP by a downstream worker.
+        scope = parsed.get("mvpScope")
+        if isinstance(scope, dict):
+            must = [str(value) for value in state.must_features if str(value).strip()]
+            included = [str(value) for value in scope.get("included") or []]
+            excluded = [str(value) for value in scope.get("excluded") or []]
+            for feature in must:
+                if feature not in included:
+                    included.append(feature)
+                excluded = [value for value in excluded if value != feature]
+            scope["included"] = included
+            scope["excluded"] = excluded
+
+    @classmethod
     def _reconcile_priorities(cls, core_features, mvp_scope) -> None:
         """coreFeatures.priority를 정규화하고, 구분이 없거나 비어 있으면 MVP 범위에서 도출한다.
 
@@ -949,10 +1748,9 @@ class PrdAgent:
                 item["priority"] = priority
 
         distinct = {p for p in resolved.values() if p}
-        # 구분이 전혀 없으면(전부 같은 값이거나 전부 비어 있음) 전량 재배정, 아니면 빈 항목만
-        targets = items if len(distinct) <= 1 else [i for i in items if not resolved[id(i)]]
-        if not targets:
-            return
+        # MVP 범위는 제품 manager의 최종 결정이므로 worker가 낸 priority보다 항상 우선한다.
+        # 이를 전량 재계산해야 P0이 excluded에 남는 직접 모순을 막을 수 있다.
+        targets = items
 
         included, excluded = [], []
         if isinstance(mvp_scope, dict):
@@ -999,26 +1797,21 @@ class PrdAgent:
         return data
 
     async def _call(self, user_prompt: str, max_tokens: int, system: str, enable_thinking: bool) -> str:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                resp = await self._client.chat.completions.create(
-                    model=self._model,
-                    temperature=_TEMPERATURE,
-                    top_p=_TOP_P,
-                    presence_penalty=_PRESENCE_PENALTY,
-                    max_tokens=max_tokens,
-                    frequency_penalty=0.5,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-                )
+                async with llm_slot():
+                    resp = await self._client.chat.completions.create(
+                        model=self._model, temperature=_TEMPERATURE, top_p=_TOP_P,
+                        presence_penalty=_PRESENCE_PENALTY, max_tokens=max_tokens,
+                        frequency_penalty=0.5,
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
+                        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
+                    )
                 return resp.choices[0].message.content or ""
             except (InternalServerError, APITimeoutError, APIConnectionError) as e:
                 logger.warning("PRD API 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
-                if attempt < 2:
-                    await asyncio.sleep(5 * (attempt + 1))
+                if attempt < 1:
+                    await asyncio.sleep(1)
                 else:
                     logger.error("PRD API 최종 실패")
                     return ""

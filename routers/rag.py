@@ -15,5 +15,12 @@ class IngestRequest(BaseModel):
 async def ingest(req: IngestRequest) -> dict:
     from main import document_ingestion_service
     source = req.source or "unknown"
-    await document_ingestion_service.ingest(req.content, {"source": source})
-    return ok({"source": source, "message": "문서가 성공적으로 저장되었습니다"})
+    saved = await document_ingestion_service.ingest(
+        req.content,
+        {"source": source, "type": "source"},
+    )
+    return ok({
+        "source": source,
+        "savedChunks": saved,
+        "message": "문서가 성공적으로 저장되었습니다",
+    })
