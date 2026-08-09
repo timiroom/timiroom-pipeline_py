@@ -25,6 +25,7 @@ class PipelineState:
 
     # PM 에이전트 결과
     feature_list: list[str] = field(default_factory=list)
+    feature_specs: list[dict[str, Any]] = field(default_factory=list)
     dba_instruction: str = ""
     api_instruction: str = ""
 
@@ -43,6 +44,8 @@ class PipelineState:
     qa_db_issues: list[str] = field(default_factory=list)
     qa_api_issues: list[str] = field(default_factory=list)
     qa_prd_issues: list[str] = field(default_factory=list)
+    qa_issue_details: list[dict[str, Any]] = field(default_factory=list)
+    qa_repair_issues: list[dict[str, Any]] = field(default_factory=list)
 
     # Search 에이전트
     market_research: str = ""

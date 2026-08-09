@@ -19,9 +19,14 @@ logger = logging.getLogger(__name__)
 RRF_K = 60
 SESSION_BOOST = 1.5
 
-# Phase1 검색 대상 타입 — ERD·API는 JSON 구조라 의미 벡터 품질이 낮고 노이즈가 됨 (rag-pipeline과 동일)
-_SEARCH_TYPES = ("prd", "market_research", "features")
-_SEARCH_TYPE_SQL = "AND metadata->>'type' IN ('prd', 'market_research', 'features')"
+# Phase1 검색 대상 타입. Kafka로 저장된 이전 파이프라인 산출물에는
+# metadata.pipeline_id가 있다. 이를 전역 지식으로 재검색하면 다른 서비스의
+# PRD/기능이 다음 프로젝트에 섞이므로, Phase1에서는 출처 문서만 검색한다.
+_SEARCH_TYPES = ("source", "prd", "market_research", "features")
+_SEARCH_TYPE_SQL = (
+    "AND metadata->>'type' IN ('source', 'prd', 'market_research', 'features') "
+    "AND COALESCE(metadata->>'pipeline_id', '') = ''"
+)
 
 _SEARCH_TAGS = {"NNG", "NNP", "NNB", "SL", "SH"}
 _kiwi = Kiwi()
@@ -66,7 +71,17 @@ class HybridSearchService:
         vector_results, keyword_results = await asyncio.gather(
             self._vector_search(query, threshold),
             loop.run_in_executor(None, self._keyword_search, query),
+            return_exceptions=True,
         )
+        failures = [x for x in (vector_results, keyword_results) if isinstance(x, BaseException)]
+        if len(failures) == 2:
+            raise RuntimeError(f"벡터·키워드 검색 모두 실패: {failures[0]} / {failures[1]}")
+        if isinstance(vector_results, BaseException):
+            logger.warning("벡터 검색 실패, 키워드 결과만 사용: %s", vector_results)
+            vector_results = []
+        if isinstance(keyword_results, BaseException):
+            logger.warning("키워드 검색 실패, 벡터 결과만 사용: %s", keyword_results)
+            keyword_results = []
         rrf_results = self._rrf(vector_results, keyword_results, top_k)
         logger.info(
             "[HybridSearch] query=%r | vector=%d | keyword=%d | rrf=%d",
@@ -91,7 +106,15 @@ class HybridSearchService:
                 chunks.setdefault(key, chunk)
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        result = [chunks[k] for k, _ in ranked]
+        result = [
+            DocumentChunk(
+                id=chunks[k].id,
+                content=chunks[k].content,
+                metadata=chunks[k].metadata,
+                relevance_score=score,
+            )
+            for k, score in ranked
+        ]
         logger.info("[MultiQuery] 쿼리 %d개 병렬 실행 → RRF 합산 %d건", len(queries), len(result))
         return result
 
@@ -121,7 +144,12 @@ class HybridSearchService:
         if self._session_store.has_session(session_id):
             session_chunks = self._session_store.get(session_id)
             session_results = await self._session_similarity_search(queries, session_chunks)
-            global_results = self._rrf(global_results, session_results, self._top_k_vector)
+            global_results = self._rrf(
+                global_results,
+                session_results,
+                self._top_k_vector,
+                weight_b=SESSION_BOOST,
+            )
 
         if self._rl_service is not None:
             self._rl_service.log_search(session_id, params, len(global_results))
@@ -129,21 +157,17 @@ class HybridSearchService:
         return global_results
 
     async def _vector_search(self, query: str, threshold: float | None = None) -> list[DocumentChunk]:
-        try:
-            query_vec = await self._embedder.embed_query(query)
-            loop = asyncio.get_running_loop()
-            chunks = await loop.run_in_executor(None, self._vector_search_sync, query_vec, threshold)
-            if chunks:
-                logger.info(
-                    "[Vector] %d 건 | 최고점수=%.4f | 최저점수=%.4f",
-                    len(chunks), chunks[0].relevance_score, chunks[-1].relevance_score,
-                )
-            else:
-                logger.info("[Vector] 결과 없음")
-            return chunks
-        except Exception as e:
-            logger.warning("벡터 검색 실패: %s", e)
-            return []
+        query_vec = await self._embedder.embed_query(query)
+        loop = asyncio.get_running_loop()
+        chunks = await loop.run_in_executor(None, self._vector_search_sync, query_vec, threshold)
+        if chunks:
+            logger.info(
+                "[Vector] %d 건 | 최고점수=%.4f | 최저점수=%.4f",
+                len(chunks), chunks[0].relevance_score, chunks[-1].relevance_score,
+            )
+        else:
+            logger.info("[Vector] 결과 없음")
+        return chunks
 
     def _vector_search_sync(
         self, query_vec: list[float], threshold_override: float | None = None
@@ -192,47 +216,43 @@ class HybridSearchService:
         if not ts_query:
             return []
 
+        conn = self._get_conn()
         try:
-            conn = self._get_conn()
-            try:
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(
-                        f"""
-                        SELECT id, content, metadata,
-                               ts_rank(tokens, to_tsquery('simple', %s)) AS rank
-                        FROM {self._document_table}
-                        WHERE tokens IS NOT NULL
-                          AND tokens @@ to_tsquery('simple', %s)
-                          {_SEARCH_TYPE_SQL}
-                        ORDER BY rank DESC
-                        LIMIT %s
-                        """,
-                        (ts_query, ts_query, self._top_k_keyword),
-                    )
-                    rows = cur.fetchall()
-            finally:
-                conn.close()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, content, metadata,
+                           ts_rank(tokens, to_tsquery('simple', %s)) AS rank
+                    FROM {self._document_table}
+                    WHERE tokens IS NOT NULL
+                      AND tokens @@ to_tsquery('simple', %s)
+                      {_SEARCH_TYPE_SQL}
+                    ORDER BY rank DESC
+                    LIMIT %s
+                    """,
+                    (ts_query, ts_query, self._top_k_keyword),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
 
-            chunks = [
-                DocumentChunk(
-                    id=uuid.UUID(str(row["id"])),
-                    content=row["content"],
-                    metadata=row["metadata"] or {},
-                    relevance_score=float(row["rank"]),
-                )
-                for row in rows
-            ]
-            if chunks:
-                logger.info(
-                    "[Keyword] ts_query=%r | %d 건 | 최고rank=%.4f",
-                    ts_query, len(chunks), chunks[0].relevance_score,
-                )
-            else:
-                logger.info("[Keyword] ts_query=%r | 결과 없음", ts_query)
-            return chunks
-        except Exception as e:
-            logger.warning("키워드 검색 실패: %s", e)
-            return []
+        chunks = [
+            DocumentChunk(
+                id=uuid.UUID(str(row["id"])),
+                content=row["content"],
+                metadata=row["metadata"] or {},
+                relevance_score=float(row["rank"]),
+            )
+            for row in rows
+        ]
+        if chunks:
+            logger.info(
+                "[Keyword] ts_query=%r | %d 건 | 최고rank=%.4f",
+                ts_query, len(chunks), chunks[0].relevance_score,
+            )
+        else:
+            logger.info("[Keyword] ts_query=%r | 결과 없음", ts_query)
+        return chunks
 
     async def _session_similarity_search(
         self,
@@ -302,18 +322,20 @@ class HybridSearchService:
         list_a: list[DocumentChunk],
         list_b: list[DocumentChunk],
         top_k: int,
+        weight_a: float = 1.0,
+        weight_b: float = 1.0,
     ) -> list[DocumentChunk]:
         scores: dict[str, float] = defaultdict(float)
         chunks: dict[str, DocumentChunk] = {}
 
         for i, chunk in enumerate(list_a):
             key = str(chunk.id)
-            scores[key] += 1.0 / (RRF_K + i + 1)
+            scores[key] += weight_a / (RRF_K + i + 1)
             chunks.setdefault(key, chunk)
 
         for i, chunk in enumerate(list_b):
             key = str(chunk.id)
-            scores[key] += 1.0 / (RRF_K + i + 1)
+            scores[key] += weight_b / (RRF_K + i + 1)
             chunks.setdefault(key, chunk)
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]

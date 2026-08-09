@@ -4,7 +4,7 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-EMBED_DIM = 4096
+EMBED_DIM = 1024
 
 UPSTAGE_BASE_URL = "https://api.upstage.ai/v1"
 

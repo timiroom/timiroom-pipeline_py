@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 class RetryService:
 
-    def __init__(self, max_retry: int = 3):
+    def __init__(self, max_retry: int = 1):
         self._max_retry = max_retry
 
     async def retry_with(
@@ -36,12 +36,18 @@ class RetryService:
         # context_prompt만 재시도 피드백으로 교체 — 문자열만으로 새 state를 만들면
         # Phase1/2에서 이미 구축된 정보가 전부 소실된다.
         retry_state = state.copy(context_prompt=retry_prompt, retry_count=current_retry)
-        result = await orchestration_graph.run(retry_state, pipeline_id)
+        result = await orchestration_graph.retry_failed_domains(retry_state, pipeline_id)
 
         validated = validation_service.validate(result)
 
         if validated.validated:
             logger.info("Phase 3 재시도 성공 (%d/%d)", current_retry, self._max_retry)
             return validated
+
+        before = (state.prd_document, state.db_schema, state.api_spec)
+        after = (result.prd_document, result.db_schema, result.api_spec)
+        if before == after:
+            logger.warning("Phase 3 선택 교정 결과 변경 없음 — 동일 작업 반복 중단")
+            return validated.copy(status_message="자동 교정 수렴 실패 — 관리자 검토 요청")
 
         return await self.retry_with(validated, orchestration_graph, validation_service, pipeline_id)

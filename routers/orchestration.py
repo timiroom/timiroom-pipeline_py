@@ -184,7 +184,7 @@ async def _run_pipeline_inner(
 
         # Phase 4
         progress_svc.send(pipeline_id, "PHASE4", "결과 저장 중...", 95)
-        await kafka_svc.publish(validated)
+        await kafka_svc.publish(validated, pipeline_id=pipeline_id)
         logger.info("파이프라인 완료 | pipelineId: %s", pipeline_id)
 
         result = {

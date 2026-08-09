@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     content      TEXT    NOT NULL,
     content_hash TEXT    UNIQUE,
     metadata     JSONB   DEFAULT '{}',
-    embedding    vector(4096),
+    embedding    vector(1024),
     tokens       TSVECTOR
 );
 

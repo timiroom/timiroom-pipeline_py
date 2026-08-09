@@ -70,7 +70,9 @@ class RagPipelineService:
 
             # Step 5: Reranking
             logger.info("[%s] ▶ Step 5: Reranking (Ko-Reranker)", session_id[:8])
-            reranked = await self._reranker.rerank(synthesized, retrieved)
+            reranked, rerank_applied = await self._reranker.rerank_with_status(
+                synthesized, retrieved
+            )
             logger.info("[%s] ✔ Step 5: %d개로 압축", session_id[:8], len(reranked))
             for i, c in enumerate(reranked, 1):
                 logger.info(
@@ -80,10 +82,12 @@ class RagPipelineService:
                 )
 
             # Step 5-1: 리랭커 평균 점수 → Phase1 RL 피드백
-            if self._rl_service is not None and reranked:
+            if self._rl_service is not None and reranked and rerank_applied:
                 avg_score = sum(c.relevance_score or 0.0 for c in reranked) / len(reranked)
                 self._rl_service.apply_rerank_score(session_id, avg_score)
                 logger.info("[%s] Phase1 RL 피드백 적용 — avgScore:%.3f", session_id[:8], avg_score)
+            elif self._rl_service is not None and reranked:
+                logger.info("[%s] 리랭커 미적용 — Phase1 RL 피드백 생략", session_id[:8])
 
             # Step 6: PipelineState 조립
             logger.info("[%s] ▶ Step 6: Context 조립", session_id[:8])

@@ -42,7 +42,7 @@ class KafkaProducerService:
                 pass
         await self._close_producer()
 
-    async def publish(self, state: PipelineState) -> str | None:
+    async def publish(self, state: PipelineState, pipeline_id: str | None = None) -> str | None:
         if not self._ready or self._producer is None:
             # 백그라운드 재연결을 기다리지 않고 발행 시점에 직접 연결을 시도한다
             # (rag-pipeline의 KafkaTemplate처럼 항상 발행을 시도 — 짧은 단절로 인한 무의미한 드롭 방지)
@@ -51,7 +51,7 @@ class KafkaProducerService:
                 self._ensure_connecting()
                 return None
 
-        pipeline_id = str(uuid.uuid4())
+        pipeline_id = pipeline_id or str(uuid.uuid4())
         event = {
             "pipelineId": pipeline_id,
             "projectName": state.project_name,

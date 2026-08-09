@@ -32,4 +32,4 @@ NAS의 k3s에서는 `rag-pipeline-svc:8080` ClusterIP로만 노출되므로 별�
 
 기존 Spring 파이프라인의 1024차원 벡터 데이터는 보존합니다. Python 서비스는
 `RAG_DOCUMENT_TABLE=document_chunks_ko`를 사용하며 init container가 Solar용
-`vector(4096)` 테이블을 멱등 생성합니다.
+`vector(1024)` 테이블을 멱등 생성합니다.

@@ -36,7 +36,10 @@ class ValidationResult:
 
 class SchemaValidator:
 
-    def validate(self, feature_list: list[str], db_schema: str, api_spec: str) -> ValidationResult:
+    def validate(
+        self, feature_list: list[str], db_schema: str, api_spec: str,
+        feature_specs: list[dict] | None = None,
+    ) -> ValidationResult:
         errors: list[str] = []
 
         db_json_errors = self._check_json(db_schema, "DB 스키마")
@@ -52,6 +55,8 @@ class SchemaValidator:
             errors += self._check_db_coverage(db_schema, feature_list)
         if not api_json_errors:
             errors += self._check_api_coverage(api_spec, feature_list)
+        if feature_specs and not db_json_errors and not api_json_errors:
+            errors += self._check_feature_contracts(feature_specs, db_schema, api_spec)
 
         if errors:
             logger.warning("검증 실패 — %d 개 오류: %s", len(errors), errors)
@@ -118,10 +123,94 @@ class SchemaValidator:
         bad = _invalid_paths(endpoints)
         if bad:
             errors.append(f"API 스펙: REST 경로 형식 위반(한글/공백/특수문자 등): {bad}")
-        missing = uncovered_features(feature_list, [ep.get("description", "") for ep in endpoints if isinstance(ep, dict)])
+        mapped = [
+            str(item.get("featureName") or "")
+            for item in data.get("featureMappings") or []
+            if isinstance(item, dict) and item.get("operations")
+        ]
+        missing = uncovered_features(feature_list, [
+            f"{ep.get('featureName', '')} {ep.get('description', '')}"
+            for ep in endpoints if isinstance(ep, dict)
+        ] + mapped)
         feature_count = len(feature_list)
-        if missing and feature_count and len(missing) / feature_count > _COVERAGE_FAIL_RATIO:
+        if missing:
             errors.append(f"API 스펙: 기능 {feature_count}개 중 {len(missing)}개에 대응하는 엔드포인트가 없어 보입니다 — {missing}")
-        elif missing:
-            logger.warning("API 스펙: 소수 기능 미반영(재시도 임계치 미만이라 통과) — %s", missing)
         return errors
+
+    def _check_feature_contracts(
+        self, feature_specs: list[dict], db_schema: str, api_spec: str,
+    ) -> list[str]:
+        db = try_parse_json(db_schema) or {}
+        api = try_parse_json(api_spec) or {}
+        tables = {
+            str(table.get("name") or ""): table
+            for table in db.get("tables") or [] if isinstance(table, dict) and table.get("name")
+        }
+        db_mappings = {
+            str(item.get("featureName") or ""): item
+            for item in db.get("featureMappings") or [] if isinstance(item, dict)
+        }
+        api_mappings = {
+            str(item.get("featureName") or ""): item
+            for item in api.get("featureMappings") or [] if isinstance(item, dict)
+        }
+        endpoints = {
+            (str(ep.get("method") or "").upper(), str(ep.get("path") or "")): ep
+            for ep in api.get("endpoints") or [] if isinstance(ep, dict)
+        }
+        errors: list[str] = []
+        user_scoped = False
+        for spec in feature_specs:
+            if not isinstance(spec, dict) or not spec.get("name"):
+                continue
+            name = str(spec["name"])
+            ownership = spec.get("ownership") if isinstance(spec.get("ownership"), dict) else {}
+            scope = str(ownership.get("scope") or "").upper()
+            user_scoped = user_scoped or scope in {"USER", "SHARED"}
+            if not spec.get("transactionRules"):
+                errors.append(f"기능 계약: 트랜잭션 규칙 누락 — {name}")
+            if spec.get("states") and not spec.get("stateTransitions"):
+                errors.append(f"기능 계약: 상태 전이 누락 — {name}")
+            db_mapping = db_mappings.get(name)
+            table_name = str((db_mapping or {}).get("table") or "")
+            if not db_mapping or not table_name or table_name not in tables:
+                errors.append(f"DB 기능 매핑 누락: {name}")
+            elif scope in {"USER", "SHARED"} and table_name not in {"users", "refresh_tokens"}:
+                columns = {
+                    str(column.get("name") or ""): str(column.get("constraints") or "")
+                    for column in tables[table_name].get("columns") or [] if isinstance(column, dict)
+                }
+                if "user_id" not in columns or "REFERENCES users" not in columns["user_id"]:
+                    errors.append(f"DB 사용자 소유 FK 누락: {name} → {table_name}.user_id REFERENCES users(id)")
+            api_mapping = api_mappings.get(name)
+            operations = (api_mapping or {}).get("operations") or []
+            if not operations:
+                errors.append(f"API 기능 매핑 누락: {name}")
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    continue
+                key = (str(operation.get("method") or "").upper(), str(operation.get("path") or ""))
+                endpoint = endpoints.get(key)
+                if not endpoint:
+                    errors.append(f"API 기능 매핑 대상 없음: {name} → {key[0]} {key[1]}")
+                    continue
+                if scope in {"USER", "SHARED"} and not key[1].endswith(("/signup", "/login", "/refresh")):
+                    if not endpoint.get("authRequired"):
+                        errors.append(f"API 사용자 소유 기능 인증 누락: {key[0]} {key[1]}")
+                for field in ("requestBody", "successResponse", "errorCodes"):
+                    if not str(endpoint.get(field) or "").strip():
+                        errors.append(f"API {field} 계약 누락: {key[0]} {key[1]}")
+                if key[0] in {"POST", "PATCH", "PUT", "DELETE"} and not endpoint.get("transactionRules"):
+                    errors.append(f"API 트랜잭션 계약 누락: {key[0]} {key[1]}")
+        if user_scoped:
+            if "users" not in tables or "refresh_tokens" not in tables:
+                errors.append("DB 인증 계약 누락: users와 refresh_tokens 테이블이 필요합니다")
+            required_paths = {
+                ("POST", "/api/v1/auth/signup"), ("POST", "/api/v1/auth/login"),
+                ("POST", "/api/v1/auth/refresh"), ("POST", "/api/v1/auth/logout"),
+                ("GET", "/api/v1/users/me"),
+            }
+            missing_paths = sorted(required_paths - set(endpoints))
+            if missing_paths:
+                errors.append(f"API 인증·회원 계약 누락: {missing_paths}")
+        return list(dict.fromkeys(errors))

@@ -1,116 +1,80 @@
-import asyncio
 import logging
+import re
 
 from openai import AsyncOpenAI
 
+from config.settings import settings
+from phase2.public_source_client import PublicSourceClient, format_collection_report
 from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
-LABELS = ["시장규모/경쟁사", "Pain Point", "법규", "기술트렌드", "사용자통계"]
-
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
 
+_STATISTICAL_PHRASES = (
+    "1인 가구", "맞벌이 가구", "청년", "고령자", "소상공인", "자영업",
+    "전자상거래", "온라인 쇼핑", "식품 소비", "반려동물", "취업", "주거",
+)
+
+
+def _select_public_search_keyword(user_query: str, model_domain: str) -> str:
+    compact = re.sub(r"\s+", " ", user_query)
+    for phrase in _STATISTICAL_PHRASES:
+        if phrase in compact:
+            return phrase
+    household = re.search(r"\b\d+인\s*가구\b", compact)
+    if household:
+        return re.sub(r"\s*", "", household.group(0)).replace("가구", " 가구")
+    return model_domain
+
 
 class SearchAgent:
+    """EXAONE은 검색어 분류에만 사용하고 외부 자료는 비-AI 수집기로 확보한다."""
 
-    def __init__(self, client: AsyncOpenAI, model: str):
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        source_client: PublicSourceClient | None = None,
+    ):
         self._client = client
         self._model = model
+        self._sources = source_client or PublicSourceClient.from_settings(settings)
 
     async def execute(self, state: PipelineState, dump=None) -> PipelineState:
-        logger.info("Search 에이전트 시작 — 시장 데이터 수집")
+        logger.info("Search 에이전트 시작 — 비-AI 공식 자료 수집")
         try:
             domain = await self._extract_domain(state.user_query)
-            market_data = await self._collect_all(state.user_query, domain)
-            logger.info("Search 에이전트 완료 — %d자 수집", len(market_data))
-            result = state.copy(
-                market_research=market_data,
-                status_message="Search 에이전트 완료 — 시장 데이터 수집",
+            public_keyword = _select_public_search_keyword(state.user_query, domain)
+            logger.info("공공 통계 검색어: [%s]", public_keyword)
+            report = await self._sources.collect(state.user_query, public_keyword)
+            market_data = format_collection_report(report)
+            logger.info(
+                "Search 에이전트 완료 — 공식 출처 %d개, 상태 알림 %d개",
+                len(report.sources),
+                len(report.notices),
             )
             if dump:
-                dump.log_raw("SEARCH", 1, market_data)
-            return result
-        except Exception as e:
-            logger.error("Search 에이전트 실패: %s", e)
+                dump.log_raw("SEARCH_PUBLIC_SOURCES", 1, market_data)
             return state.copy(
-                market_research=f"시장 데이터 수집 실패: {e}",
+                market_research=market_data,
+                status_message="Search 에이전트 완료 — 비-AI 공식 자료 수집",
+            )
+        except Exception as exc:
+            logger.error("Search 에이전트 실패: %s", exc, exc_info=True)
+            return state.copy(
+                market_research=(
+                    "[수집 실패]\n공식 자료 수집에 실패했습니다. "
+                    "검증되지 않은 수치·법률·출처는 생성하거나 저장하지 않습니다."
+                ),
                 status_message="Search 에이전트 실패",
             )
 
-    async def _collect_all(self, user_query: str, domain: str) -> str:
-        queries = [
-            f"""한국 {domain} 시장에 대해 알고 있는 정보를 바탕으로 아래 형식으로 정리하세요.
-
-[시장규모] 수치 + 출처(기관명, 연도)
-[성장률] 수치 + 출처
-[경쟁사매출] 각 사별 실제 매출액 또는 사용자 수 + 출처
-[경쟁사목록] 해당 도메인({domain})의 한국 실제 서비스명 5개 이상 나열
-반드시 한국 서비스명만 사용. Shopify, Magento, WooCommerce 등 글로벌 플랫폼 금지.
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스 사용자들의 불편 데이터를 알고 있는 정보를 바탕으로 정리하세요.
-
-[Pain Point 1~5] 내용 + 퍼센트 수치 + 출처
-반드시 한국 기관 출처만 사용.
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스에 적용되는 법규를 알고 있는 정보를 바탕으로 정리하세요.
-
-[개인정보보호법] 조항 번호 + 핵심 내용
-[전자상거래법] 조항 번호 + 핵심 내용
-[전자금융거래법] 조항 번호 + 핵심 내용
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스의 기술 트렌드를 알고 있는 정보를 바탕으로 정리하세요.
-
-[권장기술스택] 각 레이어별 권장 기술 + 선택 이유
-[성능벤치마크] 업계 평균 응답속도, 동시접속 수치 + 출처
-[아키텍처] 업계 표준 아키텍처 패턴
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스의 사용자/비즈니스 데이터를 알고 있는 정보를 바탕으로 정리하세요.
-
-[사용자통계] 연령별 이용률 + 출처
-[전환율] 업계 평균 수치 + 출처
-[재구매율] 수치 + 출처
-[모바일비중] 수치 + 출처
-
-서비스 요구사항: {user_query}""",
-        ]
-
-        tasks = [self._query(q) for q in queries]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        parts = []
-        for i, result in enumerate(results):
-            text = result if isinstance(result, str) else f"수집 실패: {result}"
-            parts.append(f"=== {LABELS[i]} ===\n{text}")
-        return "\n\n".join(parts)
-
-    async def _query(self, prompt: str) -> str:
-        resp = await self._client.chat.completions.create(
-            model=self._model,
-            max_tokens=2000,
-            temperature=_TEMPERATURE,
-            top_p=_TOP_P,
-            presence_penalty=_PRESENCE_PENALTY,
-            messages=[{"role": "user", "content": prompt}],
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
-        return (resp.choices[0].message.content or "").strip()
-
     async def _extract_domain(self, user_query: str) -> str:
         try:
-            resp = await self._client.chat.completions.create(
+            response = await self._client.chat.completions.create(
                 model=self._model,
                 max_tokens=100,
                 temperature=_TEMPERATURE,
@@ -120,19 +84,17 @@ class SearchAgent:
                     {
                         "role": "system",
                         "content": (
-                            "사용자의 서비스 설명을 읽고 해당 서비스의 업종/도메인을 한국어 2~4단어로만 답하세요. "
-                            "예시) 이커머스 전자상거래, 음식 배달, 숙박 예약, 의료 헬스케어, "
-                            "부동산 중개, 방탈출 예약, 피트니스 헬스, 반려동물 케어 "
-                            "다른 설명 없이 도메인 단어만 출력하세요."
+                            "사용자의 서비스 설명을 읽고 조사 키워드로 사용할 업종 또는 도메인을 "
+                            "한국어 2~4단어로만 출력하세요. 다른 설명은 출력하지 마세요."
                         ),
                     },
                     {"role": "user", "content": user_query},
                 ],
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            domain = (resp.choices[0].message.content or "").strip()
-            logger.info("도메인 추출: [%s]", domain)
-            return domain
-        except Exception as e:
-            logger.warning("도메인 추출 실패: %s", e)
-            return user_query
+            domain = (response.choices[0].message.content or "").strip()
+            logger.info("Search 조사 도메인: [%s]", domain)
+            return domain[:100] or user_query[:100]
+        except Exception as exc:
+            logger.warning("Search 조사 도메인 추출 실패: %s", exc)
+            return user_query[:100]
