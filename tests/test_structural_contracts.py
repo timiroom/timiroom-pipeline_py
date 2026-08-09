@@ -2,11 +2,16 @@ import json
 import re
 
 from phase2.agents.api_agent import (
-    _align_endpoints_to_db, _ensure_feature_endpoint_groups, _is_garbage_endpoint,
+    _align_endpoints_to_db,
+    _ensure_feature_endpoint_groups,
+    _is_garbage_endpoint,
 )
 from phase2.agents.dba_agent import (
-    _synthesize_relationships, enforce_schema_contracts, ensure_domain_columns,
-    reconcile_fk_types, sanitize_tables,
+    _synthesize_relationships,
+    enforce_schema_contracts,
+    ensure_domain_columns,
+    reconcile_fk_types,
+    sanitize_tables,
 )
 from phase2.agents.prd_agent import PrdAgent
 from phase2.agents.qa_agent import QaAgent
@@ -410,7 +415,10 @@ def test_api_alignment_adds_operation_contract_for_plain_mutation():
 
 
 def test_api_repair_maps_domain_behavior_tables_and_normalizes_put():
-    from phase2.agents.api_agent import _ensure_feature_endpoint_groups, _normalize_endpoints
+    from phase2.agents.api_agent import (
+        _ensure_feature_endpoint_groups,
+        _normalize_endpoints,
+    )
 
     tables = [
         _table("tasks", [("id", "BIGINT", "PRIMARY_KEY")]),

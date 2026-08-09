@@ -1,8 +1,11 @@
-from phase2.agents.prd_agent import PrdAgent, _build_plain_section_prompt
-from phase2.state import PipelineState
-from phase2.agents.dba_agent import _parse_table_plan_text, _parse_table_text
 from phase2.agents.api_agent import _parse_endpoint_text
-from phase2.agents.qa_agent import _apply_review_patches, _derive_patches_from_full_output
+from phase2.agents.dba_agent import _parse_table_plan_text, _parse_table_text
+from phase2.agents.prd_agent import PrdAgent, _build_plain_section_prompt
+from phase2.agents.qa_agent import (
+    _apply_review_patches,
+    _derive_patches_from_full_output,
+)
+from phase2.state import PipelineState
 
 
 def test_goal_accepts_plain_text_when_model_omits_label():

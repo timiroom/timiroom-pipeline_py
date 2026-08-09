@@ -7,7 +7,12 @@ import pytest
 
 from common.document_chunk import DocumentChunk
 from phase1.document_ingestion import DocumentIngestionService
-from phase1.hybrid_search import HybridSearchService, RRF_K, SESSION_BOOST, _SEARCH_TYPE_SQL
+from phase1.hybrid_search import (
+    _SEARCH_TYPE_SQL,
+    RRF_K,
+    SESSION_BOOST,
+    HybridSearchService,
+)
 from phase1.recommendation.models import (
     PersonaRecommendationRequest,
     PersonaRecommendationResponse,

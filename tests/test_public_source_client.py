@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import httpx
 
+from phase2.agents.search_agent import _select_public_search_keyword
 from phase2.public_source_client import (
     CollectionReport,
     PublicSourceClient,
@@ -10,7 +11,6 @@ from phase2.public_source_client import (
     _host_allowed,
     format_collection_report,
 )
-from phase2.agents.search_agent import _select_public_search_keyword
 
 
 def test_allowlist_rejects_http_credentials_ip_and_lookalike_domains():
@@ -102,7 +102,7 @@ def test_settings_factory_keeps_credentials_out_of_report_structure():
         kosis_api_key="secret-kosis",
         law_open_api_oc="secret-law",
         public_source_timeout_seconds=3,
-        get_public_source_urls=lambda: [],
+        get_public_source_urls=list,
         get_public_source_domains=lambda: ["go.kr"],
     )
     client = PublicSourceClient.from_settings(settings)

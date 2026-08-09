@@ -3,19 +3,32 @@ import json
 import pytest
 
 from phase2.agent_contract import (
-    IssueSeverity, auth_feature_specs, classify_issue, feature_methods, feature_relation_kind,
-    normalize_target_arrow, requires_auth, semantic_relevance,
+    IssueSeverity,
+    auth_feature_specs,
+    classify_issue,
+    feature_methods,
+    feature_relation_kind,
+    normalize_target_arrow,
+    requires_auth,
+    semantic_relevance,
 )
 from phase2.agents.api_agent import (
-    _api_feature_mappings, _ensure_auth_endpoints, _ensure_feature_endpoint_groups,
-    _invalid_paths, _sanitize_plan_paths,
+    _api_feature_mappings,
+    _ensure_auth_endpoints,
+    _ensure_feature_endpoint_groups,
+    _invalid_paths,
+    _sanitize_plan_paths,
 )
 from phase2.agents.dba_agent import (
-    DbaAgent, _ensure_auth_contract_tables, build_feature_mappings,
-    enforce_feature_relation_contracts, enforce_schema_contracts, ensure_domain_columns,
+    DbaAgent,
+    _ensure_auth_contract_tables,
+    build_feature_mappings,
+    enforce_feature_relation_contracts,
+    enforce_schema_contracts,
+    ensure_domain_columns,
 )
-from phase2.agents.qa_agent import QaAgent
 from phase2.agents.pm_agent import PmAgent
+from phase2.agents.qa_agent import QaAgent
 from phase2.state import PipelineState
 from phase3.schema_validator import SchemaValidator, ValidationResult
 from phase3.validation_service import ValidationService

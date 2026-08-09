@@ -1,13 +1,24 @@
 import json
 
-from phase2.agents.api_agent import _align_endpoints_to_db, _feature_methods, _feature_resource_slug
-from phase2.agents.dba_agent import ensure_domain_columns, reconcile_fk_types, sanitize_tables
+from phase1.hybrid_search import _SEARCH_TYPE_SQL
+from phase2.agents.api_agent import (
+    _align_endpoints_to_db,
+    _feature_methods,
+    _feature_resource_slug,
+)
+from phase2.agents.dba_agent import (
+    ensure_domain_columns,
+    reconcile_fk_types,
+    sanitize_tables,
+)
 from phase2.agents.pm_agent import PmAgent, _parse_feature_detail, _parse_plain_pm
 from phase2.agents.prd_agent import PrdAgent
 from phase2.agents.qa_agent import QaAgent
-from phase1.hybrid_search import _SEARCH_TYPE_SQL
 from phase2.quality_rules import (
-    contamination_reasons, feature_semantic_issues, kpi_basis_issues, source_evidence_issues,
+    contamination_reasons,
+    feature_semantic_issues,
+    kpi_basis_issues,
+    source_evidence_issues,
 )
 
 

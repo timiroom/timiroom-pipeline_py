@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import main
+from phase2.agents.prd_agent import _parse_plain_section
 from routers.chat import (
     ChatMessageDto,
     ChatRequest,
@@ -14,7 +15,6 @@ from routers.chat import (
     _synthesize_form_data,
     message,
 )
-from phase2.agents.prd_agent import _parse_plain_section
 
 
 def test_chat_labeled_text_collects_repeated_suggestions():
