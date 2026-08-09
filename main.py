@@ -1,13 +1,22 @@
-import io
 import logging
 import logging.config
 import sys
 
 # Windows cp949 터미널에서 UTF-8 출력 강제
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "buffer"):
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+def _configure_utf8_stdio() -> None:
+    """Configure text streams without replacing or closing pytest capture streams."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Redirected or already-closed streams cannot always be reconfigured.
+            pass
+
+
+_configure_utf8_stdio()
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI

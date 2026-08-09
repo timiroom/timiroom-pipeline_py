@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import main
@@ -15,6 +16,27 @@ from routers.chat import (
     _synthesize_form_data,
     message,
 )
+
+
+def test_stdio_configuration_does_not_replace_stream_objects(monkeypatch):
+    class ReconfigurableStream:
+        def __init__(self):
+            self.calls = []
+
+        def reconfigure(self, **kwargs):
+            self.calls.append(kwargs)
+
+    stdout = ReconfigurableStream()
+    stderr = ReconfigurableStream()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    main._configure_utf8_stdio()
+
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+    assert stdout.calls == [{"encoding": "utf-8", "errors": "replace"}]
+    assert stderr.calls == [{"encoding": "utf-8", "errors": "replace"}]
 
 
 def test_chat_labeled_text_collects_repeated_suggestions():
