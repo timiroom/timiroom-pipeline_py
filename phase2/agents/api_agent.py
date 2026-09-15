@@ -35,8 +35,9 @@ _PLAN_TEMPERATURE = 0.4
 # plan 생성 배치 크기 — 한 번에 담당할 기능 수.
 # 기능 전체(21개)를 한 프롬프트에 넣으면 EXAONE이 요구량의 1/3 수준에서 멈춘다(실측 12/42).
 _PLAN_BATCH_SIZE = 4
-_ENDPOINTS_PER_FEATURE = 2
+_ENDPOINTS_PER_FEATURE = 1
 _AUTH_ENDPOINT_COUNT = 4  # 회원가입/로그인/토큰갱신/로그아웃
+_MAX_ENDPOINT_SOFT_CAP = 36
 
 _AUTHENTICATION_DESC = (
     "JWT Bearer 토큰 방식. 로그인 시 발급받은 accessToken을 "
@@ -57,10 +58,13 @@ PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
 {auth_rule}- RESTful 설계: 명사형 복수형 경로, 반드시 영문 소문자·숫자·하이픈(-)만 사용 (예: /api/v1/book-clubs)
 - path에 한글, 공백, 괄호(), 콜론(:), 쉼표 등은 절대 사용 금지 — 기능명이 한글이어도
   의미를 압축한 영문 리소스명으로 직접 번역해서 사용 (예: "재료 등록(바코드 스캔)" 기능 → /api/v1/ingredients, 절대 /api/v1/재료-등록-(바코드-스캔) 처럼 쓰지 말 것)
-- **담당 기능 하나하나마다** 실제로 필요한 조회·생성·수정·삭제 엔드포인트를 빠짐없이 설계
+- 리소스별 CRUD 세트를 기계적으로 만들지 말고, 사용자의 핵심 워크플로우를 수행하는 엔드포인트만 설계
+- 담당 기능 하나당 대표 엔드포인트 1개를 우선 만들고, 꼭 필요한 경우에만 2개까지 확장
+- 목록/상세/대시보드/히스토리처럼 비슷한 조회 API는 하나의 overview 또는 query parameter로 통합
 - description은 반드시 "기능명: 설명" 형태로 시작해 어느 기능에 대응하는지 드러낼 것
 - 목록 조회 엔드포인트는 페이지네이션이 필요함을 description에 명시
-- 담당 기능은 {feature_count}개이므로 최소 {min_endpoints}개 이상의 엔드포인트가 나와야 합니다
+- 담당 기능은 {feature_count}개입니다. 권장 엔드포인트 수는 {min_endpoints}개 이상, {max_endpoints}개 이하입니다
+- {max_endpoints}개를 넘기지 마세요. 초과가 필요하면 낮은 우선순위 CRUD/조회 파생 API를 합치거나 제외하세요
 - 담당 기능 밖의 엔드포인트는 만들지 마세요 (다른 담당자가 설계합니다)
 {existing_note}
 응답 형식 (JSON만):
@@ -226,6 +230,7 @@ class ApiAgent:
                 "instruction": instruction,
                 "feature_str": feature_str,
                 "feature_list": state.feature_list,
+                "max_endpoints": _endpoint_soft_cap(len(state.feature_list), include_auth=True),
                 "dump": dump,
             },
         }
@@ -258,12 +263,14 @@ class ApiAgent:
         (실측) 레시피·알림·장보기 같은 기능군이 통째로 빠진 채 통과됐다. 담당 범위를
         좁히면 요구 개수가 배치당 8~10개로 내려가 실제로 채워진다."""
         min_endpoints = len(batch) * _ENDPOINTS_PER_FEATURE + (_AUTH_ENDPOINT_COUNT if with_auth else 0)
+        max_endpoints = _endpoint_soft_cap(len(batch), include_auth=with_auth)
         prompt = PLAN_PROMPT.format(
             instruction=ctx["instruction"],
             context=ctx["context"],
             feature_str="- " + "\n- ".join(batch),
             feature_count=len(batch),
             min_endpoints=min_endpoints,
+            max_endpoints=max_endpoints,
             auth_rule=_AUTH_RULE if with_auth else "",
             existing_note=_existing_paths_note(existing_paths),
         )
@@ -282,6 +289,7 @@ class ApiAgent:
                 logger.warning("%s 파싱 실패/오염 (attempt %d) — 재생성", label, attempt + 1)
                 continue
             plan_list = [ep for ep in candidate["plan"] if isinstance(ep, dict)]
+            plan_list = _prune_plan(plan_list, batch, max_endpoints)
             missing = uncovered_features(batch, [ep.get("description", "") for ep in plan_list])
             if len(plan_list) > len(best):
                 best = plan_list
@@ -313,6 +321,7 @@ class ApiAgent:
         ctx = state["ctx"]
         feature_list = ctx["feature_list"] or []
         min_endpoints = max(4, len(feature_list) * _ENDPOINTS_PER_FEATURE)
+        max_endpoints = _endpoint_soft_cap(len(feature_list), include_auth=True)
 
         # 기능을 배치로 쪼개 병렬 설계 — 배치당 요구 개수가 작아야 EXAONE이 실제로 채운다
         batches = [
@@ -326,6 +335,7 @@ class ApiAgent:
             for i, batch in enumerate(batches)
         ])
         plan = self._merge_plans(results)
+        plan = _prune_plan(plan, feature_list, max_endpoints)
 
         # 배치들이 서로 모르는 채 같은 리소스를 설계해 병합 시 중복 제거로 개수가 깎인다.
         # 흔적이 없는 기능(uncovered)뿐 아니라 엔드포인트가 부족한 기능(undercovered)까지
@@ -335,7 +345,7 @@ class ApiAgent:
             missing = uncovered_features(feature_list, descriptions)
             thin = undercovered_features(feature_list, descriptions, _ENDPOINTS_PER_FEATURE)
             need = missing + [f for f in thin if f not in missing]
-            if not need or len(plan) >= min_endpoints:
+            if not need or len(plan) >= min_endpoints or len(plan) >= max_endpoints:
                 break
             logger.warning(
                 "API manager_plan 보충 %d라운드 — 현재 %d/%d개, 미반영 %d개·부족 %d개: %s",
@@ -346,6 +356,7 @@ class ApiAgent:
                 existing_paths=[f"{ep.get('method')} {ep.get('path')}" for ep in plan],
             )
             merged = self._merge_plans([plan, topup])
+            merged = _prune_plan(merged, feature_list, max_endpoints)
             if len(merged) == len(plan):
                 logger.warning("API manager_plan 보충 %d라운드 — 새 엔드포인트 없음, 중단", round_ + 1)
                 break
@@ -357,11 +368,12 @@ class ApiAgent:
         elif _invalid_paths(plan):
             logger.warning("API manager_plan — 경로 형식 오류가 남아있어 강제 살균 적용")
             plan = _sanitize_plan_paths(plan)
+            plan = _prune_plan(plan, feature_list, max_endpoints)
 
         if len(plan) < min_endpoints:
             logger.warning("API manager_plan — 엔드포인트 %d/%d개로 목표 미달", len(plan), min_endpoints)
 
-        logger.info("API manager_plan 완료 — 엔드포인트 %d개 계획 (목표 %d개)", len(plan), min_endpoints)
+        logger.info("API manager_plan 완료 — 엔드포인트 %d개 계획 (목표 %d개, soft cap %d개)", len(plan), min_endpoints, max_endpoints)
         return {"plan": plan, "authentication": _AUTHENTICATION_DESC}
 
     def _fallback_plan(self, feature_list: list[str]) -> dict:
@@ -498,6 +510,11 @@ class ApiAgent:
 
         # 패치로 유입된 불완전 엔드포인트(method/path만 있는 경우 등)에 필수 필드 기본값 보강
         endpoints = _normalize_endpoints(endpoints)
+        endpoints = _prune_plan(
+            endpoints,
+            ctx["feature_list"],
+            int(ctx.get("max_endpoints") or _endpoint_soft_cap(len(ctx["feature_list"]), include_auth=True)),
+        )
 
         api_spec = json.dumps({"endpoints": endpoints, "authentication": authentication}, ensure_ascii=False)
         return {"api_spec": api_spec, "prd_issues": prd_issues}
@@ -534,6 +551,44 @@ class ApiAgent:
 _VALID_PATH_RE = re.compile(r'^/[A-Za-z0-9/_\-{}]*$')
 _PATH_STRIP_RE = re.compile(r'[^A-Za-z0-9\-{}/]+')
 _PATH_DASH_COLLAPSE_RE = re.compile(r'-{2,}')
+
+
+def _endpoint_soft_cap(feature_count: int, include_auth: bool = True) -> int:
+    """기능 수에 따라 API plan 상한을 유연하게 잡는다.
+
+    고정 개수 제한이 아니라 MVP 산출물에서 과도한 CRUD 확장을 막기 위한 상한이다.
+    """
+    auth = _AUTH_ENDPOINT_COUNT if include_auth else 0
+    if feature_count <= 0:
+        return max(4, auth)
+    return max(8, min(_MAX_ENDPOINT_SOFT_CAP, int(feature_count * 1.6) + auth))
+
+
+def _endpoint_priority(ep: dict, feature_list: list[str]) -> tuple[int, int, int]:
+    path = str(ep.get("path") or "").lower()
+    method = str(ep.get("method") or "GET").upper()
+    description = str(ep.get("description") or "")
+    auth_rank = 0 if any(token in path for token in ("/auth/", "/login", "/logout", "/token", "/signup", "/register")) else 1
+    action_rank = {"POST": 0, "PATCH": 1, "PUT": 2, "GET": 3, "DELETE": 4}.get(method, 5)
+    derived_penalty = sum(
+        token in path
+        for token in ("dashboard", "history", "overview", "stats", "metrics", "archive", "search")
+    )
+    covered = 0 if any(feature in description for feature in feature_list if isinstance(feature, str)) else 1
+    return auth_rank, covered + derived_penalty, action_rank
+
+
+def _prune_plan(plan: list[dict], feature_list: list[str], max_endpoints: int) -> list[dict]:
+    """soft cap 초과 시 인증/핵심 액션 API를 우선 보존하고 파생 조회 API를 줄인다."""
+    unique = _sanitize_plan_paths(plan)
+    if len(unique) <= max_endpoints:
+        return unique
+    indexed = list(enumerate(unique))
+    indexed.sort(key=lambda item: (*_endpoint_priority(item[1], feature_list), item[0]))
+    selected = sorted(indexed[:max_endpoints], key=lambda item: item[0])
+    pruned = [ep for _, ep in selected]
+    logger.warning("API manager_plan — soft cap 적용: %d개 → %d개", len(unique), len(pruned))
+    return pruned
 
 
 def _invalid_paths(plan: list) -> list[str]:
@@ -740,5 +795,52 @@ def _normalize_endpoints(endpoints: list) -> list:
         _normalize_parameters(ep)
         ep["successResponse"] = _clean_spec_field(ep.get("successResponse"), "success: boolean")
         ep["errorCodes"] = _clean_spec_field(ep.get("errorCodes"), "401 — 인증 실패, 500 — 서버 오류")
+        out.append(ep)
+    return _dedupe_semantic_endpoints(out)
+
+
+def _semantic_endpoint_key(ep: dict) -> tuple[str, str] | None:
+    """path만 다른 동일 의미 endpoint를 하나로 묶기 위한 보수적 키.
+
+    LLM manager review가 /auth/signup 과 /auth/registrations 처럼 같은 인증 동작을
+    다른 REST 스타일로 다시 추가하는 경우가 있어, 최종 산출물 직전에 의미 중복을 제거한다.
+    """
+    method = str(ep.get("method") or "GET").upper()
+    path = str(ep.get("path") or "").lower().rstrip("/")
+    desc = str(ep.get("description") or "").lower()
+    text = f"{path} {desc}"
+
+    if "/auth/" in path:
+        if any(token in text for token in ("signup", "register", "registration", "회원가입", "가입")):
+            return ("auth", "signup")
+        if any(token in text for token in ("signin", "login", "session", "로그인", "인증")) and method == "POST":
+            return ("auth", "signin")
+        if any(token in text for token in ("signout", "logout", "sessions/current", "로그아웃")):
+            return ("auth", "signout")
+        if any(token in text for token in ("refresh", "token-refresh", "토큰", "갱신")):
+            return ("auth", "refresh")
+
+    return None
+
+
+def _dedupe_semantic_endpoints(endpoints: list[dict]) -> list[dict]:
+    """METHOD+path 중복보다 한 단계 높은 의미 중복을 제거한다."""
+    out: list[dict] = []
+    seen_exact: set[tuple[str, str]] = set()
+    seen_semantic: set[tuple[str, str]] = set()
+    for ep in endpoints:
+        method = str(ep.get("method") or "GET").upper()
+        path = str(ep.get("path") or "").rstrip("/")
+        exact = (method, path)
+        if exact in seen_exact:
+            logger.warning("API 중복 엔드포인트 드롭: %s %s", method, path)
+            continue
+        semantic = _semantic_endpoint_key(ep)
+        if semantic and semantic in seen_semantic:
+            logger.warning("API 의미 중복 엔드포인트 드롭: %s %s (%s)", method, path, semantic)
+            continue
+        seen_exact.add(exact)
+        if semantic:
+            seen_semantic.add(semantic)
         out.append(ep)
     return out

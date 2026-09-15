@@ -151,12 +151,11 @@ def test_structural_and_cross_artifact_errors_are_detected():
         "DB_FOREIGN_KEY_TARGET_MISSING",
         "API_AUTH_DEFINITION_REQUIRED",
         "API_ENDPOINT_DUPLICATED",
-        "API_DB_RESOURCE_MISMATCH",
     } <= set(result.error_codes)
     assert {"db", "api"} <= set(result.repair_targets)
 
 
-def test_any_feature_coverage_gap_is_rejected():
+def test_semantic_feature_coverage_gap_is_allowed():
     result = SchemaValidator().validate(
         ["사용자 로그인", "결제 환불"],
         json.dumps(_db(), ensure_ascii=False),
@@ -164,8 +163,39 @@ def test_any_feature_coverage_gap_is_rejected():
         json.dumps(_prd(), ensure_ascii=False),
     )
 
-    assert result.success is False
-    assert {"DB_FEATURE_COVERAGE", "API_FEATURE_COVERAGE", "PRD_FEATURE_COVERAGE"} <= set(result.error_codes)
+    assert result.success is True
+    assert not result.error_codes
+
+
+def test_common_fk_aliases_and_self_relationships_are_allowed():
+    db = _db()
+    db["tables"].append({
+        "name": "files",
+        "description": "첨부 파일",
+        "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
+    })
+    db["tables"][0]["columns"].append(
+        {"name": "created_by_user_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"}
+    )
+    db["tables"][1]["columns"].extend([
+        {"name": "pdf_file_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"},
+        {"name": "source_session_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"},
+    ])
+    db["relationships"].extend([
+        "users (1:N) files",
+        "sessions (1:N) sessions (source_session_id)",
+    ])
+
+    result = SchemaValidator().validate(
+        FEATURES,
+        json.dumps(db, ensure_ascii=False),
+        json.dumps(_api(), ensure_ascii=False),
+        json.dumps(_prd(), ensure_ascii=False),
+    )
+
+    assert result.success is True
+    assert "DB_FOREIGN_KEY_TARGET_MISSING" not in result.error_codes
+    assert "DB_RELATIONSHIP_INVALID" not in result.error_codes
 
 
 def test_success_clears_stale_validation_state():

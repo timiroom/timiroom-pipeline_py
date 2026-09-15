@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import re
 from typing import Annotated, TypedDict
 
@@ -413,6 +414,7 @@ def _merge_sections(a: dict, b: dict) -> dict:
 
 _VALID_PRIORITIES = ("P0", "P1", "P2")
 _MOSCOW_TO_PRIORITY = {"MUST": "P0", "SHOULD": "P1", "COULD": "P2", "WONT": "P2", "WON'T": "P2"}
+_MAX_P0_RATIO = 0.35
 _PRIORITY_RE = re.compile(r'^P\s*([0-2])$')
 
 
@@ -954,6 +956,7 @@ class PrdAgent:
         # 구분이 전혀 없으면(전부 같은 값이거나 전부 비어 있음) 전량 재배정, 아니면 빈 항목만
         targets = items if len(distinct) <= 1 else [i for i in items if not resolved[id(i)]]
         if not targets:
+            cls._cap_p0_priorities(items, [])
             return
 
         included, excluded = [], []
@@ -965,6 +968,7 @@ class PrdAgent:
                 "coreFeatures 우선순위 구분 없음(%s)이지만 mvpScope가 비어 도출 불가 — 그대로 둠",
                 distinct or "(전부 미지정)",
             )
+            cls._cap_p0_priorities(items, [])
             return
 
         inc_tokens = [cls._label_tokens(x) for x in included]
@@ -987,6 +991,33 @@ class PrdAgent:
             "coreFeatures 우선순위 %d개를 MVP 범위 기준으로 재배정 (기존 구분: %s) — %s",
             len(targets), distinct or "없음", counts,
         )
+        cls._cap_p0_priorities(items, included)
+
+    @classmethod
+    def _cap_p0_priorities(cls, items: list[dict], included: list[str] | None = None) -> None:
+        """P0가 과도하게 많으면 MVP 핵심 후보만 남기고 나머지는 P1로 낮춘다."""
+        if not items:
+            return
+        p0_items = [item for item in items if item.get("priority") == "P0"]
+        max_p0 = max(3, math.ceil(len(items) * _MAX_P0_RATIO))
+        if len(p0_items) <= max_p0:
+            return
+
+        included_tokens = [cls._label_tokens(x) for x in (included or []) if isinstance(x, str)]
+
+        def score(item: dict) -> tuple[float, int]:
+            tokens = cls._label_tokens(item.get("name") or "")
+            overlap = cls._best_overlap(tokens, included_tokens) if included_tokens else 0.0
+            # 앞쪽 기능은 PM이 더 핵심으로 배치한 경우가 많아 같은 점수에서는 앞 순서를 보존한다.
+            return overlap, -items.index(item)
+
+        keep = set(id(item) for item in sorted(p0_items, key=score, reverse=True)[:max_p0])
+        demoted = 0
+        for item in p0_items:
+            if id(item) not in keep:
+                item["priority"] = "P1"
+                demoted += 1
+        logger.warning("coreFeatures P0 과다 보정 — P0 %d개 중 %d개를 P1으로 조정", len(p0_items), demoted)
 
     @classmethod
     def _dedup_section_fields(cls, data: dict, min_counts: dict | None) -> dict:

@@ -3,9 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from phase2.agents.api_agent import ApiAgent
+from phase2.agents.api_agent import ApiAgent, _endpoint_soft_cap, _normalize_endpoints, _prune_plan
+from phase2.agents.prd_agent import reconcile_core_features
 from phase2.agents.qa_agent import QaAgent
-from phase2.agents.search_agent import SearchAgent
+from phase2.agents.search_agent import SearchAgent, _polish_market_research_text
 from phase2.llm_runtime import LlmRuntime
 from phase2.orchestration_graph import OrchestrationGraph
 from phase2.state import PipelineState
@@ -44,6 +45,77 @@ def test_api_agent_propagates_prd_feedback():
     result = asyncio.run(agent.execute(PipelineState(feature_list=["로그인"])))
 
     assert result.prd_feedback_from_api == "권한 정책 누락"
+
+
+def test_api_plan_soft_cap_scales_with_feature_count():
+    cap = _endpoint_soft_cap(15)
+
+    assert 15 <= cap <= 36
+    assert cap < 40
+
+
+def test_prune_plan_keeps_auth_and_core_actions_under_cap():
+    features = ["견적서 생성", "계약 상태 관리"]
+    plan = [
+        {"method": "GET", "path": "/api/v1/projects/history", "description": "프로젝트 히스토리 조회"},
+        {"method": "POST", "path": "/api/v1/auth/login", "description": "사용자 로그인"},
+        {"method": "POST", "path": "/api/v1/estimates", "description": "견적서 생성: 견적 생성"},
+        {
+            "method": "PATCH",
+            "path": "/api/v1/contracts/{contract-id}/status",
+            "description": "계약 상태 관리: 상태 변경",
+        },
+        {"method": "GET", "path": "/api/v1/projects/{project-id}/dashboard", "description": "대시보드 조회"},
+    ]
+
+    pruned = _prune_plan(plan, features, 3)
+
+    keys = {f"{ep['method']} {ep['path']}" for ep in pruned}
+    assert len(pruned) == 3
+    assert "POST /api/v1/auth/login" in keys
+    assert "POST /api/v1/estimates" in keys
+    assert "PATCH /api/v1/contracts/{contract-id}/status" in keys
+
+
+def test_normalize_endpoints_drops_semantic_auth_duplicates():
+    endpoints = [
+        {"method": "POST", "path": "/api/v1/auth/signup", "description": "회원가입"},
+        {"method": "POST", "path": "/api/v1/auth/registrations", "description": "사용자 회원가입"},
+        {"method": "POST", "path": "/api/v1/auth/signin", "description": "로그인"},
+        {"method": "POST", "path": "/api/v1/auth/sessions", "description": "사용자 로그인"},
+        {"method": "DELETE", "path": "/api/v1/auth/sessions/current", "description": "로그아웃"},
+    ]
+
+    normalized = _normalize_endpoints(endpoints)
+
+    keys = {f"{ep['method']} {ep['path']}" for ep in normalized}
+    assert len(normalized) == 3
+    assert "POST /api/v1/auth/signup" in keys
+    assert "POST /api/v1/auth/signin" in keys
+    assert "DELETE /api/v1/auth/sessions/current" in keys
+
+
+def test_reconcile_core_features_caps_excessive_p0_priorities():
+    core_features = [
+        {"name": f"핵심 기능 {i}", "priority": "P0", "description": "설명", "requirements": ["요구사항"]}
+        for i in range(10)
+    ]
+
+    result = reconcile_core_features(core_features, {"included": ["핵심 기능 0", "핵심 기능 1", "핵심 기능 2"]})
+
+    assert sum(1 for item in result if item["priority"] == "P0") <= 4
+    assert any(item["priority"] == "P1" for item in result)
+
+
+def test_market_research_polish_removes_system_limitation_phrasing():
+    text = "현재 웹 검색을 수행할 수 없어 최신 법규를 확인할 수 없습니다. 따라서 답변할 수 없습니다."
+
+    polished = _polish_market_research_text(text)
+
+    assert "웹 검색을 수행할 수 없어" not in polished
+    assert "확인할 수 없습니다" not in polished
+    assert "답변할 수 없습니다" not in polished
+    assert "공개적으로 확인 가능한 자료 기준" in polished
 
 
 def test_qa_max_round_ends_without_false_approval():
@@ -157,6 +229,22 @@ def test_prd_repair_regenerates_prd_and_dependent_artifacts():
 
     assert (search.calls, pm.calls) == (0, 0)
     assert (prd.calls, dba.calls, api.calls, qa.calls) == (1, 1, 1, 1)
+
+
+def test_pm_repair_skips_search_and_regenerates_dependent_artifacts():
+    search = _Agent()
+    pm = _Agent(lambda state: state.copy(feature_list=["로그인"]))
+    prd = _Agent(lambda state: state.copy(prd_document="{}"))
+    dba = _Agent(lambda state: state.copy(db_schema="{}", prd_feedback_from_dba=""))
+    api = _Agent(lambda state: state.copy(api_spec="{}", prd_feedback_from_api=""))
+    qa = _Agent()
+    graph = OrchestrationGraph(search, pm, prd, dba, api, qa, _Progress())
+
+    result = asyncio.run(graph.repair(PipelineState(), "featureList: 기능 목록 오류", "p1", repair_targets=["pm"]))
+
+    assert result.feature_list == ["로그인"]
+    assert search.calls == 0
+    assert (pm.calls, prd.calls, dba.calls, api.calls, qa.calls) == (1, 1, 1, 1, 1)
 
 
 def test_search_agent_uses_responses_web_search():

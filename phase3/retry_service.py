@@ -69,6 +69,11 @@ class RetryService:
             logger.info("Phase 3 재시도 성공 (%d/%d)", current_retry, self._max_retry)
             return validated
 
+        next_fingerprint = self._failure_fingerprint(validated)
+        if next_fingerprint in validated.validation_failure_fingerprints:
+            logger.warning("복구 직후 동일 검증 오류가 반복되어 추가 재시도를 생략")
+            return validated.copy(status_message="Human-in-the-Loop 필요 — 동일 검증 실패 반복")
+
         return await self.retry_with(validated, orchestration_graph, validation_service, pipeline_id)
 
     @staticmethod

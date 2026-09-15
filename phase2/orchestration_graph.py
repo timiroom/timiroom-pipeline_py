@@ -101,7 +101,7 @@ class OrchestrationGraph:
         pipeline_id: str | None,
         repair_targets: list[str] | None,
     ) -> PipelineState:
-        targets = set(repair_targets or [])
+        targets = {target for target in (repair_targets or []) if target in {"pm", "prd", "db", "api"}}
         if not targets:
             if "DB 스키마" in validation_error:
                 targets.add("db")
@@ -112,9 +112,17 @@ class OrchestrationGraph:
             if "featureList" in validation_error:
                 targets.add("pm")
 
-        if "pm" in targets or not targets:
-            logger.warning("선택적 재생성 대상을 판단할 수 없어 전체 Phase 2를 재실행")
-            return await self._run_inner(state, pipeline_id)
+        if "pm" in targets:
+            self._progress.send(pipeline_id, "PM_REPAIR", "기능 목록을 재정리 중...", 64)
+            after_pm = await self._pm.execute(state)
+            self._progress.send(pipeline_id, "PRD_REPAIR", "변경된 기능 목록 기준 산출물을 재생성 중...", 68)
+            repaired = await self._run_prd_with_rollback(after_pm, pipeline_id)
+            self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
+            return await self._qa.execute(repaired)
+
+        if not targets:
+            logger.warning("선택적 재생성 대상을 판단할 수 없어 QA 정규화 후 Phase 3로 반환")
+            return await self._qa.execute(state)
 
         if "prd" in targets:
             self._progress.send(pipeline_id, "PRD_REPAIR", "PRD부터 종속 산출물을 재생성 중...", 68)

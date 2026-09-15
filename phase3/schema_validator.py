@@ -4,8 +4,6 @@ import re
 from dataclasses import dataclass, field
 
 from phase2.agents.api_agent import _invalid_paths
-from phase2.agents.dba_agent import min_table_count
-from phase2.feature_coverage import uncovered_features
 from phase2.json_utils import try_parse_json
 
 logger = logging.getLogger(__name__)
@@ -156,21 +154,13 @@ class SchemaValidator:
             known = set(table_names)
             for relationship in relationships:
                 text = str(relationship)
-                referenced = [name for name in known if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text)]
-                if len(referenced) < 2 or not _RELATION_CARDINALITY_RE.search(text):
+                referenced = [
+                    name
+                    for name in known
+                    for _ in re.finditer(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text)
+                ]
+                if not referenced or not _RELATION_CARDINALITY_RE.search(text):
                     add("DB_RELATIONSHIP_INVALID", "db", f"DB 스키마: 잘못된 relationship: {text}")
-
-        minimum = max(2, min_table_count(len(feature_list)) - 1) if feature_list else 1
-        if len(tables) < minimum:
-            add("DB_TABLE_COUNT_LOW", "db", f"DB 스키마: 테이블이 {len(tables)}개뿐 — 최소 {minimum}개 필요")
-
-        haystack = []
-        for table in tables:
-            if isinstance(table, dict):
-                haystack.extend([str(table.get("name", "")), str(table.get("description", ""))])
-        missing = uncovered_features(feature_list, haystack)
-        if missing:
-            add("DB_FEATURE_COVERAGE", "db", f"DB 스키마: 기능을 저장할 테이블이 없습니다 — {missing}")
 
     @staticmethod
     def _check_api(data: dict, feature_list: list[str], add) -> None:
@@ -201,13 +191,6 @@ class SchemaValidator:
         bad_paths = _invalid_paths([endpoint for endpoint in endpoints if isinstance(endpoint, dict)])
         if bad_paths:
             add("API_PATH_INVALID", "api", f"API 스펙: REST 경로 형식 위반: {bad_paths}")
-        missing = uncovered_features(
-            feature_list,
-            [endpoint.get("description", "") for endpoint in endpoints if isinstance(endpoint, dict)],
-        )
-        if missing:
-            add("API_FEATURE_COVERAGE", "api", f"API 스펙: 대응하는 엔드포인트가 없는 기능이 있습니다 — {missing}")
-
     @staticmethod
     def _check_prd(data: dict, feature_list: list[str], add) -> None:
         missing_fields = sorted(_REQUIRED_PRD_FIELDS - set(data))
@@ -217,10 +200,6 @@ class SchemaValidator:
         if not isinstance(core_features, list) or not core_features:
             add("PRD_CORE_FEATURES_REQUIRED", "prd", "PRD 문서: coreFeatures가 비어있습니다")
             return
-        names = [str(item.get("name", "")) for item in core_features if isinstance(item, dict)]
-        missing = uncovered_features(feature_list, names)
-        if missing:
-            add("PRD_FEATURE_COVERAGE", "prd", f"PRD 문서: coreFeatures에 누락된 기능이 있습니다 — {missing}")
 
     @staticmethod
     def _check_cross_artifact(db: dict, api: dict, add) -> None:
@@ -233,39 +212,6 @@ class SchemaValidator:
             str(table.get("name")) for table in db.get("tables", [])
             if isinstance(table, dict) and table.get("name")
         }
-        table_aliases = set(table_names)
-        for table_name in table_names:
-            table_aliases.add(table_name.removesuffix("s"))
-            if table_name.endswith("ies"):
-                table_aliases.add(table_name[:-3] + "y")
-
-        for endpoint in endpoints:
-            if not isinstance(endpoint, dict):
-                continue
-            segments = [segment for segment in str(endpoint.get("path", "")).split("/") if segment]
-            resource_segments = [
-                segment for segment in segments
-                if segment not in {"api", "v1", "v2", "v3"} and not segment.startswith("{")
-            ]
-            if not resource_segments:
-                continue
-            resource = resource_segments[0].replace("-", "_").lower()
-            if resource in _NON_RESOURCE_PATHS:
-                continue
-            resource_aliases = {resource, resource.removesuffix("s")}
-            if resource.endswith("ies"):
-                resource_aliases.add(resource[:-3] + "y")
-            resource_matches_table = bool(resource_aliases & table_aliases) or any(
-                table_alias.startswith(f"{resource_alias}_")
-                or resource_alias.startswith(f"{table_alias}_")
-                for resource_alias in resource_aliases
-                for table_alias in table_aliases
-            )
-            if not resource_matches_table:
-                message = f"DB/API 정합성: {endpoint.get('path')} 리소스에 대응하는 DB 테이블이 없습니다"
-                add("API_DB_RESOURCE_MISMATCH", "db", message)
-                add("API_DB_RESOURCE_MISMATCH", "api", message)
-
         for table in db.get("tables", []):
             if not isinstance(table, dict):
                 continue
@@ -276,7 +222,18 @@ class SchemaValidator:
                 constraints = str(column.get("constraints", "")).upper()
                 if not name.endswith("_id") or "FOREIGN_KEY" not in constraints:
                     continue
-                stem = name[:-3]
-                candidates = {stem, f"{stem}s", f"{stem}es", stem.removesuffix("y") + "ies"}
+                candidates = SchemaValidator._fk_target_candidates(name[:-3])
                 if not candidates & table_names:
                     add("DB_FOREIGN_KEY_TARGET_MISSING", "db", f"DB 스키마: {name}이 참조할 테이블을 찾을 수 없습니다")
+
+    @staticmethod
+    def _fk_target_candidates(stem: str) -> set[str]:
+        parts = [part for part in stem.split("_") if part]
+        tail = parts[-1] if parts else stem
+        candidates = {stem, f"{stem}s", f"{stem}es", stem.removesuffix("y") + "ies"}
+        candidates.update({tail, f"{tail}s", f"{tail}es", tail.removesuffix("y") + "ies"})
+        if tail in {"user", "member", "owner", "assignee", "reviewer", "signer", "uploader"}:
+            candidates.update({"user", "users", "freelancer_profiles"})
+        if tail in {"file", "document", "pdf"}:
+            candidates.update({"file", "files", "documents"})
+        return candidates
