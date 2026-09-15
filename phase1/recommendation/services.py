@@ -36,13 +36,12 @@ class TechStackRecommendationService:
         try:
             resp = await self._client.chat.completions.create(
                 model=self._model,
-                max_tokens=512,
+                max_completion_tokens=512,
                 temperature=0.3,
                 messages=[
                     {"role": "system", "content": "당신은 소프트웨어 아키텍처 전문가입니다.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요."},
                     {"role": "user", "content": prompt},
                 ],
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             raw = (resp.choices[0].message.content or "").strip()
             data = try_parse_json(raw)
@@ -76,13 +75,12 @@ class PersonaRecommendationService:
         try:
             resp = await self._client.chat.completions.create(
                 model=self._model,
-                max_tokens=512,
+                max_completion_tokens=512,
                 temperature=0.4,
                 messages=[
                     {"role": "system", "content": "당신은 UX 리서처입니다.\n서비스 정보를 보고 가장 핵심적인 타겟 유저 페르소나를 추천하세요.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요."},
                     {"role": "user", "content": prompt},
                 ],
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             raw = (resp.choices[0].message.content or "").strip()
             data = try_parse_json(raw)
@@ -127,13 +125,12 @@ class FeatureRecommendationService:
         try:
             resp = await self._client.chat.completions.create(
                 model=self._model,
-                max_tokens=1024,
+                max_completion_tokens=1024,
                 temperature=0.3,
                 messages=[
                     {"role": "system", "content": "당신은 프로덕트 매니저입니다.\n프로젝트 정보를 보고 필요한 기능을 MoSCoW 우선순위로 추천하세요.\n반드시 JSON만 반환하고 코드 블록이나 다른 텍스트는 포함하지 마세요."},
                     {"role": "user", "content": prompt},
                 ],
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             raw = (resp.choices[0].message.content or "").strip()
             data = try_parse_json(raw)

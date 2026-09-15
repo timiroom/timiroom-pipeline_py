@@ -13,15 +13,16 @@ from phase2.agents.api_agent import _normalize_endpoints
 from phase2.agents.prd_agent import reconcile_core_features
 from phase2.feature_coverage import uncovered_features
 from phase2.json_utils import try_parse_json
+from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
-_MAX_SCHEMA_CHARS = 8000  # reviewer 컨텍스트에 전달할 db_schema/api_spec 최대 길이
-_MAX_ROUNDS = 2  # 도메인당 reviewer↔manager_check 최대 라운드 (2회째는 강제 승인)
+_MAX_SCHEMA_CHARS = 60000  # GPT-5.4 mini 컨텍스트 안에서 전체 DB/API 구조를 보존
+_MAX_ROUNDS = 2  # 도메인당 reviewer↔manager_check 최대 라운드
+_LIGHTWEIGHT_GATE_ENABLED = True  # 엄격한 최종 검증은 Phase3 SchemaValidator가 담당
 
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+# 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
@@ -196,25 +197,34 @@ class _QaGraphState(TypedDict, total=False):
     db_draft: str
     db_round: int
     db_approved: bool
+    db_forced: bool
     db_issues: list
     db_feedback: str
     api_draft: str
     api_round: int
     api_approved: bool
+    api_forced: bool
     api_issues: list
     api_feedback: str
     prd_draft: str
     prd_round: int
     prd_approved: bool
+    prd_forced: bool
     prd_issues: list
     prd_feedback: str
 
 
 class QaAgent:
 
-    def __init__(self, client: AsyncOpenAI, model: str = "gpt-4o"):
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        model: str = "gpt-5.4-mini",
+        runtime: LlmRuntime | None = None,
+    ):
         self._client = client
         self._model = model
+        self._runtime = runtime
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -230,6 +240,10 @@ class QaAgent:
         return graph.compile()
 
     async def execute(self, state: PipelineState, dump=None) -> PipelineState:
+        if _LIGHTWEIGHT_GATE_ENABLED:
+            logger.info("QA 에이전트 시작 (경량 게이트 — Phase3 검증 이관)")
+            return self._execute_lightweight_gate(state)
+
         logger.info("QA 에이전트 시작 (reviewer↔manager 도메인별 독립 루프)")
 
         api_completeness_hint = self._api_completeness_hint(
@@ -250,7 +264,7 @@ class QaAgent:
                 "feature_str": "\n".join(state.feature_list),
                 "orig_db_schema": self._safe_truncate(state.db_schema or "", _MAX_SCHEMA_CHARS, "db_schema"),
                 "orig_api_spec": self._safe_truncate(state.api_spec or "", _MAX_SCHEMA_CHARS, "api_spec"),
-                "orig_prd_document": (state.prd_document or "")[:3000] or "(PRD 없음)",
+                "orig_prd_document": self._safe_truncate(state.prd_document or "", _MAX_SCHEMA_CHARS, "prd_document") or "(PRD 없음)",
                 "api_completeness_hint": api_completeness_hint,
                 "db_completeness_hint": db_completeness_hint,
                 "prd_completeness_hint": prd_completeness_hint,
@@ -259,16 +273,19 @@ class QaAgent:
             "db_draft": state.db_schema or "{}",
             "db_round": 0,
             "db_approved": False,
+            "db_forced": False,
             "db_issues": [],
             "db_feedback": "",
             "api_draft": state.api_spec or "{}",
             "api_round": 0,
             "api_approved": False,
+            "api_forced": False,
             "api_issues": [],
             "api_feedback": "",
             "prd_draft": state.prd_document or "{}",
             "prd_round": 0,
             "prd_approved": False,
+            "prd_forced": False,
             "prd_issues": [],
             "prd_feedback": "",
         }
@@ -323,16 +340,19 @@ class QaAgent:
             )
             if i not in prd_issues
         ]
-        total_issues = len(db_issues) + len(api_issues) + len(prd_issues)
-        quality_score = self._compute_quality_score(True, total_issues)
-
         forced = [
             d for d in ("db", "api", "prd")
-            if result.get(f"{d}_round", 0) >= _MAX_ROUNDS and result.get(f"{d}_issues")
+            if result.get(f"{d}_forced", False)
         ]
-        status = "QA 완료 — 전 항목 승인"
+        total_issues = len(db_issues) + len(api_issues) + len(prd_issues)
+        passed = not forced and all(
+            result.get(f"{domain}_approved", False) for domain in ("db", "api", "prd")
+        )
+        quality_score = self._compute_quality_score(passed, total_issues)
+
+        status = "QA 완료 — 전 항목 승인" if passed else "QA 완료 — 미승인 항목 있음"
         if forced:
-            status += f" (강제 승인 도메인: {', '.join(forced)}, 잔존 결함 존재)"
+            status += f" (최대 검수 횟수 도달: {', '.join(forced)})"
         logger.info(
             "QA 완료 — DB:%d회/%d결함, API:%d회/%d결함, PRD:%d회/%d결함 (qualityScore=%.2f)",
             result.get("db_round", 0), len(db_issues),
@@ -346,11 +366,61 @@ class QaAgent:
             api_spec=api_draft,
             prd_document=prd_draft,
             qa_quality_score=quality_score,
+            qa_approved=passed,
             qa_db_issues=db_issues,
             qa_api_issues=api_issues,
             qa_prd_issues=prd_issues,
             last_validation_error="",
             status_message=status,
+        )
+
+    def _execute_lightweight_gate(self, state: PipelineState) -> PipelineState:
+        """Phase2 QA는 산출물 생성 완료 여부만 확인하고, 엄격한 판단은 Phase3로 넘긴다."""
+        db_draft = state.db_schema or "{}"
+        db_parsed = try_parse_json(db_draft)
+        if isinstance(db_parsed, dict) and isinstance(db_parsed.get("tables"), list):
+            db_parsed["tables"] = reconcile_fk_types(dedupe_meta_tables(sanitize_tables(db_parsed["tables"])))
+            db_draft = json.dumps(db_parsed, ensure_ascii=False)
+
+        api_draft = state.api_spec or "{}"
+        api_parsed = try_parse_json(api_draft)
+        if isinstance(api_parsed, dict) and isinstance(api_parsed.get("endpoints"), list):
+            api_parsed["endpoints"] = _normalize_endpoints(api_parsed["endpoints"])
+            api_draft = json.dumps(api_parsed, ensure_ascii=False)
+
+        prd_draft = state.prd_document or "{}"
+        prd_parsed = try_parse_json(prd_draft)
+        if isinstance(prd_parsed, dict) and isinstance(prd_parsed.get("coreFeatures"), list):
+            prd_parsed["coreFeatures"] = reconcile_core_features(
+                prd_parsed["coreFeatures"], prd_parsed.get("mvpScope"),
+            )
+            prd_draft = json.dumps(prd_parsed, ensure_ascii=False)
+
+        db_issues = self._check_db_completeness(try_parse_json(db_draft), state.feature_list)
+        api_issues = self._check_api_completeness(try_parse_json(api_draft), state.feature_list)
+        prd_issues = self._check_prd_completeness(try_parse_json(prd_draft), len(state.feature_list))
+        total_issues = len(db_issues) + len(api_issues) + len(prd_issues)
+        score = max(0.6, 1.0 - min(total_issues, 4) * 0.1)
+
+        logger.info(
+            "QA 경량 게이트 완료 — DB:%d결함, API:%d결함, PRD:%d결함 (qualityScore=%.2f, Phase3 이관)",
+            len(db_issues),
+            len(api_issues),
+            len(prd_issues),
+            score,
+        )
+
+        return state.copy(
+            db_schema=db_draft,
+            api_spec=api_draft,
+            prd_document=prd_draft,
+            qa_quality_score=score,
+            qa_approved=True,
+            qa_db_issues=db_issues,
+            qa_api_issues=api_issues,
+            qa_prd_issues=prd_issues,
+            last_validation_error="",
+            status_message="QA 경량 게이트 완료 — Phase 3 구조 검증으로 이관",
         )
 
     def _make_reviewer_node(self, domain: str):
@@ -384,7 +454,7 @@ class QaAgent:
             round_ = state.get(f"{domain}_round", 0)
             data = None
             for parse_attempt in range(2):
-                raw = await self._call(prompt, max_tokens=16384, enable_thinking=False)
+                raw = await self._call(prompt, max_tokens=16384)
                 if ctx.get("dump"):
                     ctx["dump"].log_raw(f"QA_{domain.upper()}_REVIEWER", round_ + 1, raw)
                 data = try_parse_json(raw)
@@ -432,8 +502,13 @@ class QaAgent:
             round_ = state.get(f"{domain}_round", 0) + 1
 
             if round_ >= _MAX_ROUNDS:
-                logger.warning("%s manager_check — 최대 라운드(%d) 도달, 강제 승인", domain, _MAX_ROUNDS)
-                return {f"{domain}_round": round_, f"{domain}_approved": True, f"{domain}_feedback": ""}
+                logger.warning("%s manager_check — 최대 라운드(%d) 도달, 미승인 상태로 종료", domain, _MAX_ROUNDS)
+                return {
+                    f"{domain}_round": round_,
+                    f"{domain}_approved": False,
+                    f"{domain}_forced": True,
+                    f"{domain}_feedback": "",
+                }
 
             draft = state.get(f"{domain}_draft", "")
             issues = state.get(f"{domain}_issues", [])
@@ -444,13 +519,13 @@ class QaAgent:
                 issues="\n".join(f"- {i}" for i in issues) or "(reviewer가 보고한 결함 없음)",
                 criteria=_DOMAIN_CRITERIA[domain],
             )
-            raw = await self._call(prompt, max_tokens=16384, enable_thinking=False)
+            raw = await self._call(prompt, max_tokens=16384)
             if ctx.get("dump"):
                 ctx["dump"].log_raw(f"QA_{domain.upper()}_CHECK", round_, raw)
 
             data = try_parse_json(raw)
             if data and isinstance(data, dict):
-                approved = bool(data.get("approved", True))
+                approved = data.get("approved") is True
                 feedback = str(data.get("feedback", "")) if not approved else ""
             else:
                 # 파싱 실패를 승인으로 취급하지 않는다 — 다음 라운드에서 재작성을 강제하고,
@@ -465,31 +540,35 @@ class QaAgent:
 
     def _make_router(self, domain: str):
         def router(state: dict) -> str:
-            return END if state.get(f"{domain}_approved") else f"{domain}_reviewer"
+            finished = state.get(f"{domain}_approved") or state.get(f"{domain}_forced")
+            return END if finished else f"{domain}_reviewer"
 
         return router
 
-    async def _call(self, user_prompt: str, max_tokens: int, enable_thinking: bool) -> str:
+    async def _call(self, user_prompt: str, max_tokens: int) -> str:
         for attempt in range(3):
             try:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    temperature=_TEMPERATURE,
-                    top_p=_TOP_P,
-                    presence_penalty=_PRESENCE_PENALTY,
-                    max_tokens=max_tokens,
-                    frequency_penalty=0.3,
-                    messages=[
-                        {"role": "system", "content": REVIEW_SYSTEM},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-                )
+                async def request():
+                    return await self._client.chat.completions.create(
+                        model=self._model,
+                        temperature=_TEMPERATURE,
+                        top_p=_TOP_P,
+                        presence_penalty=_PRESENCE_PENALTY,
+                        max_completion_tokens=max_tokens,
+                        frequency_penalty=0.3,
+                        messages=[
+                            {"role": "system", "content": REVIEW_SYSTEM},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+
+                response = await self._runtime.call(request) if self._runtime else await request()
                 return response.choices[0].message.content or ""
-            except (InternalServerError, APITimeoutError, APIConnectionError) as e:
+            except (InternalServerError, APITimeoutError, APIConnectionError, TimeoutError) as e:
                 logger.warning("QA API 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
                 if attempt < 2:
-                    await asyncio.sleep(10 * (attempt + 1))
+                    # QA는 Phase3 복구 중 호출된다. 긴 backoff가 도메인별 루프와 곱해지지 않도록 짧게 제한한다.
+                    await asyncio.sleep(2 * (attempt + 1))
                 else:
                     logger.error("QA API 최종 실패")
                     return ""

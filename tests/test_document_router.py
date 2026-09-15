@@ -1,4 +1,4 @@
-"""routers/document.py — EXAONE 응답을 스텁으로 대체하고 결정론적 부분만 검증한다.
+"""routers/document.py — OpenAI 응답을 스텁으로 대체하고 결정론적 부분만 검증한다.
 
 실제 모델을 부르지 않는다. 스텁은 '어떤 프롬프트가 왔는지'로 단계를 구분해
 미리 정해둔 JSON을 돌려주고, 호출 기록을 남겨 호출 횟수·동시성 상한을 확인한다.
@@ -12,7 +12,7 @@ import pytest
 
 from routers import document as doc
 
-# ── EXAONE 스텁 ──────────────────────────────────────────────────────
+# ── OpenAI 스텁 ─────────────────────────────────────────────────────
 
 class StubClient:
     """chat.completions.create만 흉내 내는 최소 클라이언트."""
@@ -57,13 +57,13 @@ def _stage(kwargs: str) -> str:
 def _no_main_import(monkeypatch):
     """라우터가 진짜 main을 import하지 못하게 가짜 모듈을 꽂는다.
 
-    main을 import하면 앱 전역이 통째로 뜬다 — DB 연결, Kafka, Ko-Reranker 모델 로딩까지.
+    main을 import하면 앱 전역이 통째로 뜬다 — DB 연결, Kafka 클라이언트 초기화까지.
     로컬에서는 느리게나마(실측 70초) 성공해서 통과했지만, .env도 네트워크도 없는 CI에서는
     import 자체가 실패해 TestClient가 500을 돌려주고, 반쯤 초기화된 백그라운드 스레드가
     종료 후 스트림에 쓰면서 'lost sys.stderr'까지 냈다.
     """
-    monkeypatch.setattr(doc, "_exaone_endpoint_id", lambda: "stub-endpoint")
-    monkeypatch.setitem(sys.modules, "main", SimpleNamespace(settings=None, exaone_client=None))
+    monkeypatch.setattr(doc, "_chat_model", lambda: "stub-model")
+    monkeypatch.setitem(sys.modules, "main", SimpleNamespace(settings=None, openai_client=None))
 
 
 API_SEC = doc._API_PROFILE.sections["endpoints"]
@@ -80,6 +80,21 @@ def _endpoint(method: str, path: str) -> dict:
 
 def _endpoints(n: int) -> list[dict]:
     return [_endpoint("GET", f"/api/v1/res{i}") for i in range(n)]
+
+
+def test_openai_call_uses_gpt5_completion_parameters():
+    client = StubClient(lambda k: ('{"ok":true}', "stop"))
+
+    content, finish_reason = asyncio.run(
+        doc._call_openai(client, [{"role": "user", "content": "JSON을 반환해줘"}], 321)
+    )
+
+    assert content == '{"ok":true}'
+    assert finish_reason == "stop"
+    assert client.calls[0]["model"] == "stub-model"
+    assert client.calls[0]["max_completion_tokens"] == 321
+    assert "max_tokens" not in client.calls[0]
+    assert "extra_body" not in client.calls[0]
 
 
 # ── 3번: 항목 번호는 1-based로 보여주고 파싱할 때 되돌린다 ────────────

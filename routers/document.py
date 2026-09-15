@@ -1,4 +1,4 @@
-"""문서 AI 편집 — EXAONE이 현재 문서를 읽고 섹션/항목 단위 수정안을 만든다.
+"""문서 AI 편집 — OpenAI 모델이 현재 문서를 읽고 섹션/항목 단위 수정안을 만든다.
 
 이 라우터는 문서를 직접 고치지 않는다. 수정안과 그 diff만 반환하고,
 실제 적용 여부는 프론트에서 사용자가 제안문과 diff를 보고 승인한 뒤에 결정한다.
@@ -38,8 +38,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/document", tags=["document"])
 
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+# 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
@@ -77,9 +76,9 @@ _HISTORY_TURN_CHARS = 800
 _GENERIC_LABEL_KEYS = ("name", "metric", "milestone", "title", "persona")
 
 
-def _exaone_endpoint_id() -> str:
+def _chat_model() -> str:
     from main import settings
-    return settings.exaone_endpoint_id
+    return settings.openai_chat_model
 
 
 # ── 문서 프로필 ──────────────────────────────────────────────────────
@@ -706,7 +705,7 @@ def _token_budget(current, attempt: int) -> int:
     return max(_MIN_REWRITE_TOKENS, min(_MAX_REWRITE_TOKENS, budget))
 
 
-# ── EXAONE 호출 ──────────────────────────────────────────────────────
+# ── OpenAI 호출 ─────────────────────────────────────────────────────
 
 def _messages(system: str, prompt: str, history: list[dict] | None = None) -> list[dict]:
     """system + 직전 대화 + 이번 프롬프트.
@@ -725,8 +724,8 @@ def _messages(system: str, prompt: str, history: list[dict] | None = None) -> li
     return messages
 
 
-async def _call_exaone(client, messages: list[dict], max_tokens: int) -> tuple[str, str]:
-    """EXAONE 호출 (재시도 3회). (본문, finish_reason)을 함께 돌려준다.
+async def _call_openai(client, messages: list[dict], max_tokens: int) -> tuple[str, str]:
+    """OpenAI 호출 (재시도 3회). (본문, finish_reason)을 함께 돌려준다.
 
     finish_reason이 "length"면 토큰 한도에서 잘린 응답이다. 이걸 무시하면
     try_parse_json이 잘린 JSON을 '부분 복구'해서 빈 껍데기 항목이 섞인 결과를
@@ -736,20 +735,19 @@ async def _call_exaone(client, messages: list[dict], max_tokens: int) -> tuple[s
     for attempt in range(3):
         try:
             resp = await client.chat.completions.create(
-                model=_exaone_endpoint_id(),
-                max_tokens=max_tokens,
+                model=_chat_model(),
+                max_completion_tokens=max_tokens,
                 temperature=_TEMPERATURE,
                 top_p=_TOP_P,
                 presence_penalty=_PRESENCE_PENALTY,
                 frequency_penalty=0.3,
                 response_format={"type": "json_object"},
                 messages=messages,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             choice = resp.choices[0]
             return (choice.message.content or ""), (choice.finish_reason or "")
         except (InternalServerError, APITimeoutError, APIConnectionError) as e:
-            logger.warning("EXAONE 문서편집 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
+            logger.warning("OpenAI 문서편집 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
             if attempt < 2:
                 await asyncio.sleep(3 * (attempt + 1))
             else:
@@ -797,7 +795,7 @@ async def _classify(client, profile: DocProfile, document: dict, instruction: st
     )
     messages = _messages(_CLASSIFY_SYSTEM, prompt, history)
 
-    raw, finish_reason = await _call_exaone(client, messages, max_tokens=1500)
+    raw, finish_reason = await _call_openai(client, messages, max_tokens=1500)
     node = try_parse_json(raw)
     if not isinstance(node, dict):
         logger.warning(
@@ -939,7 +937,7 @@ async def _ask_scope(
     ) + note
     messages = _messages(_SCOPE_SYSTEM, prompt, history)
     try:
-        raw, _ = await _call_exaone(client, messages, max_tokens=500)
+        raw, _ = await _call_openai(client, messages, max_tokens=500)
     except Exception as e:
         logger.warning("섹션 %s 범위 판정 호출 실패: %s — 전체 재작성으로 진행", key, e)
         return None, "edit"
@@ -1056,7 +1054,7 @@ async def _rewrite_item(
     messages = _messages(_ITEM_REWRITE_SYSTEM, prompt, history)
 
     for attempt in range(3):
-        raw, finish_reason = await _call_exaone(client, messages, max_tokens=2500)
+        raw, finish_reason = await _call_openai(client, messages, max_tokens=2500)
         if finish_reason == "length":
             logger.warning("섹션 %s 항목 %d 응답 잘림 (attempt %d) — 재생성", key, index, attempt + 1)
             continue
@@ -1159,7 +1157,7 @@ async def _add_items(
 
     for attempt in range(3):
         max_tokens = min(_MAX_REWRITE_TOKENS, 4000 * (attempt + 1))
-        raw, finish_reason = await _call_exaone(client, messages, max_tokens=max_tokens)
+        raw, finish_reason = await _call_openai(client, messages, max_tokens=max_tokens)
         if finish_reason == "length":
             logger.warning("섹션 %s 항목 추가 응답 잘림 (attempt %d) — 예산 늘려 재생성", key, attempt + 1)
             continue
@@ -1311,7 +1309,7 @@ async def _rewrite_section(
 
     for attempt in range(3):
         max_tokens = _token_budget(baseline, attempt)
-        raw, finish_reason = await _call_exaone(client, messages, max_tokens=max_tokens)
+        raw, finish_reason = await _call_openai(client, messages, max_tokens=max_tokens)
 
         # 잘린 응답은 파싱 이전에 버린다 — try_parse_json이 조각을 복구해
         # 빈 항목이 섞인 '성공'을 만들어내기 때문에 여기서 끊어야 한다
@@ -1456,7 +1454,7 @@ async def _build_proposal(
     )
     messages = _messages(_PROPOSAL_SYSTEM, prompt, history)
     try:
-        raw, _ = await _call_exaone(client, messages, max_tokens=800)
+        raw, _ = await _call_openai(client, messages, max_tokens=800)
         node = try_parse_json(raw)
         if isinstance(node, dict):
             proposal = node.get("proposal")
@@ -1563,7 +1561,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
     # main import는 검증을 통과한 뒤에 한다. 순환 import를 피하려고 함수 안에서 하는 건데,
     # 함수 첫 줄에 두면 잘못된 doc_type이나 크기 초과 요청 하나가 앱 전역(DB·Kafka·리랭커)
     # 초기화를 끌고 들어온다 — 거절할 요청이 무거운 부팅을 트리거할 이유가 없다.
-    from main import exaone_client
+    from main import openai_client
 
     # history는 최근 몇 턴까지만 — 문서 본문이 이미 크므로 대화까지 길어지면 컨텍스트가 넘친다
     history = [
@@ -1573,7 +1571,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
     ]
 
     try:
-        decision = await _classify(exaone_client, profile, req.document, req.instruction, history)
+        decision = await _classify(openai_client, profile, req.document, req.instruction, history)
     except Exception as e:
         logger.error("문서편집 분류 실패(%s): %s", doc_type, e, exc_info=True)
         return ok({"intent": "chat", "reply": "잠시 후 다시 시도해 주세요.", "edits": []})
@@ -1587,7 +1585,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
 
     # 대상 섹션을 병렬로 재작성 — 섹션끼리 의존이 없으므로 순차로 돌 이유가 없다
     results = await asyncio.gather(*[
-        _rewrite_section(exaone_client, profile, key, req.document.get(key), req.instruction, history)
+        _rewrite_section(openai_client, profile, key, req.document.get(key), req.instruction, history)
         for key in decision["targets"]
     ], return_exceptions=True)
 
@@ -1628,7 +1626,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
 
     # 재작성이 끝난 뒤에 제안문을 만든다 — 실제 적용될 변경만 근거로 삼으므로
     # "이렇게 바꾸겠습니다"라고 말한 내용과 최종 결과가 어긋나지 않는다
-    proposal = await _build_proposal(exaone_client, profile, req.instruction, edits, history)
+    proposal = await _build_proposal(openai_client, profile, req.instruction, edits, history)
 
     logger.info(
         "문서편집 제안 생성 (%s) — %d개 섹션: %s",

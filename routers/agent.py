@@ -1,6 +1,6 @@
-"""문서 패널의 AI 어시스턴트 채팅 — EXAONE 스트리밍.
+"""문서 패널의 AI 어시스턴트 채팅 — OpenAI 스트리밍.
 
-파이프라인 전 구간(추천·에이전트·수집 채팅)이 EXAONE을 쓰므로 이 채팅도 같은 모델을 쓴다.
+파이프라인 전 구간(추천·에이전트·수집 채팅)이 같은 OpenAI 모델을 쓴다.
 예전에는 Anthropic API를 직접 호출했고 프론트가 프로바이더/모델을 골랐지만,
 모델 선택 UI를 없애면서 그 경로도 함께 제거했다.
 
@@ -20,8 +20,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+# 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
@@ -29,9 +28,9 @@ _PRESENCE_PENALTY = 0.0
 _MAX_TOKENS = 4096
 
 
-def _exaone_endpoint_id() -> str:
+def _chat_model() -> str:
     from main import settings
-    return settings.exaone_endpoint_id
+    return settings.openai_chat_model
 
 
 class AgentRequest(BaseModel):
@@ -62,19 +61,18 @@ def _build_messages(req: AgentRequest) -> list[dict]:
 
 @router.post("/chat/stream")
 async def chat_stream(request: AgentRequest):
-    from main import exaone_client
+    from main import openai_client
 
     async def generate():
         try:
-            stream = await exaone_client.chat.completions.create(
-                model=_exaone_endpoint_id(),
-                max_tokens=_MAX_TOKENS,
+            stream = await openai_client.chat.completions.create(
+                model=_chat_model(),
+                max_completion_tokens=_MAX_TOKENS,
                 temperature=_TEMPERATURE,
                 top_p=_TOP_P,
                 presence_penalty=_PRESENCE_PENALTY,
                 messages=_build_messages(request),
                 stream=True,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             async for chunk in stream:
                 if not chunk.choices:
@@ -84,7 +82,7 @@ async def chat_stream(request: AgentRequest):
                 if text:
                     yield f"data: {json.dumps({'delta': text})}\n\n"
         except Exception as e:
-            logger.error("EXAONE 스트리밍 오류: %s", e, exc_info=True)
+            logger.error("OpenAI 스트리밍 오류: %s", e, exc_info=True)
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -101,10 +99,10 @@ async def chat_stream(request: AgentRequest):
 @router.post("/chat")
 async def chat(request: AgentRequest) -> AgentResponse:
     try:
-        content = await _call_exaone(_build_messages(request))
+        content = await _call_openai(_build_messages(request))
         return AgentResponse(content=content)
     except Exception as e:
-        logger.error("EXAONE 호출 실패: %s", e, exc_info=True)
+        logger.error("OpenAI 호출 실패: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -113,31 +111,30 @@ async def chat(request: AgentRequest) -> AgentResponse:
 @router.post("/test")
 async def test() -> dict:
     try:
-        await _call_exaone([{"role": "user", "content": "안녕하세요"}], max_tokens=32)
+        await _call_openai([{"role": "user", "content": "안녕하세요"}], max_tokens=32)
         return {"ok": True}
     except Exception as e:
-        logger.error("EXAONE 연결 테스트 실패: %s", e)
+        logger.error("OpenAI 연결 테스트 실패: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _call_exaone(messages: list[dict], max_tokens: int = _MAX_TOKENS) -> str:
-    """EXAONE 호출 (재시도 3회) — routers/chat.py의 동일 헬퍼와 같은 파라미터."""
-    from main import exaone_client
+async def _call_openai(messages: list[dict], max_tokens: int = _MAX_TOKENS) -> str:
+    """OpenAI 호출 (재시도 3회) — routers/chat.py의 동일 헬퍼와 같은 파라미터."""
+    from main import openai_client
 
     for attempt in range(3):
         try:
-            resp = await exaone_client.chat.completions.create(
-                model=_exaone_endpoint_id(),
-                max_tokens=max_tokens,
+            resp = await openai_client.chat.completions.create(
+                model=_chat_model(),
+                max_completion_tokens=max_tokens,
                 temperature=_TEMPERATURE,
                 top_p=_TOP_P,
                 presence_penalty=_PRESENCE_PENALTY,
                 messages=messages,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             return resp.choices[0].message.content or ""
         except (InternalServerError, APITimeoutError, APIConnectionError) as e:
-            logger.warning("EXAONE 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
+            logger.warning("OpenAI 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
             if attempt < 2:
                 await asyncio.sleep(3 * (attempt + 1))
             else:

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import threading
@@ -35,8 +36,13 @@ class SearchRLService:
     보상 신호는 리랭커 평균 관련도 점수(0.0~1.0), baseline은 최근 20회 슬라이딩 윈도우 평균.
     """
 
-    def __init__(self, db_url: str):
+    def __init__(
+        self,
+        db_url: str,
+        db_semaphore: asyncio.Semaphore | None = None,
+    ):
         self._db_url = db_url
+        self._db_semaphore = db_semaphore or asyncio.Semaphore(10)
         self._lock = threading.Lock()
         self._baseline_window: deque[float] = deque(maxlen=BASELINE_WINDOW)
         self._current_threshold = 0.3
@@ -75,9 +81,23 @@ class SearchRLService:
         with self._lock:
             return SearchParams(1.0, 1.0, self._current_threshold)
 
-    def log_search(self, pipeline_id: str | None, params: SearchParams, chunk_count: int) -> None:
+    async def log_search(
+        self,
+        pipeline_id: str | None,
+        params: SearchParams,
+        chunk_count: int,
+    ) -> None:
         if not pipeline_id:
             return
+        async with self._db_semaphore:
+            await asyncio.to_thread(self._log_search_sync, pipeline_id, params, chunk_count)
+
+    def _log_search_sync(
+        self,
+        pipeline_id: str,
+        params: SearchParams,
+        chunk_count: int,
+    ) -> None:
         try:
             conn = self._get_conn()
             try:
@@ -100,7 +120,7 @@ class SearchRLService:
         except Exception as e:
             logger.warning("Phase1 RL 로그 저장 실패 — pipelineId: %s, 원인: %s", pipeline_id, e)
 
-    def apply_rerank_score(self, pipeline_id: str | None, avg_score: float) -> None:
+    async def apply_rerank_score(self, pipeline_id: str | None, avg_score: float) -> None:
         """리랭커 평균 관련도 점수로 threshold 업데이트.
 
         advantage = avg_score - baseline
@@ -108,6 +128,11 @@ class SearchRLService:
         """
         if not pipeline_id:
             return
+
+        async with self._db_semaphore:
+            await asyncio.to_thread(self._apply_rerank_score_sync, pipeline_id, avg_score)
+
+    def _apply_rerank_score_sync(self, pipeline_id: str, avg_score: float) -> None:
 
         with self._lock:
             self._baseline_window.append(avg_score)

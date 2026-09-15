@@ -13,12 +13,12 @@ from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnect
 
 from phase2.feature_coverage import uncovered_features, missing_features_note
 from phase2.json_utils import try_parse_json, has_suspicious_script
+from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+# 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
@@ -757,10 +757,12 @@ class DbaAgent:
     def __init__(
         self,
         client: AsyncOpenAI,
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-5.4-mini",
+        runtime: LlmRuntime | None = None,
     ):
         self._client = client
         self._model = model
+        self._runtime = runtime
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -867,7 +869,7 @@ class DbaAgent:
         names: list = []
         try:
             raw = await self._call(prompt, max_tokens=800, system=MANAGER_SYSTEM,
-                                   enable_thinking=False, temperature=_PLAN_TEMPERATURE)
+                                   temperature=_PLAN_TEMPERATURE)
             parsed = try_parse_json(raw)
             if isinstance(parsed, dict) and isinstance(parsed.get("names"), list):
                 names = parsed["names"]
@@ -899,7 +901,7 @@ class DbaAgent:
         best: dict | None = None
         best_uncovered = None
         for attempt in range(3):
-            raw = await self._call(prompt, max_tokens=4000, system=MANAGER_SYSTEM, enable_thinking=False, temperature=_PLAN_TEMPERATURE)
+            raw = await self._call(prompt, max_tokens=4000, system=MANAGER_SYSTEM, temperature=_PLAN_TEMPERATURE)
             if ctx.get("dump"):
                 ctx["dump"].log_raw("DBA_MANAGER_PLAN", attempt + 1, raw)
             candidate = try_parse_json(raw)
@@ -992,7 +994,7 @@ class DbaAgent:
         data = None
         best: dict | None = None
         for attempt in range(3):
-            raw = await self._call(prompt, max_tokens=1500, system=WORKER_SYSTEM, enable_thinking=False)
+            raw = await self._call(prompt, max_tokens=1500, system=WORKER_SYSTEM)
             if dump:
                 dump.log_raw(label, attempt + 1, raw)
             candidate = try_parse_json(raw)
@@ -1061,7 +1063,7 @@ class DbaAgent:
         try:
             review = None
             for parse_attempt in range(2):
-                raw = await self._call(prompt, max_tokens=16384, system=MANAGER_SYSTEM, enable_thinking=False)
+                raw = await self._call(prompt, max_tokens=16384, system=MANAGER_SYSTEM)
                 if ctx.get("dump"):
                     ctx["dump"].log_raw("DBA_MANAGER_REVIEW", parse_attempt + 1, raw)
                 review = try_parse_json(raw)
@@ -1096,24 +1098,26 @@ class DbaAgent:
 
         return {"final_tables": list(by_name.values()), "relationships": relationships, "prd_issues": prd_issues}
 
-    async def _call(self, user_prompt: str, max_tokens: int, system: str, enable_thinking: bool, temperature: float = _TEMPERATURE) -> str:
+    async def _call(self, user_prompt: str, max_tokens: int, system: str, temperature: float = _TEMPERATURE) -> str:
         for attempt in range(3):
             try:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    temperature=temperature,
-                    top_p=_TOP_P,
-                    presence_penalty=_PRESENCE_PENALTY,
-                    max_tokens=max_tokens,
-                    frequency_penalty=0.3,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-                )
+                async def request():
+                    return await self._client.chat.completions.create(
+                        model=self._model,
+                        temperature=temperature,
+                        top_p=_TOP_P,
+                        presence_penalty=_PRESENCE_PENALTY,
+                        max_completion_tokens=max_tokens,
+                        frequency_penalty=0.3,
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+
+                response = await self._runtime.call(request) if self._runtime else await request()
                 return response.choices[0].message.content or ""
-            except (InternalServerError, APITimeoutError, APIConnectionError) as e:
+            except (InternalServerError, APITimeoutError, APIConnectionError, TimeoutError) as e:
                 logger.warning("DBA API 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
                 if attempt < 2:
                     await asyncio.sleep(5 * (attempt + 1))

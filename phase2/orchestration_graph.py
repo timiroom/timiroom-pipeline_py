@@ -24,6 +24,8 @@ class OrchestrationGraph:
         api_agent: ApiAgent,
         qa_agent: QaAgent,
         progress_service: PipelineProgressService,
+        timeout_seconds: float = 900.0,
+        repair_timeout_seconds: float = 300.0,
     ):
         self._search = search_agent
         self._pm = pm_agent
@@ -32,8 +34,18 @@ class OrchestrationGraph:
         self._api = api_agent
         self._qa = qa_agent
         self._progress = progress_service
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds는 0보다 커야 합니다")
+        if repair_timeout_seconds <= 0:
+            raise ValueError("repair_timeout_seconds는 0보다 커야 합니다")
+        self._timeout_seconds = timeout_seconds
+        self._repair_timeout_seconds = repair_timeout_seconds
 
     async def run(self, initial_state: PipelineState, pipeline_id: str | None = None) -> PipelineState:
+        async with asyncio.timeout(self._timeout_seconds):
+            return await self._run_inner(initial_state, pipeline_id)
+
+    async def _run_inner(self, initial_state: PipelineState, pipeline_id: str | None = None) -> PipelineState:
         logger.info("=== Phase 2 오케스트레이션 시작 ===")
         dump = None  # 디버그 덤프 비활성화 — 필요 시 debug_dump.PipelineDump 구현체를 연결
         final_state = initial_state
@@ -68,6 +80,79 @@ class OrchestrationGraph:
                 dump.close(final_state)
 
         return final_state
+
+    async def repair(
+        self,
+        state: PipelineState,
+        validation_error: str,
+        pipeline_id: str | None = None,
+        repair_targets: list[str] | None = None,
+    ) -> PipelineState:
+        """Phase 3 오류가 난 산출물만 다시 생성하고 QA를 재실행한다."""
+        # Phase3 보정은 Phase2 전체 생성보다 짧게 제한한다. 기존에는 재시도마다
+        # 900~1800초가 다시 적용되어 QA 장애가 수십 분 동안 누적됐다.
+        async with asyncio.timeout(self._repair_timeout_seconds):
+            return await self._repair_inner(state, validation_error, pipeline_id, repair_targets)
+
+    async def _repair_inner(
+        self,
+        state: PipelineState,
+        validation_error: str,
+        pipeline_id: str | None,
+        repair_targets: list[str] | None,
+    ) -> PipelineState:
+        targets = set(repair_targets or [])
+        if not targets:
+            if "DB 스키마" in validation_error:
+                targets.add("db")
+            if "API 스펙" in validation_error:
+                targets.add("api")
+            if "PRD 문서" in validation_error or "Phase 2 QA" in validation_error:
+                targets.add("prd")
+            if "featureList" in validation_error:
+                targets.add("pm")
+
+        if "pm" in targets or not targets:
+            logger.warning("선택적 재생성 대상을 판단할 수 없어 전체 Phase 2를 재실행")
+            return await self._run_inner(state, pipeline_id)
+
+        if "prd" in targets:
+            self._progress.send(pipeline_id, "PRD_REPAIR", "PRD부터 종속 산출물을 재생성 중...", 68)
+            repaired = await self._run_prd_with_rollback(state, pipeline_id)
+            self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
+            return await self._qa.execute(repaired)
+
+        repair_state = state
+        tasks = []
+        labels = []
+        if "db" in targets:
+            tasks.append(self._dba.execute(state))
+            labels.append("DB")
+        if "api" in targets:
+            tasks.append(self._api.execute(state))
+            labels.append("API")
+
+        self._progress.send(
+            pipeline_id,
+            "PHASE2_REPAIR",
+            f"검증 실패 영역만 재생성 중: {', '.join(labels)}",
+            72,
+        )
+        results = await asyncio.gather(*tasks)
+        for label, result in zip(labels, results, strict=True):
+            if label == "DB":
+                repair_state = repair_state.copy(
+                    db_schema=result.db_schema,
+                    prd_feedback_from_dba=result.prd_feedback_from_dba,
+                )
+            else:
+                repair_state = repair_state.copy(
+                    api_spec=result.api_spec,
+                    prd_feedback_from_api=result.prd_feedback_from_api,
+                )
+
+        self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
+        return await self._qa.execute(repair_state)
 
     async def _run_prd_with_rollback(
         self, pm_state: PipelineState, pipeline_id: str | None, dump=None

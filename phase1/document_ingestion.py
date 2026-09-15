@@ -28,10 +28,12 @@ class DocumentIngestionService:
         embedder: EmbeddingService,
         chunk_size: int = 512,
         chunk_overlap: int = 64,
+        db_semaphore: asyncio.Semaphore | None = None,
     ):
         self._db_url = db_url
         self._document_table = document_table
         self._embedder = embedder
+        self._db_semaphore = db_semaphore or asyncio.Semaphore(10)
         self._semantic_chunker = SemanticChunkingService(
             embedder, max_chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )
@@ -61,47 +63,83 @@ class DocumentIngestionService:
             total += await self.ingest(content, meta)
         return total
 
+    async def ingest_event(self, documents: list[tuple[str, dict]]) -> int:
+        """Kafka 이벤트의 모든 문서를 한 트랜잭션으로 저장한다."""
+        records: list[tuple[str, dict]] = []
+        for content, metadata in documents:
+            texts = self._split_fixed(content, KAFKA_CHUNK_SIZE)
+            records.extend(
+                (text, {**metadata, "chunk_index": index})
+                for index, text in enumerate(texts)
+            )
+        if not records:
+            return 0
+        embeddings = await self._embedder.embed([text for text, _ in records])
+        if len(embeddings) != len(records):
+            raise RuntimeError("이벤트 임베딩 개수가 청크 개수와 일치하지 않습니다")
+        loop = asyncio.get_running_loop()
+        async with self._db_semaphore:
+            return await loop.run_in_executor(None, self._store_records_to_db, records, embeddings)
+
     async def _embed_and_store(self, texts: list[str], metadata: dict) -> int:
         if not texts:
             return 0
         embeddings = await self._embedder.embed(texts)
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._store_to_db, texts, embeddings, metadata)
+        async with self._db_semaphore:
+            return await loop.run_in_executor(None, self._store_to_db, texts, embeddings, metadata)
 
     def _store_to_db(self, texts: list[str], embeddings: list[list[float]], metadata: dict) -> int:
+        records = [(text, {**metadata, "chunk_index": index}) for index, text in enumerate(texts)]
+        return self._store_records_to_db(records, embeddings)
+
+    def _store_records_to_db(
+        self,
+        records: list[tuple[str, dict]],
+        embeddings: list[list[float]],
+    ) -> int:
         conn = self._get_conn()
-        saved = 0
         try:
             with conn.cursor() as cur:
-                for i, (text, vec) in enumerate(zip(texts, embeddings)):
-                    try:
-                        meta = {**metadata, "chunk_index": i}
-                        tokens_text = " ".join(t.form for t in _kiwi.tokenize(text))
-                        content_hash = hashlib.md5(text.encode()).hexdigest()
-                        cur.execute(
-                            f"""
-                            INSERT INTO {self._document_table} (id, content, content_hash, metadata, embedding, tokens)
-                            VALUES (%s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
-                            ON CONFLICT (content_hash) DO NOTHING
-                            """,
-                            (
-                                str(uuid.uuid4()),
-                                text,
-                                content_hash,
-                                json.dumps(meta, ensure_ascii=False),
-                                str(vec),
-                                tokens_text,
-                            ),
-                        )
-                        if cur.rowcount > 0:
-                            saved += 1
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        logger.warning("청크 저장 실패 (건너뜀) — index %d: %s", i, e)
+                for (text, metadata), vec in zip(records, embeddings, strict=True):
+                    tokens_text = " ".join(token.form for token in _kiwi.tokenize(text))
+                    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    source_key = self._source_key(text, metadata)
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self._document_table}
+                            (id, content, content_hash, source_key, metadata, embedding, tokens)
+                        VALUES (%s, %s, %s, %s, %s::jsonb, %s::vector, to_tsvector('simple', %s))
+                        ON CONFLICT (source_key) DO NOTHING
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            text,
+                            content_hash,
+                            source_key,
+                            json.dumps(metadata, ensure_ascii=False),
+                            str(vec),
+                            tokens_text,
+                        ),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
-        return saved
+        # 충돌은 동일 이벤트의 재처리이므로 논리적으로 저장 완료로 본다.
+        return len(records)
+
+    @staticmethod
+    def _source_key(text: str, metadata: dict) -> str:
+        identity = "\x1f".join([
+            str(metadata.get("pipeline_id", "")),
+            str(metadata.get("type", "")),
+            str(metadata.get("chunk_index", "")),
+            text,
+        ])
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _split_fixed(text: str, size: int) -> list[str]:

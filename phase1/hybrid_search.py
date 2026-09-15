@@ -42,6 +42,7 @@ class HybridSearchService:
         min_results: int = 5,
         threshold_step: float = 0.1,
         rl_service: SearchRLService | None = None,
+        db_semaphore: asyncio.Semaphore | None = None,
     ):
         self._db_url = db_url
         self._document_table = document_table
@@ -54,6 +55,7 @@ class HybridSearchService:
         self._min_results = min_results
         self._threshold_step = threshold_step
         self._rl_service = rl_service
+        self._db_semaphore = db_semaphore or asyncio.Semaphore(10)
 
     def _get_conn(self):
         conn = psycopg2.connect(self._db_url)
@@ -62,10 +64,9 @@ class HybridSearchService:
 
     async def search(self, query: str, top_k: int, threshold: float | None = None) -> list[DocumentChunk]:
         """벡터·키워드 검색을 병렬 실행 후 RRF 합산."""
-        loop = asyncio.get_running_loop()
         vector_results, keyword_results = await asyncio.gather(
             self._vector_search(query, threshold),
-            loop.run_in_executor(None, self._keyword_search, query),
+            self._run_db(self._keyword_search, query),
         )
         rrf_results = self._rrf(vector_results, keyword_results, top_k)
         logger.info(
@@ -121,18 +122,22 @@ class HybridSearchService:
         if self._session_store.has_session(session_id):
             session_chunks = self._session_store.get(session_id)
             session_results = await self._session_similarity_search(queries, session_chunks)
-            global_results = self._rrf(global_results, session_results, self._top_k_vector)
+            global_results = self._rrf(
+                global_results,
+                session_results,
+                self._top_k_vector,
+                weight_b=SESSION_BOOST,
+            )
 
         if self._rl_service is not None:
-            self._rl_service.log_search(session_id, params, len(global_results))
+            await self._rl_service.log_search(session_id, params, len(global_results))
 
         return global_results
 
     async def _vector_search(self, query: str, threshold: float | None = None) -> list[DocumentChunk]:
         try:
             query_vec = await self._embedder.embed_query(query)
-            loop = asyncio.get_running_loop()
-            chunks = await loop.run_in_executor(None, self._vector_search_sync, query_vec, threshold)
+            chunks = await self._run_db(self._vector_search_sync, query_vec, threshold)
             if chunks:
                 logger.info(
                     "[Vector] %d 건 | 최고점수=%.4f | 최저점수=%.4f",
@@ -144,6 +149,11 @@ class HybridSearchService:
         except Exception as e:
             logger.warning("벡터 검색 실패: %s", e)
             return []
+
+    async def _run_db(self, func, *args):
+        async with self._db_semaphore:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, func, *args)
 
     def _vector_search_sync(
         self, query_vec: list[float], threshold_override: float | None = None
@@ -302,18 +312,20 @@ class HybridSearchService:
         list_a: list[DocumentChunk],
         list_b: list[DocumentChunk],
         top_k: int,
+        weight_a: float = 1.0,
+        weight_b: float = 1.0,
     ) -> list[DocumentChunk]:
         scores: dict[str, float] = defaultdict(float)
         chunks: dict[str, DocumentChunk] = {}
 
         for i, chunk in enumerate(list_a):
             key = str(chunk.id)
-            scores[key] += 1.0 / (RRF_K + i + 1)
+            scores[key] += weight_a / (RRF_K + i + 1)
             chunks.setdefault(key, chunk)
 
         for i, chunk in enumerate(list_b):
             key = str(chunk.id)
-            scores[key] += 1.0 / (RRF_K + i + 1)
+            scores[key] += weight_b / (RRF_K + i + 1)
             chunks.setdefault(key, chunk)
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]

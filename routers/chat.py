@@ -16,16 +16,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+# 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
 
 
-def _exaone_endpoint_id() -> str:
+def _chat_model() -> str:
     from main import settings
-    return settings.exaone_endpoint_id
+    return settings.openai_chat_model
 
 
 # ── 수집 항목 정의 ───────────────────────────────────────────────────
@@ -271,24 +270,23 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessageDto] = Field(min_length=1, description="메시지 목록이 비어있습니다")
 
 
-async def _call_exaone(client, messages: list[dict], max_tokens: int) -> str:
-    """EXAONE 호출 (재시도 3회)"""
+async def _call_openai(client, messages: list[dict], max_tokens: int) -> str:
+    """OpenAI 호출 (재시도 3회)"""
     for attempt in range(3):
         try:
             resp = await client.chat.completions.create(
-                model=_exaone_endpoint_id(),
-                max_tokens=max_tokens,
+                model=_chat_model(),
+                max_completion_tokens=max_tokens,
                 temperature=_TEMPERATURE,
                 top_p=_TOP_P,
                 presence_penalty=_PRESENCE_PENALTY,
                 frequency_penalty=0.3,
                 response_format={"type": "json_object"},
                 messages=messages,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
             return resp.choices[0].message.content or ""
         except (InternalServerError, APITimeoutError, APIConnectionError) as e:
-            logger.warning("EXAONE 채팅 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
+            logger.warning("OpenAI 채팅 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
             if attempt < 2:
                 await asyncio.sleep(3 * (attempt + 1))
             else:
@@ -422,7 +420,7 @@ async def _generate_dynamic_suggestions(question_idx: int, context: str, client)
             {"role": "user", "content": dynamic_prompt}
         ]
 
-        raw = await _call_exaone(client, messages_for_suggestions, max_tokens=500)
+        raw = await _call_openai(client, messages_for_suggestions, max_tokens=500)
         node = try_parse_json(raw)
 
         if node and isinstance(node, dict):
@@ -456,7 +454,7 @@ async def _regenerate_question(
         ),
     }]
     try:
-        raw = await _call_exaone(client, retry_messages, max_tokens=800)
+        raw = await _call_openai(client, retry_messages, max_tokens=800)
         node = try_parse_json(raw)
         if not (node and isinstance(node, dict)):
             return None, []
@@ -503,7 +501,7 @@ async def _generate_project_name_candidates(messages: list[ChatMessageDto], clie
             {"role": "user", "content": name_prompt}
         ]
         
-        raw = await _call_exaone(client, name_msgs, max_tokens=500)
+        raw = await _call_openai(client, name_msgs, max_tokens=500)
         node = try_parse_json(raw)
         
         if node and isinstance(node, dict):
@@ -535,7 +533,7 @@ async def _synthesize_form_data(messages: list[ChatMessageDto], client) -> dict 
 
     for attempt in range(2):
         try:
-            raw = await _call_exaone(client, synthesis_msgs, max_tokens=4000)
+            raw = await _call_openai(client, synthesis_msgs, max_tokens=4000)
             logger.debug("Synthesis attempt %d raw (%.500s)", attempt + 1, raw)
 
             node = try_parse_json(raw)
@@ -615,7 +613,7 @@ async def _finish_collection(
 
 @router.post("/message")
 async def message(req: ChatRequest) -> dict:
-    from main import exaone_client
+    from main import openai_client
 
     user_msg_count = _get_user_message_count(req.messages)
     q_idx = _question_index(req.messages)
@@ -657,9 +655,9 @@ async def message(req: ChatRequest) -> dict:
         # 6개 항목을 모두 받았으면 질문 생성 없이 곧장 naming/synthesis로 —
         # 수집용 LLM 호출을 낭비하지 않고, 단계 판정 기준도 q_idx 하나로 통일된다
         if q_idx >= _QUESTION_COUNT:
-            return await _finish_collection(req.messages, user_msg_count, exaone_client)
+            return await _finish_collection(req.messages, user_msg_count, openai_client)
 
-        raw = await _call_exaone(exaone_client, collection_messages, max_tokens=800)
+        raw = await _call_openai(openai_client, collection_messages, max_tokens=800)
         logger.debug("Collection raw (%.400s)", raw)
 
         node = try_parse_json(raw)
@@ -680,7 +678,7 @@ async def message(req: ChatRequest) -> dict:
         if not _is_valid_question(question):
             logger.warning("질문이 프롬프트 에코/무효 (idx=%d): %r — 재생성", q_idx, question)
             question, retry_suggestions = await _regenerate_question(
-                exaone_client, collection_messages, q_idx,
+                openai_client, collection_messages, q_idx,
             )
             if len(retry_suggestions) > len(suggestions):
                 suggestions = retry_suggestions
@@ -688,7 +686,7 @@ async def message(req: ChatRequest) -> dict:
         # suggestions 보강 1단계: 맥락 기반 동적 생성
         if len(suggestions) < 3:
             logger.warning("suggestions 부족 (%d/3, idx=%d) — 동적 생성 시도", len(suggestions), q_idx)
-            dynamic = await _generate_dynamic_suggestions(q_idx, context, exaone_client)
+            dynamic = await _generate_dynamic_suggestions(q_idx, context, openai_client)
             if len(dynamic) > len(suggestions):
                 suggestions = dynamic
 
@@ -714,5 +712,5 @@ async def message(req: ChatRequest) -> dict:
         })
 
     except Exception as e:
-        logger.error("EXAONE 호출 실패: %s", e, exc_info=True)
+        logger.error("OpenAI 호출 실패: %s", e, exc_info=True)
         return ok({"message": "잠시 후 다시 시도해 주세요.", "isComplete": False, "suggestions": [], "formData": None})

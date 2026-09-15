@@ -1,5 +1,6 @@
 import re
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,19 +14,31 @@ def validate_sql_identifier(value: str) -> str:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    # ── OpenAI ────────────────────────────────────────────────────
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_chat_model: str = "gpt-5.4-mini"
+    openai_request_timeout_seconds: float = 120.0
+
+    # ── Phase 2 ───────────────────────────────────────────────────
+    phase2_llm_max_concurrency: int = 8
+    phase2_timeout_seconds: float = 900.0
+    phase2_web_search_enabled: bool = True
+
     # ── Upstage Solar 임베딩 ─────────────────────────────────────
-    # query/passage 전용 모델이 분리되어 있음 (동일 벡터 공간)
     upstage_api_key: str = ""
     solar_embedding_query_model: str = "solar-embedding-2-query"
     solar_embedding_passage_model: str = "solar-embedding-2-passage"
 
-    # ── K-EXAONE (Friendli.ai) ────────────────────────────────────
-    exaone_api_key: str = ""
-    exaone_endpoint_id: str = ""
+    # ── Cohere Rerank ─────────────────────────────────────────────
+    cohere_api_key: str = ""
+    cohere_rerank_model: str = "rerank-v4.0-pro"
+    cohere_base_url: str = "https://api.cohere.com"
+    cohere_max_concurrency: int = 5
 
     # ── PostgreSQL ────────────────────────────────────────────────
     db_url: str = "postgresql://localhost:5432/timiroom"
-    # 기존 Spring 임베딩(vector(1024))과 Solar(vector(4096))를 분리할 수 있다.
+    # Solar Embedding 2의 출력 차원은 1024다.
     rag_document_table: str = "document_chunks"
 
     # ── Kafka ─────────────────────────────────────────────────────
@@ -33,11 +46,8 @@ class Settings(BaseSettings):
     kafka_topic_pipeline_result: str = "rag.pipeline.result"
     kafka_topic_dead_letter: str = "rag.pipeline.result.DLT"
     kafka_consumer_group_id: str = "rag-pipeline-group"
-
-    # ── 로컬 Ko-Reranker ──────────────────────────────────────────
-    # Dongjin-kr/ko-reranker: bge-reranker-large 기반 한국어 파인튜닝
-    # 빈 문자열로 설정 시 비활성화
-    ko_reranker_model: str = "Dongjin-kr/ko-reranker"
+    kafka_publish_max_retry: int = 3
+    kafka_max_poll_interval_ms: int = 900000
 
     # ── RAG ───────────────────────────────────────────────────────
     rag_chunk_size: int = 512
@@ -50,12 +60,44 @@ class Settings(BaseSettings):
     rag_min_threshold: float = 0.1
     rag_min_results: int = 5
     rag_threshold_step: float = 0.1
+    embedding_max_concurrency: int = 8
+    embedding_batch_size: int = 64
+    rag_db_max_concurrency: int = 10
 
     # ── 검증 ─────────────────────────────────────────────────────
     validation_max_retry: int = 3
+    phase3_repair_timeout_seconds: float = 300.0
 
     # ── CORS ──────────────────────────────────────────────────────
     allowed_origins: str = "http://localhost:3000,http://localhost:5500,http://127.0.0.1:5500"
+
+    @model_validator(mode="after")
+    def validate_runtime_limits(self) -> "Settings":
+        if self.rag_chunk_size <= 0:
+            raise ValueError("RAG_CHUNK_SIZE는 1 이상이어야 합니다")
+        if self.rag_chunk_overlap < 0 or self.rag_chunk_overlap >= self.rag_chunk_size:
+            raise ValueError("RAG_CHUNK_OVERLAP은 0 이상 RAG_CHUNK_SIZE 미만이어야 합니다")
+        if self.embedding_max_concurrency <= 0:
+            raise ValueError("EMBEDDING_MAX_CONCURRENCY는 1 이상이어야 합니다")
+        if self.embedding_batch_size <= 0:
+            raise ValueError("EMBEDDING_BATCH_SIZE는 1 이상이어야 합니다")
+        if self.rag_db_max_concurrency <= 0:
+            raise ValueError("RAG_DB_MAX_CONCURRENCY는 1 이상이어야 합니다")
+        if self.cohere_max_concurrency <= 0:
+            raise ValueError("COHERE_MAX_CONCURRENCY는 1 이상이어야 합니다")
+        if self.openai_request_timeout_seconds <= 0:
+            raise ValueError("OPENAI_REQUEST_TIMEOUT_SECONDS는 0보다 커야 합니다")
+        if self.phase2_llm_max_concurrency <= 0:
+            raise ValueError("PHASE2_LLM_MAX_CONCURRENCY는 1 이상이어야 합니다")
+        if self.phase2_timeout_seconds <= 0:
+            raise ValueError("PHASE2_TIMEOUT_SECONDS는 0보다 커야 합니다")
+        if self.phase3_repair_timeout_seconds <= 0:
+            raise ValueError("PHASE3_REPAIR_TIMEOUT_SECONDS는 0보다 커야 합니다")
+        if self.kafka_publish_max_retry <= 0:
+            raise ValueError("KAFKA_PUBLISH_MAX_RETRY는 1 이상이어야 합니다")
+        if self.kafka_max_poll_interval_ms <= 0:
+            raise ValueError("KAFKA_MAX_POLL_INTERVAL_MS는 1 이상이어야 합니다")
+        return self
 
     def get_allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",")]

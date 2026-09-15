@@ -7,7 +7,6 @@ services:
       DB_URL: postgresql://user:password@postgres:5432/timiroom
       PORT: "8080"
       RAG_DOCUMENT_TABLE: document_chunks
-      KO_RERANKER_MODEL: ""
     ports:
       - "8081:8080"
     depends_on:

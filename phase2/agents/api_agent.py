@@ -11,6 +11,7 @@ from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnect
 
 from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note
 from phase2.json_utils import try_parse_json, has_suspicious_script
+from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
 
 # EXAONE이 가끔 오타로 내는 필드명 -> 정규화
@@ -23,8 +24,7 @@ _ENDPOINT_KEY_ALIASES = {
 
 logger = logging.getLogger(__name__)
 
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+# 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
@@ -164,12 +164,14 @@ MANAGER_REVIEW_PROMPT = """아래는 sub-agent들이 작성한 API 엔드포인�
 
 JSON:
 {{
+  "prdIssues": "API 설계에 필요한데 PRD에 누락되거나 모순된 요구사항. 없으면 빈 문자열",
   "patches": {{
     "METHOD /api/v1/path": {{"method":"...","path":"...","description":"...","authRequired":true,"requestBody":"...","successResponse":"...","errorCodes":"..."}}
   }}
 }}
 
-문제되는 엔드포인트가 하나도 없으면 반드시 {{"patches": {{}}}}로 응답하세요.
+PRD 자체에 문제가 없으면 prdIssues는 빈 문자열로 두세요.
+문제되는 엔드포인트가 하나도 없으면 patches는 빈 객체로 응답하세요.
 """
 
 
@@ -178,6 +180,7 @@ class _ApiGraphState(TypedDict):
     authentication: str
     endpoints: Annotated[list, operator.add]
     api_spec: str
+    prd_issues: str
     ctx: dict
 
 
@@ -186,10 +189,12 @@ class ApiAgent:
     def __init__(
         self,
         client: AsyncOpenAI,
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-5.4-mini",
+        runtime: LlmRuntime | None = None,
     ):
         self._client = client
         self._model = model
+        self._runtime = runtime
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -215,6 +220,7 @@ class ApiAgent:
             "authentication": "",
             "endpoints": [],
             "api_spec": "",
+            "prd_issues": "",
             "ctx": {
                 "context": context,
                 "instruction": instruction,
@@ -227,6 +233,7 @@ class ApiAgent:
         try:
             result = await self._graph.ainvoke(graph_input)
             api_spec = result["api_spec"]
+            prd_issues = result.get("prd_issues", "")
         except Exception as e:
             logger.error("API 에이전트 실패: %s", e)
             return state.copy(
@@ -237,7 +244,7 @@ class ApiAgent:
         logger.info("API 에이전트 완료")
         return state.copy(
             api_spec=api_spec,
-            prd_feedback_from_api="",
+            prd_feedback_from_api=prd_issues,
             status_message="API 에이전트 완료 — API 스펙 생성",
         )
 
@@ -266,7 +273,7 @@ class ApiAgent:
         for attempt in range(3):
             raw = await self._call(
                 prompt, max_tokens=8192, system=MANAGER_SYSTEM,
-                enable_thinking=False, temperature=_PLAN_TEMPERATURE,
+                temperature=_PLAN_TEMPERATURE,
             )
             if ctx.get("dump"):
                 ctx["dump"].log_raw(label, attempt + 1, raw)
@@ -397,7 +404,7 @@ class ApiAgent:
         label = f"API_ENDPOINT_{method}_{path}"
         data = None
         for attempt in range(3):
-            raw = await self._call(prompt, max_tokens=1200, system=WORKER_SYSTEM, enable_thinking=False)
+            raw = await self._call(prompt, max_tokens=1200, system=WORKER_SYSTEM)
             if dump:
                 dump.log_raw(label, attempt + 1, raw)
             data = try_parse_json(raw)
@@ -441,6 +448,7 @@ class ApiAgent:
         endpoints = state["endpoints"]
         authentication = state["authentication"]
         dump = ctx.get("dump")
+        prd_issues = ""
 
         missing = uncovered_features(ctx["feature_list"], [ep.get("description", "") for ep in endpoints if isinstance(ep, dict)])
         if missing:
@@ -456,7 +464,7 @@ class ApiAgent:
         try:
             review = None
             for parse_attempt in range(2):
-                raw = await self._call(prompt, max_tokens=16384, system=MANAGER_SYSTEM, enable_thinking=False)
+                raw = await self._call(prompt, max_tokens=16384, system=MANAGER_SYSTEM)
                 if dump:
                     dump.log_raw("API_MANAGER_REVIEW", parse_attempt + 1, raw)
                 review = try_parse_json(raw)
@@ -466,6 +474,7 @@ class ApiAgent:
             if review is None or not isinstance(review, dict):
                 logger.warning("API manager 리뷰 파싱 최종 실패 — 원본 엔드포인트 유지")
             else:
+                prd_issues = str(review.get("prdIssues", "") or "").strip()
                 patches = review.get("patches")
                 if isinstance(patches, dict) and patches:
                     valid_patches = {k: v for k, v in patches.items() if isinstance(v, dict)}
@@ -491,26 +500,28 @@ class ApiAgent:
         endpoints = _normalize_endpoints(endpoints)
 
         api_spec = json.dumps({"endpoints": endpoints, "authentication": authentication}, ensure_ascii=False)
-        return {"api_spec": api_spec}
+        return {"api_spec": api_spec, "prd_issues": prd_issues}
 
-    async def _call(self, user_prompt: str, max_tokens: int, system: str, enable_thinking: bool, temperature: float = _TEMPERATURE) -> str:
+    async def _call(self, user_prompt: str, max_tokens: int, system: str, temperature: float = _TEMPERATURE) -> str:
         for attempt in range(3):
             try:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    temperature=temperature,
-                    top_p=_TOP_P,
-                    presence_penalty=_PRESENCE_PENALTY,
-                    max_tokens=max_tokens,
-                    frequency_penalty=0.5,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
-                )
+                async def request():
+                    return await self._client.chat.completions.create(
+                        model=self._model,
+                        temperature=temperature,
+                        top_p=_TOP_P,
+                        presence_penalty=_PRESENCE_PENALTY,
+                        max_completion_tokens=max_tokens,
+                        frequency_penalty=0.5,
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+
+                response = await self._runtime.call(request) if self._runtime else await request()
                 return response.choices[0].message.content or ""
-            except (InternalServerError, APITimeoutError, APIConnectionError) as e:
+            except (InternalServerError, APITimeoutError, APIConnectionError, TimeoutError) as e:
                 logger.warning("API 호출 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
                 if attempt < 2:
                     await asyncio.sleep(5 * (attempt + 1))

@@ -6,6 +6,7 @@ from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnect
 
 from common.pm_skills import PmSkillsLoader
 from phase2.json_utils import try_parse_json, has_suspicious_script
+from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
@@ -88,8 +89,7 @@ def repair_feature_name(name) -> str | None:
     logger.warning("PM 기능명 손상(%s) — 제외: %r", reason, stripped)
     return None
 
-# EXAONE 모델 카드 권장 샘플링 파라미터
-# https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
+# 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
@@ -117,10 +117,17 @@ PM_PROMPT = """당신은 시니어 소프트웨어 아키텍트이자 PM입니�
 
 class PmAgent:
 
-    def __init__(self, client: AsyncOpenAI, skills_loader: PmSkillsLoader, model: str = "gpt-4o"):
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        skills_loader: PmSkillsLoader,
+        model: str = "gpt-5.4-mini",
+        runtime: LlmRuntime | None = None,
+    ):
         self._client = client
         self._skills = skills_loader
         self._model = model
+        self._runtime = runtime
 
     async def execute(self, state: PipelineState, dump=None) -> PipelineState:
         logger.info("PM 에이전트 시작")
@@ -148,19 +155,21 @@ class PmAgent:
         data = None
         for attempt in range(3):
             try:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    temperature=_TEMPERATURE,
-                    top_p=_TOP_P,
-                    presence_penalty=_PRESENCE_PENALTY,
-                    frequency_penalty=0.3,
-                    messages=[
-                        {"role": "system", "content": "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-                )
-            except (InternalServerError, APITimeoutError, APIConnectionError) as e:
+                async def request():
+                    return await self._client.chat.completions.create(
+                        model=self._model,
+                        temperature=_TEMPERATURE,
+                        top_p=_TOP_P,
+                        presence_penalty=_PRESENCE_PENALTY,
+                        frequency_penalty=0.3,
+                        messages=[
+                            {"role": "system", "content": "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."},
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+
+                response = await self._runtime.call(request) if self._runtime else await request()
+            except (InternalServerError, APITimeoutError, APIConnectionError, TimeoutError) as e:
                 logger.warning("PM API 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
                 if attempt < 2:
                     await asyncio.sleep(5 * (attempt + 1))

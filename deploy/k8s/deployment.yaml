@@ -38,8 +38,6 @@ spec:
               value: kafka:9092
             - name: ALLOWED_ORIGINS
               value: https://timiroom.kro.kr
-            - name: KO_RERANKER_MODEL
-              value: ""
           envFrom:
             - secretRef:
                 name: rag-pipeline-secrets

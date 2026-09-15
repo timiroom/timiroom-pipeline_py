@@ -11,6 +11,7 @@ from common.api_response import ok
 from common.logging_middleware import pipeline_id_var
 from phase1.form_to_query import FormToQueryService
 from phase1.models import FormData
+from phase1.pdf_parsing import MAX_FILES
 from phase1.rag_pipeline import RagPipelineService
 from phase2.orchestration_graph import OrchestrationGraph
 from phase2.state import PipelineState
@@ -61,6 +62,8 @@ async def generate(
     _validate_form(form_data)
 
     # 파일 읽기 (요청 스레드에서 처리)
+    _validate_file_count(len(files))
+
     pdf_bytes: list[tuple[str, bytes]] = []
     for file in files:
         data = await file.read()
@@ -184,7 +187,9 @@ async def _run_pipeline_inner(
 
         # Phase 4
         progress_svc.send(pipeline_id, "PHASE4", "결과 저장 중...", 95)
-        await kafka_svc.publish(validated)
+        published_pipeline_id = await kafka_svc.publish(validated, pipeline_id)
+        if published_pipeline_id != pipeline_id:
+            raise RuntimeError("Kafka 발행 pipelineId가 요청 pipelineId와 일치하지 않습니다")
         logger.info("파이프라인 완료 | pipelineId: %s", pipeline_id)
 
         result = {
@@ -223,3 +228,8 @@ def _validate_form(form: FormData) -> None:
         raise HTTPException(400, "타겟유저는 최소 1명 필요합니다")
     if not form.feature_definition:
         raise HTTPException(400, "기능정의는 필수입니다")
+
+
+def _validate_file_count(file_count: int) -> None:
+    if file_count > MAX_FILES:
+        raise HTTPException(400, f"PDF 파일은 최대 {MAX_FILES}개까지 업로드할 수 있습니다")

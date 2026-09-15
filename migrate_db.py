@@ -1,7 +1,6 @@
-"""Solar 4096차원 RAG 테이블과 RL 테이블을 멱등 생성한다.
+"""Solar Embedding 2용 1024차원 RAG 테이블과 RL 테이블을 멱등 생성한다.
 
-기존 Spring 파이프라인의 ``document_chunks``(vector(1024))는 건드리지 않는다.
-NAS 배포에서는 RAG_DOCUMENT_TABLE=document_chunks_ko를 사용한다.
+기존 테이블이 같은 1024차원이라면 원문과 벡터를 보존하면서 필요한 컬럼만 보강한다.
 """
 
 import psycopg2
@@ -23,13 +22,38 @@ def main() -> None:
                     CREATE TABLE IF NOT EXISTS {} (
                         id           UUID PRIMARY KEY,
                         content      TEXT NOT NULL,
-                        content_hash TEXT UNIQUE,
+                        content_hash TEXT NOT NULL,
+                        source_key   TEXT UNIQUE NOT NULL,
                         metadata     JSONB DEFAULT '{{}}'::jsonb,
-                        embedding    vector(4096),
+                        embedding    vector(1024),
                         tokens       TSVECTOR
                     )
                     """
                 ).format(table)
+            )
+
+            # 기존 전역 content_hash UNIQUE는 프로젝트가 다른 동일 문서를 누락시키므로 제거하고,
+            # pipeline/type/chunk 범위의 source_key를 중복 방지 키로 사용한다.
+            cur.execute(
+                sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS source_key TEXT").format(table)
+            )
+            cur.execute(
+                sql.SQL(
+                    "UPDATE {} SET source_key = md5(COALESCE(metadata->>'pipeline_id', 'legacy') || id::text) "
+                    "WHERE source_key IS NULL"
+                ).format(table)
+            )
+            cur.execute(sql.SQL("ALTER TABLE {} ALTER COLUMN source_key SET NOT NULL").format(table))
+            cur.execute(
+                sql.SQL("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {}").format(
+                    table,
+                    sql.Identifier(f"{table_name}_content_hash_key"),
+                )
+            )
+            cur.execute(
+                sql.SQL("CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} (source_key)").format(
+                    sql.Identifier(f"idx_{table_name}_source_key"), table
+                )
             )
 
             cur.execute(
@@ -42,11 +66,10 @@ def main() -> None:
                 (table_name,),
             )
             row = cur.fetchone()
-            if not row or row[0] != 4096:
+            if not row or row[0] != 1024:
                 raise RuntimeError(
-                    f"{table_name}.embedding은 vector(4096)이어야 합니다. "
-                    "기존 vector(1024) 테이블을 변경하지 말고 "
-                    "RAG_DOCUMENT_TABLE=document_chunks_ko를 사용하세요."
+                    f"{table_name}.embedding은 Solar Embedding 2와 호환되는 "
+                    "vector(1024)여야 합니다."
                 )
 
             cur.execute(
@@ -85,8 +108,20 @@ def main() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pipeline_outbox (
+                    pipeline_id TEXT PRIMARY KEY,
+                    topic       TEXT NOT NULL,
+                    payload     JSONB NOT NULL,
+                    attempts    INT NOT NULL DEFAULT 0,
+                    last_error  TEXT,
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
 
-    print(f"DB migration complete: {table_name} (vector(4096))")
+    print(f"DB migration complete: {table_name} (vector(1024))")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ class PipelineState:
 
     # QA 에이전트 결과 (선택적 재시도용 카테고리별 결함 + 품질 점수)
     qa_quality_score: float = 0.0
+    qa_approved: bool | None = None
     qa_db_issues: list[str] = field(default_factory=list)
     qa_api_issues: list[str] = field(default_factory=list)
     qa_prd_issues: list[str] = field(default_factory=list)
@@ -54,6 +55,11 @@ class PipelineState:
 
     # 상태 메시지
     status_message: str = ""
+
+    # Phase 3 구조화 검증·재시도 상태
+    validation_error_codes: list[str] = field(default_factory=list)
+    validation_repair_targets: list[str] = field(default_factory=list)
+    validation_failure_fingerprints: list[str] = field(default_factory=list)
 
     def copy(self, **kwargs) -> PipelineState:
         return replace(self, **kwargs)
