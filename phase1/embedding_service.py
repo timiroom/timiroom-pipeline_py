@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+import httpx
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,15 @@ class EmbeddingService:
             raise ValueError("max_concurrency는 1 이상이어야 합니다")
         if batch_size <= 0:
             raise ValueError("batch_size는 1 이상이어야 합니다")
-        self._client = AsyncOpenAI(api_key=api_key, base_url=UPSTAGE_BASE_URL)
+        # Phase4 Kafka consumer도 이 client를 사용한다. 시스템 프록시가 설정된
+        # 환경에서는 Upstage 연결이 Connection error로 실패할 수 있으므로
+        # OpenAI/Codex client와 동일하게 명시적으로 프록시 상속을 차단한다.
+        self._http_client = httpx.AsyncClient(trust_env=False)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=UPSTAGE_BASE_URL,
+            http_client=self._http_client,
+        )
         self._query_model = query_model
         self._passage_model = passage_model
         self._semaphore = asyncio.Semaphore(max_concurrency)

@@ -37,6 +37,8 @@ Phase 2 기본 실행 제한은 LLM 동시 호출 8개, 호출당 120초, 전체
 `PHASE2_WEB_SEARCH_ENABLED=false`로 설정할 수 있지만 시장조사의 최신성은 보장되지 않습니다.
 Phase 3의 선택적 산출물 복구는 기본 300초로 별도 제한되며
 `PHASE3_REPAIR_TIMEOUT_SECONDS`로 조정할 수 있습니다. 복구 타임아웃은
+`PHASE2_DBA_RESYNC_TIMEOUT_SECONDS`, `PHASE2_API_RESYNC_TIMEOUT_SECONDS`로 DBA/API
+targeted resync를 각각 조정할 수 있습니다.
 전체 Phase 2 생성 제한과 합산되지 않고 해당 보정 시도만 종료합니다.
 
 저장소 시크릿 `DOCKER_USERNAME`, `DOCKER_PASSWORD`, `GH_PAT`도 필요합니다.

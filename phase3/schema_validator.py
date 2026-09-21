@@ -4,6 +4,9 @@ import re
 from dataclasses import dataclass, field
 
 from phase2.agents.api_agent import _invalid_paths
+from phase2.feature_coverage import strictly_uncovered_features, uncovered_features
+from phase2.feature_registry import missing_api_contract_features, missing_db_contract_features
+from phase2.feature_scope import backend_features
 from phase2.json_utils import try_parse_json
 
 logger = logging.getLogger(__name__)
@@ -13,7 +16,8 @@ _REQUIRED_PRD_FIELDS = {
     "projectOverview", "background", "goals", "kpi", "userPersonas",
     "mvpScope", "techStack", "releaseSchedule", "coreFeatures",
 }
-_RELATION_CARDINALITY_RE = re.compile(r"\(\s*(?:1|N|M)\s*:\s*(?:1|N|M)\s*\)", re.IGNORECASE)
+_CARDINALITY = r"(?:0\.\.[01NM]|1\.\.[1NM]|[01NM])"
+_RELATION_CARDINALITY_RE = re.compile(rf"\(\s*{_CARDINALITY}\s*:\s*{_CARDINALITY}\s*\)", re.IGNORECASE)
 _NON_RESOURCE_PATHS = {
     "auth", "login", "logout", "signup", "register", "token", "refresh",
     "health", "search", "metrics", "status", "me",
@@ -41,6 +45,7 @@ class SchemaValidator:
         db_schema: str,
         api_spec: str,
         prd_document: str = "",
+        feature_registry: list[dict] | None = None,
     ) -> ValidationResult:
         errors: list[str] = []
         codes: list[str] = []
@@ -67,13 +72,15 @@ class SchemaValidator:
             add("FEATURES_DUPLICATED", "pm", "featureList: 중복 기능이 있습니다")
 
         if db is not None:
-            self._check_db(db, cleaned_features, add)
+            self._check_db(db, cleaned_features, add, feature_registry)
         if api is not None:
-            self._check_api(api, cleaned_features, add)
+            self._check_api(api, cleaned_features, add, feature_registry)
         if prd is not None:
             self._check_prd(prd, cleaned_features, add)
         if db is not None and api is not None:
             self._check_cross_artifact(db, api, add)
+        if db is not None and prd is not None:
+            self._check_prd_db_entities(prd, db, add)
 
         if errors:
             logger.warning("검증 실패 — %d개 오류: %s", len(errors), errors)
@@ -104,7 +111,7 @@ class SchemaValidator:
         return parsed, json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
-    def _check_db(data: dict, feature_list: list[str], add) -> None:
+    def _check_db(data: dict, feature_list: list[str], add, feature_registry=None) -> None:
         tables = data.get("tables")
         if not isinstance(tables, list) or not tables:
             add("DB_TABLES_REQUIRED", "db", "DB 스키마: tables는 비어있지 않은 배열이어야 합니다")
@@ -145,12 +152,32 @@ class SchemaValidator:
         if len(table_names) != len(set(table_names)):
             add("DB_TABLE_DUPLICATED", "db", "DB 스키마: 중복 테이블명이 있습니다")
 
+        if feature_registry:
+            missing = missing_db_contract_features(feature_registry, tables)
+        else:
+            # Backward-compatible fallback for callers that predate Feature Registry.
+            backend_feature_list = backend_features(feature_list)
+            table_texts = []
+            for table in tables:
+                if isinstance(table, dict):
+                    table_texts.extend([
+                        str(table.get("name", "")),
+                        str(table.get("description", "")),
+                        " ".join(str(column.get("name", "")) for column in table.get("columns", []) if isinstance(column, dict)),
+                    ])
+            missing = uncovered_features(backend_feature_list, table_texts)
+        if missing:
+            add("DB_FEATURE_COVERAGE", "db", f"DB 스키마: 기능을 저장할 테이블이 없어 보입니다 — {missing}")
+
         relationships = data.get("relationships")
         if not isinstance(relationships, list):
             add("DB_RELATIONSHIPS_REQUIRED", "db", "DB 스키마: relationships는 배열이어야 합니다")
         elif len(tables) > 1 and not relationships:
             add("DB_RELATIONSHIPS_EMPTY", "db", "DB 스키마: 테이블이 2개 이상인데 relationships가 비어 있습니다")
         else:
+            normalized_relationships = [re.sub(r"\s+", " ", str(value)).strip().casefold() for value in relationships]
+            if len(normalized_relationships) != len(set(normalized_relationships)):
+                add("DB_RELATIONSHIP_DUPLICATED", "db", "DB 스키마: 중복 relationship이 있습니다")
             known = set(table_names)
             for relationship in relationships:
                 text = str(relationship)
@@ -163,7 +190,7 @@ class SchemaValidator:
                     add("DB_RELATIONSHIP_INVALID", "db", f"DB 스키마: 잘못된 relationship: {text}")
 
     @staticmethod
-    def _check_api(data: dict, feature_list: list[str], add) -> None:
+    def _check_api(data: dict, feature_list: list[str], add, feature_registry=None) -> None:
         endpoints = data.get("endpoints")
         if not isinstance(endpoints, list) or not endpoints:
             add("API_ENDPOINTS_REQUIRED", "api", "API 스펙: endpoints는 비어있지 않은 배열이어야 합니다")
@@ -191,6 +218,29 @@ class SchemaValidator:
         bad_paths = _invalid_paths([endpoint for endpoint in endpoints if isinstance(endpoint, dict)])
         if bad_paths:
             add("API_PATH_INVALID", "api", f"API 스펙: REST 경로 형식 위반: {bad_paths}")
+        if feature_registry:
+            registry_ids = {
+                str(item.get("featureId") or item.get("id") or "").strip()
+                for item in feature_registry if isinstance(item, dict)
+            }
+            unmapped = [
+                f"{endpoint.get('method', 'GET')} {endpoint.get('path', '')}"
+                for endpoint in endpoints
+                if isinstance(endpoint, dict)
+                and str(endpoint.get("featureId") or "").strip() not in registry_ids
+            ]
+            if unmapped:
+                add("API_FEATURE_ID_REQUIRED", "api", f"API 스펙: Registry featureId 매핑 누락 — {unmapped}")
+            missing_contracts = missing_api_contract_features(feature_registry, endpoints)
+            if missing_contracts:
+                add("API_CONTRACT_MISSING", "api", f"API 스펙: apiContract endpoint 누락 — {missing_contracts}")
+        else:
+            missing = strictly_uncovered_features(
+                backend_features(feature_list),
+                [str(endpoint.get("description", "")) for endpoint in endpoints if isinstance(endpoint, dict)],
+            )
+            if missing:
+                add("API_FEATURE_COVERAGE", "api", f"API 스펙: 기능에 대응하는 endpoint가 없어 보입니다 — {missing}")
     @staticmethod
     def _check_prd(data: dict, feature_list: list[str], add) -> None:
         missing_fields = sorted(_REQUIRED_PRD_FIELDS - set(data))
@@ -200,6 +250,32 @@ class SchemaValidator:
         if not isinstance(core_features, list) or not core_features:
             add("PRD_CORE_FEATURES_REQUIRED", "prd", "PRD 문서: coreFeatures가 비어있습니다")
             return
+        core_texts = []
+        for feature in core_features:
+            if isinstance(feature, dict):
+                core_texts.extend([
+                    str(feature.get("name", "")),
+                    str(feature.get("description", "")),
+                    " ".join(str(item) for item in feature.get("requirements", []) if item is not None),
+                ])
+            else:
+                core_texts.append(str(feature))
+        missing = strictly_uncovered_features(feature_list, core_texts)
+        if missing:
+            add("PRD_FEATURE_COVERAGE", "prd", f"PRD 문서: coreFeatures에 반영되지 않은 기능이 있습니다 — {missing}")
+
+
+    @staticmethod
+    def _check_prd_db_entities(prd: dict, db: dict, add) -> None:
+        """PRD의 구조화된 database 엔티티가 DBA 테이블에 존재하는지 확인한다."""
+        declared = set(re.findall(r"\b([a-z][a-z0-9_]*)\s*\(id\s+PK\b", json.dumps(prd, ensure_ascii=False)))
+        actual = {
+            str(table.get("name")) for table in db.get("tables", [])
+            if isinstance(table, dict) and table.get("name")
+        }
+        missing = sorted(declared - actual)
+        if missing:
+            add("PRD_DB_ENTITY_MISMATCH", "prd", f"PRD/DB 정합성: PRD에 정의된 테이블이 DBA 스키마에 없습니다 — {missing}")
 
     @staticmethod
     def _check_cross_artifact(db: dict, api: dict, add) -> None:
@@ -222,7 +298,34 @@ class SchemaValidator:
                 constraints = str(column.get("constraints", "")).upper()
                 if not name.endswith("_id") or "FOREIGN_KEY" not in constraints:
                     continue
+                # 구조화된 FK가 명시되어 있으면 컬럼명 추론보다 REFERENCES를 기준으로
+                # 검증한다. recorded_by_id, actor_id, job_id처럼 이름만으로 대상을
+                # 결정할 수 없는 감사/폴리모픽 컬럼을 오탐하지 않기 위한 규칙이다.
+                referenced = re.search(r"REFERENCES\s+([A-Z_][A-Z0-9_]*)\s*\(", constraints)
+                if referenced:
+                    if referenced.group(1).lower() in {name.lower() for name in table_names}:
+                        continue
+                    add(
+                        "DB_FOREIGN_KEY_TARGET_MISSING",
+                        "db",
+                        f"DB 스키마: {name}이 참조할 테이블을 찾을 수 없습니다",
+                    )
+                    continue
                 candidates = SchemaValidator._fk_target_candidates(name[:-3])
+                stem = name[:-3]
+                for table_name in table_names:
+                    tail = table_name.rsplit("_", 1)[-1]
+                    variants = {tail}
+                    if tail.endswith("ies"):
+                        variants.add(tail[:-3] + "y")
+                    elif tail.endswith("sses"):
+                        variants.add(tail[:-2])
+                    elif tail.endswith("s"):
+                        variants.add(tail[:-1])
+                    else:
+                        variants.add(tail + "s")
+                    if stem in variants:
+                        candidates.add(table_name)
                 if not candidates & table_names:
                     add("DB_FOREIGN_KEY_TARGET_MISSING", "db", f"DB 스키마: {name}이 참조할 테이블을 찾을 수 없습니다")
 

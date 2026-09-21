@@ -152,6 +152,10 @@ class KafkaConsumerService:
             (event.api_spec, {**base_meta, "type": "api"}),
             ("\n".join(event.feature_list), {**base_meta, "type": "features"}),
         ]
+        if event.feature_spec_document.strip() and event.feature_spec_document.strip() != "{}":
+            documents.append((event.feature_spec_document, {**base_meta, "type": "feature_spec"}))
+        if event.feature_registry:
+            documents.append((json.dumps(event.feature_registry, ensure_ascii=False), {**base_meta, "type": "feature_registry"}))
         if event.market_research.strip():
             documents.append((event.market_research, {**base_meta, "type": "market_research"}))
 

@@ -125,6 +125,8 @@ class KafkaProducerService:
             marketResearch=state.market_research,
             dbSchema=state.db_schema,
             apiSpec=state.api_spec,
+            featureSpecDocument=state.feature_spec_document or "{}",
+            featureRegistry=state.feature_registry or [],
             retryCount=state.retry_count,
             createdAt=datetime.now(UTC).isoformat(),
         ).model_dump(by_alias=True)

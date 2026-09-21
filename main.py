@@ -4,6 +4,9 @@ import logging
 import logging.config
 import sys
 
+import psycopg2
+import httpx
+
 # Windows cp949 터미널에서 UTF-8 출력 강제
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -13,12 +16,12 @@ if hasattr(sys.stderr, "buffer"):
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 
 from common.exception_handler import register_exception_handlers
 from common.logging_middleware import RequestIdFilter, RequestIdMiddleware
-from common.pm_skills import PmSkillsLoader
 from config.settings import settings
 from phase1.document_ingestion import DocumentIngestionService
 from phase1.embedding_service import EmbeddingService
@@ -39,6 +42,7 @@ from phase2.agents.api_agent import ApiAgent
 from phase2.agents.dba_agent import DbaAgent
 from phase2.agents.pm_agent import PmAgent
 from phase2.agents.prd_agent import PrdAgent
+from phase2.agents.feature_spec_agent import FeatureSpecAgent
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent
 from phase2.llm_runtime import LlmRuntime
@@ -71,11 +75,13 @@ logging.getLogger("aiokafka").setLevel(logging.INFO)
 
 # ── API 클라이언트 ────────────────────────────────────────────────
 
+openai_http_client = httpx.AsyncClient(trust_env=False)
 openai_client = AsyncOpenAI(
     api_key=settings.openai_api_key,
     base_url=settings.openai_base_url,
     timeout=settings.openai_request_timeout_seconds,
-    max_retries=0,
+    max_retries=settings.openai_max_retries,
+    http_client=openai_http_client,
 )
 
 # ── Phase 1 ───────────────────────────────────────────────────────
@@ -89,8 +95,6 @@ embedding_service = EmbeddingService(
     max_concurrency=settings.embedding_max_concurrency,
     batch_size=settings.embedding_batch_size,
 )
-pm_skills = PmSkillsLoader(embedding_service)
-
 search_rl_service = SearchRLService(
     db_url=settings.db_url,
     db_semaphore=db_io_semaphore,
@@ -162,8 +166,9 @@ search_agent = SearchAgent(
     runtime=phase2_llm_runtime,
     web_search_enabled=settings.phase2_web_search_enabled,
 )
-pm_agent = PmAgent(openai_client, pm_skills, settings.openai_chat_model, runtime=phase2_llm_runtime)
+pm_agent = PmAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
 prd_agent = PrdAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
+feature_spec_agent = FeatureSpecAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
 dba_agent = DbaAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
 api_agent = ApiAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
 qa_agent = QaAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
@@ -172,19 +177,25 @@ orchestration_graph = OrchestrationGraph(
     search_agent=search_agent,
     pm_agent=pm_agent,
     prd_agent=prd_agent,
+    feature_spec_agent=feature_spec_agent,
     dba_agent=dba_agent,
     api_agent=api_agent,
     qa_agent=qa_agent,
     progress_service=progress_service,
     timeout_seconds=settings.phase2_timeout_seconds,
     repair_timeout_seconds=settings.phase3_repair_timeout_seconds,
+    dba_resync_timeout_seconds=settings.phase2_dba_resync_timeout_seconds,
+    api_resync_timeout_seconds=settings.phase2_api_resync_timeout_seconds,
 )
 
 # ── Phase 3 ───────────────────────────────────────────────────────
 
 schema_validator = SchemaValidator()
 validation_service = ValidationService(schema_validator)
-retry_service = RetryService(max_retry=settings.validation_max_retry)
+retry_service = RetryService(
+    max_retry=settings.validation_max_retry,
+    max_targeted_repair_per_domain=settings.phase3_targeted_repair_max_per_domain,
+)
 
 # ── Phase 4 ───────────────────────────────────────────────────────
 
@@ -208,8 +219,6 @@ kafka_consumer_service = KafkaConsumerService(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await pm_skills.load()
-
     # Kafka는 백그라운드 비동기 연결 — 앱 기동 차단 없음 (Java fail-fast: false 동일)
     kafka_producer_service.start()
     kafka_consumer_service.start()
@@ -270,8 +279,25 @@ def liveness():
 
 
 @app.get("/actuator/health/readiness")
-def readiness():
+async def readiness():
+    """DB와 Kafka가 실제로 요청을 처리할 수 있을 때만 ready를 반환한다."""
+    try:
+        await asyncio.to_thread(_check_database)
+        kafka_ready = kafka_producer_service.ready and kafka_consumer_service.ready
+    except Exception as exc:
+        logger.warning("Readiness 검사 실패: %s", exc)
+        kafka_ready = False
+
+    if not kafka_ready:
+        return JSONResponse(status_code=503, content={"status": "DOWN"})
     return {"status": "UP"}
+
+
+def _check_database() -> None:
+    with psycopg2.connect(settings.db_url, connect_timeout=3) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
 
 
 if __name__ == "__main__":

@@ -3,7 +3,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from phase2.agents.api_agent import ApiAgent, _endpoint_soft_cap, _normalize_endpoints, _prune_plan
+from phase2.agents.api_agent import (
+    ApiAgent, _endpoint_soft_cap, _normalize_endpoints, _prune_plan,
+    _sanitize_plan_paths, _semantic_endpoint_key,
+)
+from phase2.agents.dba_agent import (
+    DbaAgent, _normalize_special_references, ensure_primary_keys, reconcile_fk_types,
+    normalize_table_contract_names, annotate_table_feature_ids,
+)
+from phase2.agents.feature_spec_agent import FeatureSpecAgent, _score_supporting
+from phase2.feature_registry import normalize_feature_registry
 from phase2.agents.prd_agent import reconcile_core_features
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent, _polish_market_research_text
@@ -47,11 +56,231 @@ def test_api_agent_propagates_prd_feedback():
     assert result.prd_feedback_from_api == "권한 정책 누락"
 
 
+def test_api_targeted_repair_preserves_unrelated_endpoints():
+    agent = ApiAgent(object())
+    agent._call = lambda *_args, **_kwargs: _async_text(
+        '{"patches":[{"method":"POST","path":"/api/v1/orders","description":"주문 생성 및 검증","requestBody":"order","successResponse":"order","errorCodes":"400"}]}'
+    )
+    state = PipelineState(api_spec='{"authentication":"JWT","endpoints":['
+        '{"method":"GET","path":"/api/v1/orders","description":"주문 목록","successResponse":"list","errorCodes":"400"},'
+        '{"method":"POST","path":"/api/v1/orders","description":"잘못된 설명","successResponse":"old","errorCodes":"500"}]}'
+    )
+
+    result = asyncio.run(agent.repair(state, "POST /api/v1/orders의 요청 형식이 잘못되었습니다"))
+    endpoints = __import__("json").loads(result.api_spec)["endpoints"]
+
+    assert len(endpoints) == 2
+    assert endpoints[0]["description"] == "주문 목록"
+    assert endpoints[1]["description"] == "주문 생성 및 검증"
+
+
+async def _async_text(value):
+    return value
+
+
 def test_api_plan_soft_cap_scales_with_feature_count():
     cap = _endpoint_soft_cap(15)
 
     assert 15 <= cap <= 36
     assert cap < 40
+
+
+def test_feature_registry_exposes_explicit_contract_fields_and_stable_ids():
+    registry = normalize_feature_registry([{
+        "featureId": "reservation.create",
+        "name": "예약 생성",
+        "actions": ["create"],
+        "apiContract": [{"method": "POST", "path": "/api/v1/reservations"}],
+        "dbContract": {"tables": ["reservations"], "foreignKeys": ["reservations.user_id -> users.id"]},
+    }], ["예약 생성"])
+
+    assert registry[0]["featureId"] == "reservation.create"
+    assert registry[0]["apiContract"][0]["path"] == "/api/v1/reservations"
+    assert registry[0]["dbContract"]["tables"] == ["reservations"]
+
+
+def test_api_path_normalization_and_auth_semantic_dedupe_do_not_drop_refresh_logout():
+    plan = [
+        {"method": "POST", "path": "/api/v1/api/auth/login", "description": "로그인"},
+        {"method": "POST", "path": "/api/auth/refresh", "description": "토큰 갱신"},
+        {"method": "POST", "path": "/api/auth/logout", "description": "로그아웃"},
+    ]
+    normalized = _normalize_endpoints(_sanitize_plan_paths(plan))
+    paths = {ep["path"] for ep in normalized}
+
+    assert "/api/v1/auth/login" in paths
+    assert "/api/v1/auth/refresh" in paths
+    assert "/api/v1/auth/logout" in paths
+
+
+def test_auth_logout_with_token_word_is_not_deduped_as_refresh():
+    plan = _normalize_endpoints([
+        {"method": "POST", "path": "/api/v1/auth/refresh", "description": "토큰 갱신"},
+        {"method": "POST", "path": "/api/v1/auth/logout", "description": "토큰 폐기 및 로그아웃"},
+    ])
+    assert {ep["path"] for ep in plan} == {"/api/v1/auth/refresh", "/api/v1/auth/logout"}
+
+
+def test_auth_actions_are_not_semantically_collapsed():
+    endpoints = _normalize_endpoints([
+        {"method": "POST", "path": "/api/v1/auth/refresh", "description": "토큰 갱신"},
+        {"method": "POST", "path": "/api/v1/auth/signup", "description": "회원가입"},
+        {"method": "POST", "path": "/api/v1/auth/verify", "description": "이메일 인증"},
+    ])
+    assert {ep["path"] for ep in endpoints} == {
+        "/api/v1/auth/refresh", "/api/v1/auth/signup", "/api/v1/auth/verify",
+    }
+
+
+def test_dba_fk_constraints_keep_reference_target_and_type():
+    tables = [
+        {"name": "users", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
+        {"name": "reservations", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "user_id", "type": "VARCHAR(255)", "constraints": "NOT_NULL"}]},
+    ]
+    reconcile_fk_types(tables)
+    user_id = tables[1]["columns"][1]
+
+    assert user_id["type"] == "BIGINT"
+    assert "FOREIGN_KEY" in user_id["constraints"]
+    assert "REFERENCES users(id)" in user_id["constraints"]
+
+
+def test_dba_backstop_adds_missing_pk_and_unique_compound_fk_target():
+    tables = [
+        {"name": "pet_guardians", "columns": [{"name": "id", "type": "BIGINT", "constraints": ""},
+            {"name": "guardian_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"}]},
+        {"name": "users", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
+        {"name": "grooming_records", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
+        {"name": "grooming_photos", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "record_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"}]},
+    ]
+    ensure_primary_keys(tables)
+    reconcile_fk_types(tables)
+
+    assert "PRIMARY_KEY" in tables[0]["columns"][0]["constraints"]
+    photo_record = tables[3]["columns"][1]
+    assert "REFERENCES grooming_records(id)" in photo_record["constraints"]
+
+
+def test_dba_special_references_distinguish_external_polymorphic_and_self_fk():
+    tables = [
+        {"name": "refresh_tokens", "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "replaced_by_token_id", "type": "BIGINT", "constraints": "NULL"},
+        ]},
+        {"name": "notification_deliveries", "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "provider_message_id", "type": "VARCHAR(255)", "constraints": "FOREIGN_KEY"},
+        ]},
+        {"name": "audit_logs", "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "target_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"},
+        ]},
+    ]
+
+    _normalize_special_references(tables)
+    reconcile_fk_types(tables)
+
+    refresh = tables[0]["columns"][1]
+    provider = tables[1]["columns"][1]
+    audit_names = {column["name"] for column in tables[2]["columns"]}
+    assert "REFERENCES refresh_tokens(id)" in refresh["constraints"]
+    assert "FOREIGN_KEY" not in provider["constraints"]
+    assert "target_type" in audit_names
+
+
+def test_supporting_priority_uses_dependency_score_and_release_gate():
+    priority, score, gate = _score_supporting("inventory validation", "required release blocker for data integrity")
+
+    assert priority == "P1"
+    assert score >= 5
+    assert gate is True
+
+
+def test_feature_spec_fallback_uses_prd_core_features():
+    agent = FeatureSpecAgent(object(), "test")
+    state = PipelineState(
+        feature_list=["재고 등록"],
+        feature_registry=[{"featureId": "inventory.register", "name": "재고 등록", "apiContract": [],
+                           "dbContract": {"tables": [], "foreignKeys": []}}],
+        prd_document='{"coreFeatures":[{"name":"재고 등록"}]}',
+    )
+
+    result = asyncio.run(agent.execute(state))
+    assert result.feature_registry[0]["featureId"] == "inventory.register"
+    assert result.feature_registry[0]["priority"] == "P0"
+    assert result.feature_spec_document
+
+
+def test_feature_registry_preserves_feature_spec_supporting_items_for_downstream_agents():
+    registry = normalize_feature_registry(
+        [
+            {"featureId": "reservation.create", "name": "예약 생성"},
+            {"featureId": "auth.signup", "name": "회원가입", "source": "supporting"},
+        ],
+        ["예약 생성"],
+        preserve_extra=True,
+    )
+
+    assert [item["featureId"] for item in registry] == ["reservation.create", "auth.signup"]
+
+
+def test_feature_registry_deduplicates_extra_feature_ids():
+    registry = normalize_feature_registry(
+        [
+            {"featureId": "feature_001", "name": "핵심"},
+            {"featureId": "feature_001", "name": "보조"},
+        ],
+        ["핵심"],
+        preserve_extra=True,
+    )
+
+    assert len({item["featureId"] for item in registry}) == len(registry)
+
+
+def test_dba_table_aliases_follow_registry_and_get_feature_mapping():
+    tables = [{
+        "name": "organization_memberships",
+        "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
+        "indexes": [],
+    }]
+    registry = [{
+        "featureId": "membership.manage",
+        "dbContract": {"tables": ["memberships"], "foreignKeys": []},
+    }]
+
+    tables, relationships = normalize_table_contract_names(
+        tables, ["organizations (1:N) organization_memberships"], registry,
+    )
+    annotate_table_feature_ids(tables, registry)
+
+    assert tables[0]["name"] == "memberships"
+    assert tables[0]["featureIds"] == ["membership.manage"]
+    assert relationships == ["organizations (1:N) memberships"]
+
+
+def test_dba_manager_plan_accepts_valid_partial_plan_for_targeted_patch():
+    agent = DbaAgent(object())
+    calls = {"count": 0}
+
+    async def call(*_args, **_kwargs):
+        calls["count"] += 1
+        return '{"plan": [{"name":"reservations","purpose":"예약 등록"},{"name":"users","purpose":"회원"},{"name":"payments","purpose":"결제"}]}'
+
+    agent._call = call
+    result = asyncio.run(agent._manager_plan_node({
+        "ctx": {
+            "feature_list": ["예약 등록", "회원정보 수정"],
+            "feature_str": "- 예약 등록\\n- 회원정보 수정",
+            "instruction": "",
+            "context": "",
+            "feature_registry": "[]",
+        }
+    }))
+
+    assert calls["count"] == 1
+    assert len(result["plan"]) == 3
 
 
 def test_prune_plan_keeps_auth_and_core_actions_under_cap():
@@ -95,6 +324,18 @@ def test_normalize_endpoints_drops_semantic_auth_duplicates():
     assert "DELETE /api/v1/auth/sessions/current" in keys
 
 
+def test_auth_semantic_keys_keep_refresh_and_password_reset_confirmation_distinct():
+    assert _semantic_endpoint_key({
+        "method": "POST", "path": "/api/v1/auth/refresh", "description": "토큰 갱신"
+    }) == ("auth", "refresh")
+    assert _semantic_endpoint_key({
+        "method": "POST", "path": "/api/v1/auth/password-reset/confirm", "description": "비밀번호 재설정 확인"
+    }) == ("auth", "password_reset_confirm")
+    assert _semantic_endpoint_key({
+        "method": "POST", "path": "/api/v1/auth/password-reset", "description": "비밀번호 재설정 요청"
+    }) == ("auth", "password_reset_request")
+
+
 def test_reconcile_core_features_caps_excessive_p0_priorities():
     core_features = [
         {"name": f"핵심 기능 {i}", "priority": "P0", "description": "설명", "requirements": ["요구사항"]}
@@ -134,6 +375,19 @@ def test_qa_quality_score_distinguishes_unapproved_result():
     assert agent._compute_quality_score(False, 1) < agent._compute_quality_score(True, 1)
 
 
+def test_qa_gate_blocks_contract_breaks_but_allows_quality_warnings():
+    classified = QaAgent._classify_issues(
+        ["DB 설명 문구 보강 필요", "DB 스키마: 참조 대상 테이블을 찾을 수 없습니다"],
+        ["endpoint 설명이 간략함", "API 스펙: 기능에 대응하는 endpoint가 없어 보임"],
+        [],
+    )
+
+    assert classified["db_warnings"] == ["DB 설명 문구 보강 필요"]
+    assert classified["db_blockers"] == ["DB 스키마: 참조 대상 테이블을 찾을 수 없습니다"]
+    assert classified["api_warnings"] == ["endpoint 설명이 간략함"]
+    assert classified["api_blockers"] == ["API 스펙: 기능에 대응하는 endpoint가 없어 보임"]
+
+
 def test_qa_execute_uses_lightweight_phase3_gate():
     async def fail_if_called(_state):
         raise AssertionError("strict QA graph should not run in lightweight mode")
@@ -149,8 +403,23 @@ def test_qa_execute_uses_lightweight_phase3_gate():
 
     result = asyncio.run(agent.execute(state))
 
-    assert result.qa_approved is True
+    assert result.qa_approved is False
     assert result.status_message == "QA 경량 게이트 완료 — Phase 3 구조 검증으로 이관"
+
+
+def test_qa_lightweight_gate_rejects_cross_artifact_entity_mismatch():
+    agent = QaAgent(object())
+    state = PipelineState(
+        feature_list=["사용자 로그인"],
+        db_schema='{"tables":[{"name":"users","columns":[{"name":"id","type":"BIGINT","constraints":"PRIMARY_KEY"}]}],"relationships":[]}',
+        api_spec='{"authentication":"Bearer JWT","endpoints":[{"method":"POST","path":"/api/v1/login","description":"사용자 로그인","successResponse":"ok","errorCodes":"400"}]}',
+        prd_document='{"coreFeatures":[{"name":"사용자 로그인"}],"techStack":{"database":"courses(id PK, academy_id FK→academies.id)"}}',
+    )
+
+    result = asyncio.run(agent.execute(state))
+
+    assert result.qa_approved is False
+    assert any("PRD에 정의된 테이블" in issue for issue in result.qa_prd_issues)
 
 
 def test_llm_runtime_bounds_concurrency():

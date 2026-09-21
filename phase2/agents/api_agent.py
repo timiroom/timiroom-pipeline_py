@@ -9,7 +9,9 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
-from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note
+from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note, strictly_uncovered_features
+from phase2.feature_scope import backend_features
+from phase2.feature_registry import normalize_feature_registry, registry_text
 from phase2.json_utils import try_parse_json, has_suspicious_script
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
@@ -34,7 +36,8 @@ _PLAN_TEMPERATURE = 0.4
 
 # plan 생성 배치 크기 — 한 번에 담당할 기능 수.
 # 기능 전체(21개)를 한 프롬프트에 넣으면 EXAONE이 요구량의 1/3 수준에서 멈춘다(실측 12/42).
-_PLAN_BATCH_SIZE = 4
+# Registry가 기능 경계를 제공하므로 초기 manager plan은 한 번만 만든다.
+_PLAN_BATCH_SIZE = 999
 _ENDPOINTS_PER_FEATURE = 1
 _AUTH_ENDPOINT_COUNT = 4  # 회원가입/로그인/토큰갱신/로그아웃
 _MAX_ENDPOINT_SOFT_CAP = 36
@@ -49,6 +52,24 @@ WORKER_SYSTEM = "JSON만 출력하세요. 설명·인사말·마크다운 코드
 MANAGER_SYSTEM = """당신은 시니어 백엔드 아키텍트 겸 API manager입니다.
 JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."""
 
+TARGETED_REPAIR_PROMPT = """현재 API 명세에서 검증 피드백이 지적한 엔드포인트만 수정하세요.
+문제없는 엔드포인트는 절대 다시 작성하거나 삭제하지 마세요.
+patches에는 수정된 엔드포인트 전체 객체를 넣고 method와 path를 식별자로 사용하세요.
+피드백에 [STRUCTURED_REPAIR_TARGETS]가 있으면 artifactKey와 featureId가 일치하는 항목만 패치하세요.
+각 patch는 기존 endpoint의 featureId와 action을 반드시 보존하거나 명시하세요.
+새 엔드포인트가 정말 필요한 경우에만 추가하세요.
+JSON만 출력하세요.
+
+[검증 피드백]
+{feedback}
+
+[현재 API 명세]
+{api_spec}
+
+출력 형식:
+{{"patches": [{{"method":"PATCH","path":"/api/v1/example","description":"...","authRequired":true,"requestBody":"...","successResponse":"...","errorCodes":"..."}}]}}
+"""
+
 PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
 아래 지시사항과 컨텍스트를 바탕으로, **담당 기능들**에 필요한 REST API 엔드포인트 목록(스켈레톤)을
 설계하세요. 상세 스펙(requestBody/successResponse/errorCodes)은 이후 단계에서 채울 것이므로
@@ -59,13 +80,21 @@ PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
 - path에 한글, 공백, 괄호(), 콜론(:), 쉼표 등은 절대 사용 금지 — 기능명이 한글이어도
   의미를 압축한 영문 리소스명으로 직접 번역해서 사용 (예: "재료 등록(바코드 스캔)" 기능 → /api/v1/ingredients, 절대 /api/v1/재료-등록-(바코드-스캔) 처럼 쓰지 말 것)
 - 리소스별 CRUD 세트를 기계적으로 만들지 말고, 사용자의 핵심 워크플로우를 수행하는 엔드포인트만 설계
-- 담당 기능 하나당 대표 엔드포인트 1개를 우선 만들고, 꼭 필요한 경우에만 2개까지 확장
-- 목록/상세/대시보드/히스토리처럼 비슷한 조회 API는 하나의 overview 또는 query parameter로 통합
-- description은 반드시 "기능명: 설명" 형태로 시작해 어느 기능에 대응하는지 드러낼 것
+- 기능 목록에 생성·조회·수정·삭제·취소·신청·신청취소 등 서로 다른 행동이 있으면 각 행동에 대응하는 endpoint를 별도로 설계
+- 한 endpoint의 description에 여러 행동을 나열하여 다른 endpoint를 대체하지 말 것
+- 목록/상세/대시보드/히스토리처럼 비슷한 조회 API만 overview 또는 query parameter로 통합
+- description은 반드시 "기능명: 행동 — 설명" 형태로 시작해 어느 기능의 어떤 행동에 대응하는지 드러낼 것
+- Registry의 featureId를 각 endpoint skeleton에 반드시 그대로 넣고, action도 반드시 기록하세요. 하나의 endpoint는 하나의 featureId/action만 담당할 것
+- Registry의 각 apiContract 항목은 누락 없이 1:1로 계획에 반영하세요. Registry에 계약이 있으면 새 해석보다 method/path/featureId/action 계약을 우선하세요.
+- 모든 plan 항목은 featureId와 action을 가져야 하며, featureId 없는 endpoint는 출력하지 마세요. 계약을 만족시키는 endpoint가 부족하면 다른 기능과 합치지 말고 누락된 endpoint를 추가하세요.
+- 상태 변경 endpoint는 정상 상태 전이, 선행 조건, 권한, 중복·기간·정원 초과 오류를 반영
 - 목록 조회 엔드포인트는 페이지네이션이 필요함을 description에 명시
 - 담당 기능은 {feature_count}개입니다. 권장 엔드포인트 수는 {min_endpoints}개 이상, {max_endpoints}개 이하입니다
 - {max_endpoints}개를 넘기지 마세요. 초과가 필요하면 낮은 우선순위 CRUD/조회 파생 API를 합치거나 제외하세요
 - 담당 기능 밖의 엔드포인트는 만들지 마세요 (다른 담당자가 설계합니다)
+- 출력 직전에 담당 기능을 하나씩 대조하세요. 각 기능에 최소 1개의 endpoint가 있어야 하며,
+  기능명에 독립 행동이 여러 개 포함되면 각 행동의 endpoint가 모두 있어야 합니다.
+- 기존 endpoint를 설명만 고쳐서 여러 행동을 커버한 것으로 간주하지 마세요. 누락 행동은 별도 method/path로 추가하세요.
 {existing_note}
 응답 형식 (JSON만):
 {{
@@ -73,6 +102,8 @@ PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
     {{
       "method": "GET 또는 POST 또는 PUT 또는 DELETE 또는 PATCH",
       "path": "/api/v1/영문-리소스명 (한글 금지, 예: /api/v1/ingredients)",
+      "featureId": "PM Registry의 featureId",
+      "action": "Registry apiContract의 action",
       "description": "기능명: 이 API가 하는 일 한 줄 설명",
       "authRequired": true 또는 false
     }}
@@ -85,8 +116,14 @@ PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
 컨텍스트 (DB 스키마 포함):
 {context}
 
+PM 기능 계약 Registry (각 featureId/action의 apiContract를 빠짐없이 반영):
+{feature_registry}
+
 담당 기능 목록 ({feature_count}개):
 {feature_str}
+
+PRD 요구사항 문서 (Registry와 충돌하면 Registry의 featureId/action 계약을 우선):
+{prd_document}
 """
 
 _AUTH_RULE = (
@@ -110,6 +147,8 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
 아래 엔드포인트 스켈레톤 1개에 대한 상세 REST API 스펙을 JSON으로 작성하세요.
 
 담당 엔드포인트:
+- featureId: {feature_id}
+- action: Registry 계약의 action
 - method: {method}
 - path: {path}
 - description: {description}
@@ -131,6 +170,8 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
 {{
   "method": "{method}",
   "path": "{path}",
+  "featureId": "{feature_id}",
+  "action": "Registry 계약의 action",
   "description": "{description}",
   "authRequired": {auth_required},
   "parameters": [
@@ -151,8 +192,13 @@ MANAGER_REVIEW_PROMPT = """아래는 sub-agent들이 작성한 API 엔드포인�
 {endpoints_json}
 =================
 
+=== PM 기능 계약 (source of truth) ===
+{feature_registry}
+=====================================
+
 === 검증 기준 ===
 - 기능 목록의 모든 기능에 대응하는 엔드포인트가 존재하는가?
+- 각 기능의 생성·조회·수정·삭제·취소·신청·확정 등 독립 행동이 모두 별도 endpoint로 존재하는가?
 - path가 서로 중복되지 않는가?
 - requestBody/successResponse/errorCodes가 비어있거나 placeholder가 남아있지 않은가?
 - DB 스키마(컨텍스트)와 필드명이 어긋나지 않는가?
@@ -186,6 +232,7 @@ class _ApiGraphState(TypedDict):
     api_spec: str
     prd_issues: str
     ctx: dict
+    generation_blocker: str
 
 
 class ApiAgent:
@@ -217,7 +264,13 @@ class ApiAgent:
 
         context = state.context_prompt or ""
         instruction = state.api_instruction or ""
-        feature_str = "- " + "\n- ".join(state.feature_list) if state.feature_list else "(기능 목록 없음)"
+        source_registry = normalize_feature_registry(
+            state.feature_registry, state.feature_list, preserve_extra=True,
+        )
+        registry_features = [str(item.get("name")) for item in source_registry if item.get("name")]
+        scoped_features = backend_features(registry_features or state.feature_list)
+        feature_str = "- " + "\n- ".join(scoped_features) if scoped_features else "(API 대상 기능 없음)"
+        registry = [item for item in source_registry if item.get("name") in scoped_features]
 
         graph_input = {
             "plan": [],
@@ -229,29 +282,133 @@ class ApiAgent:
                 "context": context,
                 "instruction": instruction,
                 "feature_str": feature_str,
-                "feature_list": state.feature_list,
-                "max_endpoints": _endpoint_soft_cap(len(state.feature_list), include_auth=True),
+                "feature_list": scoped_features,
+                "feature_registry": registry_text(registry),
+                "prd_document": state.prd_document or "{}",
+                "max_endpoints": _endpoint_soft_cap(len(scoped_features), include_auth=True),
                 "dump": dump,
             },
+            "generation_blocker": "",
         }
 
         try:
             result = await self._graph.ainvoke(graph_input)
-            api_spec = result["api_spec"]
+            blocker = str(
+                result.get("generation_blocker") or graph_input["ctx"].get("generation_blocker") or ""
+            ).strip()
+            if not blocker and not try_parse_json(result.get("api_spec")):
+                blocker = "API_GENERATION_BLOCKER: upstream API 응답 후 유효한 산출물이 생성되지 않았습니다"
+            if blocker:
+                api_spec = json.dumps(
+                    {
+                        "endpoints": _registry_fallback_plan(registry),
+                        "authentication": _AUTHENTICATION_DESC,
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                api_spec = result["api_spec"]
             prd_issues = result.get("prd_issues", "")
         except Exception as e:
             logger.error("API 에이전트 실패: %s", e)
+            blocker = f"API_GENERATION_BLOCKER: upstream API 호출 실패 ({type(e).__name__}: {e})"
             return state.copy(
                 api_spec="{}",
+                generation_blockers=[*state.generation_blockers, blocker],
+                qa_api_blockers=[*state.qa_api_blockers, blocker],
+                qa_approved=False,
                 status_message=f"API 에이전트 실패: {e}",
             )
+
+        # Graph worker 결과를 최종 산출물로 채택하기 직전에 계약을 다시 투영한다.
+        # 병렬 worker 병합이나 manager patch가 featureId를 잃어도 Registry 계약이
+        # 단일 기준이 되도록 보정하고, 계약 밖 orphan endpoint는 남기지 않는다.
+        parsed_spec = try_parse_json(api_spec)
+        if isinstance(parsed_spec, dict) and isinstance(parsed_spec.get("endpoints"), list):
+            endpoints = _normalize_endpoints(parsed_spec["endpoints"])
+            endpoints = _ensure_contract_endpoints(endpoints, registry)
+            endpoints = _annotate_feature_ids(endpoints, registry)
+            endpoints = [ep for ep in endpoints if isinstance(ep, dict) and str(ep.get("featureId") or "").strip()]
+            parsed_spec["endpoints"] = _normalize_endpoints(endpoints)
+            api_spec = json.dumps(parsed_spec, ensure_ascii=False)
 
         logger.info("API 에이전트 완료")
         return state.copy(
             api_spec=api_spec,
             prd_feedback_from_api=prd_issues,
+            generation_blockers=(
+                [*state.generation_blockers, blocker] if blocker else state.generation_blockers
+            ),
+            qa_api_blockers=(
+                [*state.qa_api_blockers, blocker] if blocker else state.qa_api_blockers
+            ),
+            qa_approved=False if blocker else state.qa_approved,
             status_message="API 에이전트 완료 — API 스펙 생성",
         )
+
+    async def repair(self, state: PipelineState, feedback: str, dump=None) -> PipelineState:
+        """기존 API 명세를 보존하고 검증 피드백에 해당하는 endpoint만 patch한다."""
+        current = try_parse_json(state.api_spec)
+        if not isinstance(current, dict) or not isinstance(current.get("endpoints"), list):
+            blocker = "TARGETED_REPAIR_BLOCKER: API 기존 산출물이 없어 전체 재생성을 차단했습니다"
+            logger.error(blocker)
+            return state.copy(
+                prd_feedback_from_api=blocker,
+                qa_api_blockers=[*state.qa_api_blockers, blocker],
+                qa_approved=False,
+                status_message="API targeted repair 차단 — 기존 산출물 없음",
+            )
+
+        prompt = TARGETED_REPAIR_PROMPT.format(
+            feedback=str(feedback or "")[:8000],
+            api_spec=json.dumps(current, ensure_ascii=False),
+        )
+        try:
+            raw = await self._call(prompt, max_tokens=7000, system=MANAGER_SYSTEM)
+            if dump:
+                dump.log_raw("API_TARGETED_REPAIR", 1, raw)
+            result = try_parse_json(raw)
+            patches = result.get("patches") if isinstance(result, dict) else None
+            if not isinstance(patches, list) or not patches:
+                logger.warning("API targeted repair — 유효한 patches 없음, 원본 유지")
+                return state
+
+            by_key = {
+                (str(ep.get("method", "GET")).upper(), str(ep.get("path", ""))): ep
+                for ep in current["endpoints"] if isinstance(ep, dict)
+            }
+            applied = 0
+            for patch in patches:
+                if not isinstance(patch, dict):
+                    continue
+                patch = _normalize_endpoint_keys(dict(patch))
+                method = str(patch.get("method", "GET")).upper()
+                path = str(patch.get("path", ""))
+                if not path:
+                    continue
+                patch["method"] = method
+                key = (method, path)
+                by_key[key] = {**by_key[key], **patch} if key in by_key else patch
+                applied += 1
+
+            if not applied:
+                logger.warning("API targeted repair — 적용 가능한 endpoint 없음, 원본 유지")
+                return state
+            registry = normalize_feature_registry(
+                state.feature_registry, state.feature_list, preserve_extra=True,
+            )
+            endpoints = _normalize_endpoints(list(by_key.values()))
+            endpoints = _annotate_feature_ids(endpoints, registry)
+            repaired = {**current, "endpoints": _normalize_endpoints(endpoints)}
+            logger.info("API targeted repair — %d개 endpoint만 패치", applied)
+            return state.copy(
+                api_spec=json.dumps(repaired, ensure_ascii=False),
+                prd_feedback_from_api="",
+                status_message="API 에이전트 완료 — 지적 endpoint만 수정",
+            )
+        except Exception as e:
+            logger.warning("API targeted repair 실패 — 원본 유지: %s", e)
+            return state
 
     async def _plan_batch(
         self, ctx: dict, batch: list[str], batch_idx: int, with_auth: bool,
@@ -273,11 +430,13 @@ class ApiAgent:
             max_endpoints=max_endpoints,
             auth_rule=_AUTH_RULE if with_auth else "",
             existing_note=_existing_paths_note(existing_paths),
+            feature_registry=ctx.get("feature_registry", "[]"),
+            prd_document=ctx.get("prd_document", "{}"),
         )
         label = f"API_MANAGER_PLAN_{batch_idx}"
 
         best: list[dict] = []
-        for attempt in range(3):
+        for attempt in range(1):
             raw = await self._call(
                 prompt, max_tokens=8192, system=MANAGER_SYSTEM,
                 temperature=_PLAN_TEMPERATURE,
@@ -340,7 +499,8 @@ class ApiAgent:
         # 배치들이 서로 모르는 채 같은 리소스를 설계해 병합 시 중복 제거로 개수가 깎인다.
         # 흔적이 없는 기능(uncovered)뿐 아니라 엔드포인트가 부족한 기능(undercovered)까지
         # 모아, 이미 설계된 경로를 알려주고 '없는 것만' 추가로 받아낸다. 최대 2라운드.
-        for round_ in range(2):
+        # 누락 보충은 Phase3 targeted repair로 이관한다.
+        for round_ in range(0):
             descriptions = [ep.get("description", "") for ep in plan]
             missing = uncovered_features(feature_list, descriptions)
             thin = undercovered_features(feature_list, descriptions, _ENDPOINTS_PER_FEATURE)
@@ -362,9 +522,15 @@ class ApiAgent:
                 break
             plan = merged
 
+        generation_blocker = ""
+        registry_items = _registry_items(ctx.get("feature_registry", "[]"))
         if not plan:
-            logger.error("API manager_plan 최종 실패 — feature_list 기반 fallback 스켈레톤 사용")
-            plan = self._fallback_plan(feature_list)["plan"]
+            generation_blocker = (
+                "API_GENERATION_BLOCKER: upstream API 응답 실패로 Registry 계약 기반 fallback을 사용했습니다"
+            )
+            logger.error("%s", generation_blocker)
+            ctx["generation_blocker"] = generation_blocker
+            plan = _registry_fallback_plan(registry_items)
         elif _invalid_paths(plan):
             logger.warning("API manager_plan — 경로 형식 오류가 남아있어 강제 살균 적용")
             plan = _sanitize_plan_paths(plan)
@@ -373,8 +539,14 @@ class ApiAgent:
         if len(plan) < min_endpoints:
             logger.warning("API manager_plan — 엔드포인트 %d/%d개로 목표 미달", len(plan), min_endpoints)
 
+        plan = _ensure_contract_endpoints(plan, registry_items)
+        plan = _annotate_feature_ids(plan, registry_items)
         logger.info("API manager_plan 완료 — 엔드포인트 %d개 계획 (목표 %d개, soft cap %d개)", len(plan), min_endpoints, max_endpoints)
-        return {"plan": plan, "authentication": _AUTHENTICATION_DESC}
+        return {
+            "plan": plan,
+            "authentication": _AUTHENTICATION_DESC,
+            "generation_blocker": generation_blocker,
+        }
 
     def _fallback_plan(self, feature_list: list[str]) -> dict:
         plan = [
@@ -389,6 +561,8 @@ class ApiAgent:
         return {"plan": plan, "authentication": "JWT Bearer 토큰"}
 
     def _dispatch(self, state: dict) -> list[Send]:
+        if state.get("generation_blocker"):
+            return []
         ctx = state["ctx"]
         sends = []
         for skeleton in state["plan"]:
@@ -406,6 +580,7 @@ class ApiAgent:
         auth_required = bool(skeleton.get("authRequired", True))
 
         prompt = ENDPOINT_SPEC_PROMPT.format(
+            feature_id=skeleton.get("featureId", "미지정"),
             method=method,
             path=path,
             description=description,
@@ -415,7 +590,7 @@ class ApiAgent:
 
         label = f"API_ENDPOINT_{method}_{path}"
         data = None
-        for attempt in range(3):
+        for attempt in range(1):
             raw = await self._call(prompt, max_tokens=1200, system=WORKER_SYSTEM)
             if dump:
                 dump.log_raw(label, attempt + 1, raw)
@@ -437,6 +612,7 @@ class ApiAgent:
                 "path": path,
                 "description": description,
                 "authRequired": auth_required,
+                "featureId": skeleton.get("featureId", ""),
                 "requestBody": "없음",
                 "successResponse": "success: boolean",
                 "errorCodes": "500 — 서버 오류",
@@ -446,6 +622,8 @@ class ApiAgent:
             data.setdefault("path", path)
             data.setdefault("description", description)
             data.setdefault("authRequired", auth_required)
+            if skeleton.get("featureId"):
+                data["featureId"] = skeleton["featureId"]
             if not data.get("requestBody"):
                 data["requestBody"] = "없음"
             if not data.get("successResponse"):
@@ -459,8 +637,24 @@ class ApiAgent:
         ctx = state["ctx"]
         endpoints = state["endpoints"]
         authentication = state["authentication"]
-        dump = ctx.get("dump")
-        prd_issues = ""
+        # Review는 전체 endpoint를 다시 LLM에 보내는 생성 단계가 아니다.
+        # 계약/경로/필수 필드 보강은 결정론적으로 처리하고 남은 결함은 Phase3가
+        # featureId 단위 targeted repair 대상으로 전달한다.
+        registry_items = _registry_items(ctx.get("feature_registry", "[]"))
+        endpoints = _annotate_feature_ids(
+            _ensure_contract_endpoints(
+                _normalize_endpoints(_sanitize_plan_paths(endpoints)),
+                registry_items,
+            ),
+            registry_items,
+        )
+        return {
+            "api_spec": json.dumps(
+                {"endpoints": endpoints, "authentication": authentication},
+                ensure_ascii=False,
+            ),
+            "prd_issues": "",
+        }
 
         missing = uncovered_features(ctx["feature_list"], [ep.get("description", "") for ep in endpoints if isinstance(ep, dict)])
         if missing:
@@ -471,6 +665,7 @@ class ApiAgent:
             feature_str=ctx["feature_str"],
             context=ctx["context"],
             missing_note=missing_features_note(missing, "API 스펙"),
+            feature_registry=ctx.get("feature_registry", "[]"),
         )
 
         try:
@@ -495,8 +690,17 @@ class ApiAgent:
                         logger.warning("API manager 리뷰 — 패치 값이 dict가 아니어서 무시: %s", list(dropped))
                     if valid_patches:
                         logger.info("API manager 리뷰 — %d개 엔드포인트 패치: %s", len(valid_patches), list(valid_patches.keys()))
-                        by_key = {f"{ep.get('method')} {ep.get('path')}": ep for ep in endpoints}
-                        by_key.update(valid_patches)
+                        by_key = {
+                            (str(ep.get("method", "GET")).upper(), _canonical_api_path(ep.get("path"))): ep
+                            for ep in endpoints if isinstance(ep, dict)
+                        }
+                        for patch_key, patch in valid_patches.items():
+                            method, _, raw_path = str(patch_key).partition(" ")
+                            method = str(patch.get("method") or method or "GET").upper()
+                            path = _output_api_path(patch.get("path") or raw_path)
+                            key = (method, _canonical_api_path(path))
+                            existing = by_key.get(key, {})
+                            by_key[key] = {**existing, **patch, "method": method, "path": path}
                         endpoints = list(by_key.values())
                 else:
                     logger.info("API manager 리뷰 — 패치 없음, 원본 유지")
@@ -509,18 +713,30 @@ class ApiAgent:
             endpoints = _sanitize_plan_paths(endpoints)
 
         # 패치로 유입된 불완전 엔드포인트(method/path만 있는 경우 등)에 필수 필드 기본값 보강
+        endpoints = _annotate_feature_ids(endpoints, _registry_items(ctx.get("feature_registry", "[]")))
         endpoints = _normalize_endpoints(endpoints)
         endpoints = _prune_plan(
             endpoints,
             ctx["feature_list"],
             int(ctx.get("max_endpoints") or _endpoint_soft_cap(len(ctx["feature_list"]), include_auth=True)),
         )
+        # Registry 계약 endpoint는 soft cap 이후에도 보존한다. cap은 파생 endpoint를
+        # 줄이기 위한 것이며 PM이 명시한 최소 계약을 삭제하는 용도가 아니다.
+        endpoints = _ensure_contract_endpoints(
+            endpoints, _registry_items(ctx.get("feature_registry", "[]"))
+        )
+        # 계약 endpoint를 cap/patch 뒤에 다시 매핑한다. 새로 주입된 endpoint와
+        # manager patch가 featureId를 잃어 QA에서 추적 불가능해지는 것을 방지한다.
+        endpoints = _annotate_feature_ids(
+            endpoints, _registry_items(ctx.get("feature_registry", "[]"))
+        )
+        endpoints = _normalize_endpoints(endpoints)
 
         api_spec = json.dumps({"endpoints": endpoints, "authentication": authentication}, ensure_ascii=False)
         return {"api_spec": api_spec, "prd_issues": prd_issues}
 
     async def _call(self, user_prompt: str, max_tokens: int, system: str, temperature: float = _TEMPERATURE) -> str:
-        for attempt in range(3):
+        for attempt in range(1):
             try:
                 async def request():
                     return await self._client.chat.completions.create(
@@ -584,8 +800,23 @@ def _prune_plan(plan: list[dict], feature_list: list[str], max_endpoints: int) -
     if len(unique) <= max_endpoints:
         return unique
     indexed = list(enumerate(unique))
-    indexed.sort(key=lambda item: (*_endpoint_priority(item[1], feature_list), item[0]))
-    selected = sorted(indexed[:max_endpoints], key=lambda item: item[0])
+    # soft cap 적용 전에 기능별 대표 endpoint를 먼저 보존한다. 그렇지 않으면
+    # 인증/저우선순위 정렬 때문에 특정 기능의 유일한 endpoint가 잘릴 수 있다.
+    required: list[tuple[int, dict]] = []
+    remaining: list[tuple[int, dict]] = []
+    for item in indexed:
+        ep_text = json.dumps(item[1], ensure_ascii=False)
+        if any(not strictly_uncovered_features([feature], [ep_text]) for feature in feature_list):
+            required.append(item)
+        else:
+            remaining.append(item)
+    if len(required) > max_endpoints:
+        required = sorted(required, key=lambda item: (*_endpoint_priority(item[1], feature_list), item[0]))[:max_endpoints]
+        selected = required
+    else:
+        remaining.sort(key=lambda item: (*_endpoint_priority(item[1], feature_list), item[0]))
+        selected = required + remaining[:max_endpoints - len(required)]
+    selected = sorted(selected, key=lambda item: item[0])
     pruned = [ep for _, ep in selected]
     logger.warning("API manager_plan — soft cap 적용: %d개 → %d개", len(unique), len(pruned))
     return pruned
@@ -602,19 +833,179 @@ def _invalid_paths(plan: list) -> list[str]:
     return bad
 
 
+def _canonical_api_path(path: str) -> str:
+    """Registry 계약(/tools)과 실제 API 경로(/api/v1/tools)를 같은 키로 비교한다."""
+    value = "/" + str(path or "").strip().lstrip("/")
+    value = re.sub(r"^/api/v1", "", value, flags=re.IGNORECASE) or "/"
+    return value.rstrip("/") or "/"
+
+
+def _output_api_path(path: str) -> str:
+    """Return the single public path form used by generated API specs."""
+    value = "/" + str(path or "").strip().lstrip("/")
+    value = re.sub(r"^/api/v1/api(?:/|$)", "/api/v1/", value, flags=re.IGNORECASE)
+    if not re.match(r"^/api/v1(?:/|$)", value, flags=re.IGNORECASE):
+        value = "/api/v1/" + value.lstrip("/")
+    return re.sub(r"/{2,}", "/", value).rstrip("/") or "/api/v1"
+
+
+def _route_shape(path: str) -> str:
+    """Compare REST routes independent of LLM-chosen parameter names."""
+    return re.sub(r"\{[^}]+\}", "{}", _canonical_api_path(path))
+
+
+def _annotate_feature_ids(plan: list, registry: list[dict] | None) -> list:
+    """모든 endpoint에 Registry의 featureId를 결정론적으로 부착한다.
+
+    계약 경로가 있는 endpoint는 exact match를 사용하고, LLM이 새 supporting endpoint를
+    추가한 경우에는 설명/기능명/action을 보조 기준으로 사용한다. Registry 밖의 임의
+    featureId는 남기지 않아 QA가 추적 불가능한 endpoint를 즉시 발견할 수 있게 한다.
+    """
+    contracts: dict[tuple[str, str], str] = {}
+    valid_ids: set[str] = set()
+    names: list[tuple[str, str, set[str]]] = []
+    route_prefixes: list[tuple[str, str]] = []
+    for item in registry or []:
+        feature_id = str(item.get("featureId") or item.get("id") or "").strip()
+        if feature_id:
+            valid_ids.add(feature_id)
+            terms = {str(item.get("name") or "").casefold()}
+            terms.update(str(action).casefold() for action in item.get("actions") or [])
+            names.append((feature_id, str(item.get("name") or ""), {term for term in terms if term}))
+        for contract in item.get("apiContract") or item.get("api") or []:
+            if not isinstance(contract, dict) or not feature_id:
+                continue
+            method = str(contract.get("method") or "GET").upper()
+            path = _canonical_api_path(contract.get("path"))
+            if path:
+                contracts[(method, path)] = feature_id
+                route_prefixes.append((path.rsplit("/", 1)[0] or "/", feature_id))
+    for ep in plan:
+        if not isinstance(ep, dict):
+            continue
+        ep["path"] = _output_api_path(ep.get("path"))
+        key = (str(ep.get("method") or "GET").upper(), _canonical_api_path(ep.get("path")))
+        if key in contracts:
+            ep["featureId"] = contracts[key]
+            continue
+        current = str(ep.get("featureId") or "").strip()
+        if current not in valid_ids:
+            current = ""
+        haystack = " ".join(str(ep.get(key) or "") for key in ("description", "summary", "operationId", "action")).casefold()
+        candidates = [fid for fid, _name, terms in names if any(term in haystack for term in terms)]
+        if not current:
+            route = _canonical_api_path(ep.get("path"))
+            candidates.extend(fid for prefix, fid in route_prefixes if route.startswith(prefix + "/"))
+        if not current and len(candidates) == 1:
+            current = candidates[0]
+        if not current and len(valid_ids) == 1:
+            current = next(iter(valid_ids))
+        if current:
+            ep["featureId"] = current
+        else:
+            # Never assign an unrelated feature just to silence QA. An orphan
+            # endpoint must remain visible as a mapping blocker for repair.
+            ep.pop("featureId", None)
+    return plan
+
+
+def _registry_items(raw: str | list[dict] | None) -> list[dict]:
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    parsed = try_parse_json(raw or "[]")
+    return parsed if isinstance(parsed, list) else []
+
+
+def _registry_fallback_plan(registry: list[dict] | None) -> list[dict]:
+    """Upstream 장애 시에도 Registry 계약만 투영하고 임의 endpoint는 만들지 않는다."""
+    plan: list[dict] = []
+    for item in registry or []:
+        if not isinstance(item, dict):
+            continue
+        feature_id = str(item.get("featureId") or item.get("id") or "").strip()
+        name = str(item.get("name") or feature_id).strip()
+        for contract in item.get("apiContract") or item.get("api") or []:
+            if not isinstance(contract, dict) or not feature_id:
+                continue
+            method = str(contract.get("method") or "GET").upper()
+            path = _output_api_path(contract.get("path"))
+            if not path or path == "/api/v1":
+                continue
+            action = str(contract.get("action") or "manage")
+            plan.append({
+                "featureId": feature_id,
+                "action": action,
+                "method": method,
+                "path": path,
+                "description": f"{name}: {action} — Registry 계약 fallback",
+                "authRequired": not path.startswith("/api/v1/auth/"),
+                "requestBody": "계약 기반 요청 본문",
+                "successResponse": "계약 기반 성공 응답",
+                "errorCodes": "400 — 요청 오류; 500 — 서버 오류",
+            })
+    return _normalize_endpoints(plan)
+
+
+def _ensure_contract_endpoints(plan: list, registry: list[dict] | None) -> list:
+    """PM이 명시한 endpoint는 LLM plan 누락 여부와 무관하게 최종 plan에 보존한다."""
+    existing = {
+        (str(ep.get("method", "GET")).upper(), _canonical_api_path(ep.get("path"))): ep
+        for ep in plan if isinstance(ep, dict)
+    }
+    existing_shapes = {
+        (method, _route_shape(path)): ep for (method, path), ep in existing.items()
+    }
+    for item in registry or []:
+        fid = str(item.get("featureId") or item.get("id") or "")
+        name = str(item.get("name") or fid)
+        for contract in item.get("apiContract") or []:
+            if not isinstance(contract, dict):
+                continue
+            method = str(contract.get("method", "GET")).upper()
+            path = str(contract.get("path", "")).strip()
+            if not path:
+                continue
+            path = _output_api_path(path)
+            key = (method, _canonical_api_path(path))
+            shape_key = (method, _route_shape(path))
+            if key in existing:
+                existing[key]["featureId"] = fid
+                existing[key]["action"] = contract.get("action") or existing[key].get("action", "manage")
+                continue
+            if shape_key in existing_shapes:
+                endpoint = existing_shapes[shape_key]
+                endpoint["path"] = path
+                endpoint["featureId"] = fid
+                endpoint["action"] = contract.get("action") or endpoint.get("action", "manage")
+                existing[key] = endpoint
+                continue
+            plan.append({
+                "featureId": fid, "method": method, "path": path,
+                "description": f"{name}: {contract.get('action', '계약된 행동')} — PM 계약 endpoint",
+                "authRequired": True,
+            })
+            existing[key] = plan[-1]
+            existing_shapes[shape_key] = plan[-1]
+    return plan
+
+
 def _sanitize_plan_paths(plan: list) -> list:
     """유효하지 않은 path를 ASCII 슬러그로 강제 변환 (재생성 3회 실패 시 최후 수단)."""
     seen: set[tuple[str, str]] = set()
     for i, ep in enumerate(plan):
         if not isinstance(ep, dict):
             continue
-        path = ep.get("path") or ""
-        if not _VALID_PATH_RE.match(path):
-            rest = path[len("/api/v1/"):] if path.startswith("/api/v1/") else path.lstrip("/")
+        path = str(ep.get("path") or "").strip()
+        path = re.sub(r"^/api/v1/api(?:/|$)", "/api/v1/", path, flags=re.I)
+        if re.match(r"^/api/(?!v1/)", path, flags=re.I):
+            path = "/api/v1/" + path[5:]
+        if not path.lower().startswith("/api/v1/") or not _VALID_PATH_RE.match(path):
+            rest = path[len("/api/v1/"):] if path.lower().startswith("/api/v1/") else path.lstrip("/")
             slug = _PATH_STRIP_RE.sub("-", rest)
             slug = _PATH_DASH_COLLAPSE_RE.sub("-", slug).strip("-").lower()
             path = f"/api/v1/{slug}" if slug else f"/api/v1/resource-{i}"
-            ep["path"] = path
+        path = re.sub(r"/{2,}", "/", path)
+        ep["path"] = path
         method = ep.get("method", "GET")
         key = (method, ep["path"])
         n = 2
@@ -636,7 +1027,7 @@ def _normalize_endpoint_keys(data: dict) -> dict:
 
 # EXAONE이 엔드포인트 스펙 대신 자기 추론/메타 설명을 필드에 흘려넣을 때 나타나는 어휘
 _ENDPOINT_META_PHRASES = ("커버리지", "누락", "패치", "오타", "결정론", "엔드포인트", "오류 있음", "삭제됨", "수정해야")
-_SPEC_FIELD_MAX = 400  # 정상 스펙 한 필드의 상한 (초과 시 서술/추론 유출로 간주)
+_SPEC_FIELD_MAX = 1200  # 정상 스펙 한 필드의 상한; 긴 도메인 응답을 오탐 삭제하지 않음
 
 
 def _is_garbage_endpoint(ep: dict) -> bool:
@@ -648,7 +1039,7 @@ def _is_garbage_endpoint(ep: dict) -> bool:
         return True
     for f in ("description", "requestBody", "successResponse", "errorCodes"):
         v = str(ep.get(f) or "")
-        if len(v) > _SPEC_FIELD_MAX or '\n' in v:  # 여러 줄/과도 길이 = 스펙 아님
+        if len(v) > _SPEC_FIELD_MAX:
             return True
     desc = str(ep.get("description") or "")
     if sum(p in desc for p in _ENDPOINT_META_PHRASES) >= 2:
@@ -796,7 +1187,15 @@ def _normalize_endpoints(endpoints: list) -> list:
         ep["successResponse"] = _clean_spec_field(ep.get("successResponse"), "success: boolean")
         ep["errorCodes"] = _clean_spec_field(ep.get("errorCodes"), "401 — 인증 실패, 500 — 서버 오류")
         out.append(ep)
-    return _dedupe_semantic_endpoints(out)
+    deduped = _dedupe_semantic_endpoints(out)
+    return sorted(
+        deduped,
+        key=lambda ep: (
+            str(ep.get("featureId") or "~"),
+            str(ep.get("method") or "GET"),
+            str(ep.get("path") or ""),
+        ),
+    )
 
 
 def _semantic_endpoint_key(ep: dict) -> tuple[str, str] | None:
@@ -810,15 +1209,45 @@ def _semantic_endpoint_key(ep: dict) -> tuple[str, str] | None:
     desc = str(ep.get("description") or "").lower()
     text = f"{path} {desc}"
 
+    # featureId가 있으면 서로 다른 계약을 의미 중복으로 합치지 않는다.
+    feature_id = str(ep.get("featureId") or "").strip()
+    if feature_id:
+        return ("feature", f"{feature_id}:{method}:{path}")
+
     if "/auth/" in path:
-        if any(token in text for token in ("signup", "register", "registration", "회원가입", "가입")):
+        # 인증 공통 prefix만으로 분류하지 않는다. 이메일 인증·OAuth callback·비밀번호
+        # 재설정은 signup/signin/refresh와 별도 계약이며, dedupe에서 삭제되면 안 된다.
+        # 경로에 동작이 명시되어 있으면 LLM description보다 우선한다.
+        if "/refresh" in path:
+            return ("auth", "refresh")
+        if any(token in path for token in ("/logout", "/signout")):
+            return ("auth", "signout")
+        if any(token in path for token in ("/verify", "/verification")):
+            return ("auth", "verify_email")
+        if any(token in path for token in ("/signup", "/register", "/registrations")):
             return ("auth", "signup")
+        if any(token in path for token in ("/login", "/signin")):
+            return ("auth", "signin")
+        if any(token in path for token in ("/verify", "/verification")) or any(token in text for token in ("verify email", "email verification", "이메일 인증", "인증 코드")):
+            return ("auth", "verify_email")
+        if "/oauth/" in path or "oauth" in text:
+            return ("auth", "oauth_callback")
+        if "password-reset" in path or any(token in text for token in ("password reset", "비밀번호 재설정", "비밀번호 찾기")):
+            # 요청과 확인은 서로 다른 계약이다. path/설명에 confirm이 있으면
+            # 첫 단계와 같은 semantic key를 쓰지 않아 후속 endpoint가 삭제되지 않는다.
+            suffix = "confirm" if any(token in text for token in ("confirm", "확인", "완료")) else "request"
+            return ("auth", f"password_reset_{suffix}")
+        if any(token in path for token in ("/signup", "/register", "/registrations")) or any(token in text for token in ("signup", "register", "registration", "회원가입", "가입")):
+            return ("auth", "signup")
+        # logout 설명에 '토큰'이 함께 들어가도 refresh로 분류하지 않는다.
+        if any(token in path for token in ("/logout", "/signout")) or any(
+            token in text for token in ("signout", "logout", "sessions/current", "로그아웃")
+        ):
+            return ("auth", "signout")
+        if any(token in path for token in ("/refresh", "/token/refresh")) or any(token in text for token in ("refresh", "token-refresh", "토큰 갱신", "갱신 토큰")):
+            return ("auth", "refresh")
         if any(token in text for token in ("signin", "login", "session", "로그인", "인증")) and method == "POST":
             return ("auth", "signin")
-        if any(token in text for token in ("signout", "logout", "sessions/current", "로그아웃")):
-            return ("auth", "signout")
-        if any(token in text for token in ("refresh", "token-refresh", "토큰", "갱신")):
-            return ("auth", "refresh")
 
     return None
 

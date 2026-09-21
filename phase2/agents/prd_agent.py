@@ -12,6 +12,55 @@ from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnect
 from phase2.json_utils import try_parse_json, has_suspicious_script
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
+from phase2.feature_registry import normalize_feature_registry, registry_text
+
+
+def attach_feature_ids(core_features, registry):
+    """PRD coreFeatures에 PM Registry의 안정적인 식별자를 보존한다."""
+    by_name = {str(item.get("name", "")).strip(): item for item in registry or [] if isinstance(item, dict)}
+    for feature in core_features or []:
+        if not isinstance(feature, dict):
+            continue
+        item = by_name.get(str(feature.get("name", "")).strip())
+        if item:
+            feature["featureId"] = str(item.get("featureId") or item.get("id") or "")
+    return core_features
+
+
+def ensure_registry_core_features(core_features, feature_hints, registry) -> list[dict]:
+    """Restore omitted PM core journeys without inventing new supporting features."""
+    items = [item for item in (core_features or []) if isinstance(item, dict)]
+    by_name = {
+        str(item.get("name") or "").strip().casefold(): item
+        for item in registry or [] if isinstance(item, dict) and item.get("name")
+    }
+    existing_ids = {
+        str(item.get("featureId") or item.get("id") or "").strip()
+        for item in items
+    }
+    existing_names = {str(item.get("name") or "").strip().casefold() for item in items}
+    for hint in feature_hints or []:
+        name = str(hint or "").strip()
+        if not name or name.casefold() in existing_names:
+            continue
+        contract = by_name.get(name.casefold(), {})
+        feature_id = str(contract.get("featureId") or contract.get("id") or "").strip()
+        if feature_id and feature_id in existing_ids:
+            continue
+        items.append({
+            "featureId": feature_id or None,
+            "name": name,
+            "description": f"사용자가 {name}을(를) 이용하면 시스템이 관련 정보를 처리하고 결과를 제공하여 핵심 업무를 완료할 수 있도록 지원합니다.",
+            "priority": "P0",
+            "actions": contract.get("actions") or ["manage"],
+            "apiContract": contract.get("apiContract") or [],
+            "dbContract": contract.get("dbContract") or {"tables": [], "foreignKeys": []},
+            "requirements": [f"사용자가 {name}을(를) 요청하면 시스템은 필요한 검증과 처리를 수행하고 완료 결과를 반환해야 합니다."],
+        })
+        if feature_id:
+            existing_ids.add(feature_id)
+        existing_names.add(name.casefold())
+    return items
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +69,7 @@ logger = logging.getLogger(__name__)
 # coreFeatures 생성 배치 크기 — 한 worker가 담당할 기능 수.
 # 기능 전체를 한 호출에 넣으면 출력이 잘려 3회 재생성이 모두 실패한다(실측 21개).
 _CORE_FEATURE_BATCH_SIZE = 5
+_CORE_FEATURE_MAX_COUNT = 8
 
 _SECTION_MIN_COUNTS: dict[str, dict[str, int]] = {
     "goalsKpi": {"kpi": 7},
@@ -61,6 +111,21 @@ sub-agent 7명이 작성한 PRD 섹션 초안을 검토하여, 기준 미달이�
 직접 교정본을 작성하세요. 문제 없는 섹션은 절대 건드리지 마세요.
 
 JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."""
+
+TARGETED_REPAIR_PROMPT = """현재 PRD에서 검증 피드백이 지적한 부분만 수정하세요.
+문제없는 섹션과 항목은 절대 다시 작성하거나 삭제하지 마세요.
+전체 PRD가 아니라 교체할 최상위 섹션만 patches에 넣으세요.
+JSON만 출력하세요.
+
+[검증 피드백]
+{feedback}
+
+[현재 PRD]
+{prd_document}
+
+출력 형식:
+{{"patches": {{"섹션명": "수정된 섹션 값"}}}}
+"""
 
 # 섹션별 프롬프트 — 기존 PART_1~3 프롬프트의 글자수/개수 기준을 그대로 유지
 SECTION_PROMPTS: dict[str, str] = {
@@ -144,26 +209,40 @@ JSON (아래 goals 3개·kpi 7개는 개수/형식 예시입니다 — 이 서�
 {rollback_section}
 
 아래 JSON 형식으로 PRD의 핵심기능 부분을 작성하세요.
-⚠️⭐ coreFeatures 배열은 반드시 정확히 {feature_count}개 — 아래 '기능 목록'의 각 기능마다 1:1로 대응하는 항목을 하나씩 만드세요. 여러 기능을 하나로 묶거나 빠뜨리지 마세요. ⭐
+⚠️⭐ coreFeatures는 아래 기능 힌트를 빠짐없이 반영하되, 기능 힌트에 없는 필수 사용자 여정도 projectPlan과 요구사항에서 보강하세요. 항목 수는 최소 {feature_count}개, 최대 8개이며, 서로 다른 사용자 행동은 별도 항목으로 작성하세요. 일반적인 인증·회원관리·알림·이력 기능은 Feature Spec Agent가 supporting 기능으로 보강하므로 coreFeatures에 과도하게 넣지 마세요. ⭐
+
+PM Feature Registry (featureId/actions/API/DB 계약의 기준):
+{feature_registry}
 
 ══ 필드별 최소 기준 (반드시 충족) ══
-▸ coreFeatures             : 정확히 {feature_count}개. 각 항목 name은 기능 목록의 각 기능명을 그대로(또는 거의 동일하게) 사용.
+▸ coreFeatures             : 최소 {feature_count}개, 최대 8개. 기능 힌트의 항목을 모두 포함하고, 서비스 성립에 필요한 핵심 여정을 추가.
 ▸ coreFeatures.description : 100자 이상. "사용자가 ~상황에서 ~을 하면 시스템이 ~을 수행하여 ~효과를 낸다" 구조.
 ▸ coreFeatures.requirements: 각 항목 60자 이상. "~할 때 → ~처리 → ~결과" 구조.
+▸ 각 기능은 하나의 사용자 행동 단위로 작성하세요. 생성·조회·수정·삭제·취소·신청을 한 항목에 묶지 마세요.
+▸ 각 requirements에는 역할, 선행 조건, 입력값, 정상 처리, 실패 조건, 상태 변화, 권한 범위를 포함하세요.
+▸ 각 기능 끝에 관련 API 행동과 DB 테이블/관계를 괄호로 명시하여 기능→API→DB 계약을 추적할 수 있게 하세요.
+▸ "소속 조직/동호회/팀"을 전제로 하면 단일 조직인지 다중 조직인지 명시하고, 다중 조직이면 조직과 membership 요구사항을 포함하세요.
+▸ 각 coreFeatures 항목에 반드시 featureId를 넣고 PM Feature Registry의 featureId를 그대로 복사하세요. 이름으로 새 ID를 만들거나 다른 기능의 ID를 재사용하지 마세요.
+▸ 각 항목의 apiContract와 dbContract는 Registry 값을 요약하거나 재해석하지 말고 그대로 반영하세요. apiContract에는 method/path/featureId/action을, dbContract에는 tables/foreignKeys를 포함하세요.
+▸ coreFeatures에는 projectPlan.priorities.must에 해당하는 P0 핵심 여정만 우선 배치하세요. supporting 기능은 Feature Spec Agent가 생성하므로 coreFeatures에 추가하지 마세요.
 
-⚠️ 출력하기 전에 coreFeatures 원소 수가 기능 목록 개수({feature_count}개)와 같은지 직접 세어 확인하세요.
+⚠️ 출력하기 전에 기능 힌트가 모두 포함됐는지, projectPlan의 목표를 실행하는 핵심 여정이 빠지지 않았는지 확인하세요.
 
-JSON (아래는 형식 예시 2개일 뿐 — 기능 목록의 모든 기능에 대해 정확히 {feature_count}개를 채우세요):
+JSON (아래는 형식 예시 2개일 뿐 — 기능 힌트와 요구사항에 맞는 모든 핵심 기능을 채우세요):
 {{
   "coreFeatures": [
-    {{"name":"기능 목록의 1번 기능명","description":"사용자가 특정 상황에서 이 기능을 사용하면 시스템이 해당 처리를 수행하여 구체적 효과를 내는 방식을 100자 이상으로 서술","priority":"P0","requirements":["특정 조건일 때 어떤 처리를 거쳐 어떤 결과를 내는지 60자 이상 서술"]}},
-    {{"name":"기능 목록의 2번 기능명","description":"두 번째 기능의 사용 상황·시스템 동작·효과를 100자 이상으로 서술","priority":"P1","requirements":["처리 조건 → 처리 → 결과를 60자 이상 서술"]}}
+    {{"featureId":"Registry의 featureId","name":"기능 목록의 1번 기능명","description":"사용자가 특정 상황에서 이 기능을 사용하면 시스템이 해당 처리를 수행하여 구체적 효과를 내는 방식을 100자 이상으로 서술","priority":"P0","actions":["create"],"apiContract":[{{"method":"POST","path":"/api/v1/resource","featureId":"Registry의 featureId","action":"create"}}],"dbContract":{{"tables":["resources"],"foreignKeys":[]}},"requirements":["특정 조건일 때 어떤 처리를 거쳐 어떤 결과를 내는지 60자 이상 서술"]}},
+    {{"featureId":"Registry의 featureId","name":"기능 목록의 2번 기능명","description":"두 번째 기능의 사용 상황·시스템 동작·효과를 100자 이상으로 서술","priority":"P0","actions":["read"],"apiContract":[{{"method":"GET","path":"/api/v1/resources","featureId":"Registry의 featureId","action":"read"}}],"dbContract":{{"tables":["resources"],"foreignKeys":[]}},"requirements":["처리 조건 → 처리 → 결과를 60자 이상 서술"]}}
   ]
 }}
 
 검증 체크리스트 (생성 후 스스로 확인):
-[ ] coreFeatures 항목 수가 기능 목록 개수({feature_count}개)와 정확히 일치하고 묶음 처리가 없는가?
+[ ] coreFeatures 항목 수가 최소 {feature_count}개이고 기능 힌트가 모두 포함되어 있는가?
 [ ] coreFeatures.requirements 각 항목이 60자 이상인가?
+[ ] 생성·수정·삭제·조회 행동이 서로 다른 기능 항목으로 분리되어 있는가?
+[ ] 각 기능에 관련 API 행동과 DB 엔티티가 연결되어 있는가?
+[ ] 모든 coreFeatures의 featureId가 Registry와 일치하는가?
+[ ] apiContract와 dbContract가 비어 있지 않고 Registry 계약을 그대로 반영하는가?
 
 사용자 요구사항: {user_query}
 기능 목록 (아래 {feature_count}개 기능 각각을 coreFeatures 1개 항목으로 작성):
@@ -272,7 +351,7 @@ _SECTION_CRITERIA = """- projectOverview: 50자 이상
 - background: 200자 이상, 수치마다 출처 표기
 - goals: 각 항목 60자 이상
 - kpi: 7개 이상, target은 "현재값 → 목표값" 형식
-- coreFeatures: featureList와 정확히 {feature_count}개 1:1 대응, description 100자 이상
+- coreFeatures: 기능 힌트를 모두 포함하고 8개 이하, description 100자 이상. PM projectPlan의 MUST/SHOULD/COULD/WONT와 MVP 범위를 반영
 - userPersonas: 정확히 3개
 - mvpScope: rationale 100자 이상
 - techStack: 각 레이어 선택 이유 2문장 이상
@@ -290,6 +369,8 @@ MANAGER_REVIEW_PROMPT = """아래는 sub-agent 7명이 작성한 PRD 섹션 초�
 
 사용자 요구사항: {user_query}
 기능 목록 ({feature_count}개): {feature_str}
+PM Feature Registry:
+{feature_registry}
 
 위 기준을 충족하지 못했거나 내용이 이상한(placeholder 남음, 기준 미달, 사실관계 오류 등) 섹션이 있으면
 해당 섹션만 새로 작성해 patches에 담으세요. 문제 없는 섹션은 patches에 포함하지 마세요.
@@ -524,14 +605,16 @@ class PrdAgent:
             feature_count = len(state.feature_list)
             rollback_section = self._build_rollback_section(state) if is_rollback else ""
 
+            project_context = state.user_query + "\n[PM projectPlan]\n" + json.dumps(state.project_plan or {}, ensure_ascii=False)
             graph_input = {
                 "sections": {},
                 "prd_document": "",
                 "ctx": {
-                    "user_query": state.user_query,
+                    "user_query": project_context,
                     "feature_str": feature_str,
                     "feature_count": feature_count,
                     "feature_list": state.feature_list,
+                    "feature_registry_text": registry_text(normalize_feature_registry(state.feature_registry, state.feature_list)),
                     "market_data": market_data,
                     "rollback_section": rollback_section,
                     "dump": dump,
@@ -558,6 +641,18 @@ class PrdAgent:
                     parsed["coreFeatures"] = self._dedup_list(
                         self._drop_empty_features(parsed["coreFeatures"])
                     )
+                    parsed["coreFeatures"] = self._limit_core_features(
+                        parsed["coreFeatures"], state.feature_list,
+                    )
+                    parsed["coreFeatures"] = ensure_registry_core_features(
+                        parsed["coreFeatures"], state.feature_list,
+                        normalize_feature_registry(state.feature_registry, state.feature_list),
+                    )
+
+                attach_feature_ids(
+                    parsed.get("coreFeatures") or [],
+                    normalize_feature_registry(state.feature_registry, state.feature_list),
+                )
 
                 # 우선순위는 항상 마지막에 정리 — MVP 범위가 확정된 뒤라야 도출할 수 있다
                 self._reconcile_priorities(parsed.get("coreFeatures"), parsed.get("mvpScope"))
@@ -571,12 +666,67 @@ class PrdAgent:
                 prd_feedback_from_api="",
                 status_message="PRD 에이전트 완료",
             )
+
         except Exception as e:
             logger.error("PRD 에이전트 실패: %s", e)
             return state.copy(
                 prd_document="{}",
                 status_message=f"PRD 에이전트 실패: {e}",
             )
+
+    async def repair(self, state: PipelineState, feedback: str, dump=None) -> PipelineState:
+        """검증 피드백에 해당하는 PRD 최상위 섹션만 patch한다.
+
+        전체 PRD 재생성은 기능 목록이 바뀐 경우에만 orchestration fallback으로 사용한다.
+        """
+        current = try_parse_json(state.prd_document)
+        if not isinstance(current, dict) or not current:
+            return await self.execute(state, dump)
+
+        prompt = TARGETED_REPAIR_PROMPT.format(
+            feedback=str(feedback or "")[:8000],
+            prd_document=json.dumps(current, ensure_ascii=False),
+        )
+        try:
+            raw = await self._call(prompt, max_tokens=10000, system=MANAGER_SYSTEM)
+            if dump:
+                dump.log_raw("PRD_TARGETED_REPAIR", 1, raw)
+            result = try_parse_json(raw)
+            patches = result.get("patches") if isinstance(result, dict) else None
+            if not isinstance(patches, dict) or not patches:
+                logger.warning("PRD targeted repair — 유효한 patches 없음, 원본 유지")
+                return state
+            applied = {key: value for key, value in patches.items() if key in current}
+            if not applied:
+                logger.warning("PRD targeted repair — 기존 섹션과 일치하는 패치 없음, 원본 유지")
+                return state
+            repaired = {**current, **applied}
+            if isinstance(repaired.get("coreFeatures"), list):
+                repaired["coreFeatures"] = self._dedup_list(
+                    self._drop_empty_features(repaired["coreFeatures"])
+                )
+                repaired["coreFeatures"] = self._limit_core_features(
+                    repaired["coreFeatures"], state.feature_list,
+                )
+                repaired["coreFeatures"] = ensure_registry_core_features(
+                    repaired["coreFeatures"], state.feature_list,
+                    normalize_feature_registry(state.feature_registry, state.feature_list),
+                )
+                attach_feature_ids(
+                    repaired["coreFeatures"],
+                    normalize_feature_registry(state.feature_registry, state.feature_list),
+                )
+                self._reconcile_priorities(repaired["coreFeatures"], repaired.get("mvpScope"))
+            logger.info("PRD targeted repair — %d개 섹션 패치: %s", len(applied), list(applied))
+            return state.copy(
+                prd_document=json.dumps(repaired, ensure_ascii=False),
+                prd_feedback_from_dba="",
+                prd_feedback_from_api="",
+                status_message="PRD 에이전트 완료 — 지적 섹션만 수정",
+            )
+        except Exception as e:
+            logger.warning("PRD targeted repair 실패 — 원본 유지: %s", e)
+            return state
 
     def _dispatch(self, state: dict) -> list[Send]:
         ctx = state["ctx"]
@@ -591,6 +741,7 @@ class PrdAgent:
                 user_query=ctx["user_query"],
                 feature_str=ctx["feature_str"],
                 feature_count=ctx["feature_count"],
+                feature_registry=ctx.get("feature_registry_text", "[]"),
             )
             sends.append(Send("worker", {
                 "section": section_key,
@@ -624,6 +775,7 @@ class PrdAgent:
                 user_query=ctx["user_query"],
                 feature_str="- " + "\n- ".join(batch) if batch else ctx["feature_str"],
                 feature_count=len(batch) or ctx["feature_count"],
+                feature_registry=ctx.get("feature_registry_text", "[]"),
             )
             sends.append(Send("worker", {
                 "section": "coreFeatures",
@@ -658,6 +810,11 @@ class PrdAgent:
     async def _manager_review_node(self, state: dict) -> dict:
         ctx = state["ctx"]
         sections = state["sections"]
+        # Manager review는 PRD 전체를 다시 LLM에 보내는 생성 단계가 아니다.
+        # 섹션 키/기능 ID/개수 보정은 execute 후처리와 결정론적 QA가 담당하고,
+        # 의미 결함은 Phase3 targeted repair에서 해당 섹션만 수정한다.
+        return {"prd_document": json.dumps(sections, ensure_ascii=False)}
+
         dump = ctx.get("dump")
 
         prompt = MANAGER_REVIEW_PROMPT.format(
@@ -666,6 +823,7 @@ class PrdAgent:
             user_query=ctx["user_query"],
             feature_count=ctx["feature_count"],
             feature_str=ctx["feature_str"],
+            feature_registry=ctx.get("feature_registry_text", "[]"),
         )
 
         try:
@@ -713,7 +871,7 @@ class PrdAgent:
         3회 모두 기준 미달이면 그중 항목 수가 가장 많았던 결과를 반환한다."""
         best: dict | None = None
         best_score = -1
-        for attempt in range(3):
+        for attempt in range(1):
             raw = await self._call(prompt, max_tokens=max_tokens, system=WORKER_SYSTEM)
             if dump:
                 dump.log_raw(label, attempt + 1, raw)
@@ -772,7 +930,8 @@ class PrdAgent:
         재요청해서 채운다. 같은 서비스 맥락(base_prompt)을 재사용하므로 채운 항목도 서비스 특화된다.
         결정론적 템플릿 채움은 하지 않으므로 개수를 100% 보장하진 않지만(EXAONE 한계), 매 라운드
         진짜 항목만 늘어나 절대 나빠지지 않는다. 최대 3라운드."""
-        for round_ in range(3):
+        # 부족분 전체 재생성은 금지한다. 부족한 계약은 Phase3에서 targeted repair한다.
+        for round_ in range(0):
             shortfall = self._count_shortfall(data, min_counts)
             if not shortfall:
                 break
@@ -933,6 +1092,36 @@ class PrdAgent:
         return kept
 
     @classmethod
+    def _limit_core_features(cls, core_features: list, feature_hints: list[str]) -> list:
+        """핵심 사용자 여정만 유지하고 일반 supporting 기능은 Feature Spec으로 넘긴다."""
+        max_count = max(_CORE_FEATURE_MAX_COUNT, len(feature_hints or []))
+        if len(core_features) <= max_count:
+            return core_features
+
+        hints = {
+            str(item).strip().casefold()
+            for item in (feature_hints or [])
+            if isinstance(item, str) and item.strip()
+        }
+        hint_tokens = [cls._label_tokens(value) for value in hints]
+        required = [
+            item for item in core_features
+            if str(item.get("name") or "").strip().casefold() in hints
+            or cls._best_overlap(cls._label_tokens(item.get("name") or ""), hint_tokens) >= 0.5
+        ]
+        optional = [item for item in core_features if item not in required]
+        # Registry/폼 기능을 우선 보존하고, 일반 supporting 항목은 Feature Spec으로 이관한다.
+        limited = (required + [
+            item for item in optional
+            if str(item.get("source") or "").strip().casefold() not in {"supporting", "support"}
+        ])[:max_count]
+        logger.warning(
+            "PRD coreFeatures 상한 적용 — %d개 → %d개; 일반 기능은 Feature Spec으로 이관",
+            len(core_features), len(limited),
+        )
+        return limited
+
+    @classmethod
     def _reconcile_priorities(cls, core_features, mvp_scope) -> None:
         """coreFeatures.priority를 정규화하고, 구분이 없거나 비어 있으면 MVP 범위에서 도출한다.
 
@@ -1032,7 +1221,7 @@ class PrdAgent:
         return data
 
     async def _call(self, user_prompt: str, max_tokens: int, system: str) -> str:
-        for attempt in range(3):
+        for attempt in range(1):
             try:
                 async def request():
                     return await self._client.chat.completions.create(
@@ -1068,9 +1257,11 @@ class PrdAgent:
         return "\n".join(parts)
 
 
-def reconcile_core_features(core_features, mvp_scope) -> list:
+def reconcile_core_features(core_features, mvp_scope, feature_hints=None) -> list:
     """coreFeatures 정리(빈 항목 제거 + 우선순위 재배정)의 모듈 레벨 진입점 —
     QA 최종 백스톱에서 재사용한다. (dba_agent.reconcile_fk_types와 동일한 역할)"""
     cleaned = PrdAgent._drop_empty_features(core_features)
+    if feature_hints:
+        cleaned = PrdAgent._limit_core_features(cleaned, feature_hints)
     PrdAgent._reconcile_priorities(cleaned, mvp_scope)
     return cleaned

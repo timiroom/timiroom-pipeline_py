@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid
 
 from .form_to_query import FormToQueryService
@@ -11,6 +12,35 @@ from .search_rl_service import SearchRLService
 from .session_vector_store import SessionVectorStore
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_domain_noise(query: str, chunks: list, min_keep: int = 2) -> list:
+    """전역 RAG 문서에서 프로젝트 핵심어와 전혀 겹치지 않는 상위 문서를 제거한다."""
+    if not chunks:
+        return []
+    tokens = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[가-힣]{2,}", query or "")
+    }
+    # 검색 시스템/일반 요구사항에서 너무 흔한 단어는 도메인 판정에서 제외한다.
+    tokens -= {"서비스", "관리", "기능", "사용자", "시스템", "정보", "처리", "확인", "지원"}
+    if not tokens:
+        return chunks
+    kept = []
+    for chunk in chunks:
+        content = str(getattr(chunk, "content", "") or "").casefold()
+        if any(token in content for token in tokens):
+            kept.append(chunk)
+    if len(kept) < min_keep:
+        # 너무 엄격한 필터로 Phase1 컨텍스트가 비는 것은 막되, 관련 문서를 우선한다.
+        for chunk in chunks:
+            if chunk not in kept:
+                kept.append(chunk)
+            if len(kept) >= min_keep:
+                break
+    if len(kept) != len(chunks):
+        logger.info("Phase1 도메인 노이즈 필터 — %d개 중 %d개 유지", len(chunks), len(kept))
+    return kept
 
 
 class RagPipelineService:
@@ -43,8 +73,12 @@ class RagPipelineService:
             # Step 1: PDF 파싱
             if pdf_files:
                 logger.info("[%s] ▶ Step 1: PDF 파싱 시작 (%d개)", session_id[:8], len(pdf_files))
-                await self._pdf_parsing.parse_and_store_all(pdf_files, session_id)
+                pdf_result = await self._pdf_parsing.parse_and_store_all(pdf_files, session_id)
+                if pdf_result.failed_files == pdf_result.total_files:
+                    raise RuntimeError("업로드된 PDF를 하나도 처리하지 못했습니다")
                 logger.info("[%s] ✔ Step 1: PDF 파싱 완료", session_id[:8])
+            else:
+                pdf_result = None
 
             # Step 2: 폼 → 쿼리 합성
             logger.info("[%s] ▶ Step 2: 폼 → 쿼리 합성", session_id[:8])
@@ -72,7 +106,7 @@ class RagPipelineService:
             # Step 5: Reranking
             logger.info("[%s] ▶ Step 5: Reranking (Cohere)", session_id[:8])
             rerank_result = await self._reranker.rerank(synthesized, retrieved)
-            reranked = rerank_result.chunks
+            reranked = _filter_domain_noise(synthesized, rerank_result.chunks)
             logger.info("[%s] ✔ Step 5: %d개로 압축", session_id[:8], len(reranked))
             for i, c in enumerate(reranked, 1):
                 logger.info(
@@ -95,6 +129,13 @@ class RagPipelineService:
             logger.info("[%s] ✔ Step 6: context_prompt %d자 생성", session_id[:8], len(context_prompt))
 
             from phase2.state import PipelineState
+            pdf_status = "Phase 1 완료"
+            if pdf_result and pdf_result.failed_files:
+                pdf_status = (
+                    f"Phase 1 완료 — PDF {pdf_result.processed_files}/{pdf_result.total_files}개 처리, "
+                    f"{pdf_result.failed_files}개 실패"
+                )
+
             return PipelineState(
                 session_id=session_id,
                 user_query=synthesized,
@@ -107,7 +148,10 @@ class RagPipelineService:
                 excluded_features=self._form_to_query.extract_excluded_features(form),
                 feature_list=self._form_to_query.extract_all_included_features(form),
                 context_prompt=context_prompt,
-                status_message="Phase 1 완료",
+                pdf_files_total=pdf_result.total_files if pdf_result else 0,
+                pdf_files_processed=pdf_result.processed_files if pdf_result else 0,
+                pdf_files_failed=pdf_result.failed_files if pdf_result else 0,
+                status_message=pdf_status,
             )
         finally:
             self._session_store.clear(session_id)

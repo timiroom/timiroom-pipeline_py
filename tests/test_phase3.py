@@ -102,6 +102,55 @@ def test_repairable_json_is_canonicalized_in_state():
     assert json.loads(result.api_spec) == _api()
 
 
+def test_api_registry_contract_is_validated_without_description_keyword_match():
+    registry = [{
+        "featureId": "plot.schedule",
+        "name": "재배 일정 관리",
+        "apiContract": [{"method": "POST", "path": "/api/v1/growing-schedules"}],
+    }]
+    api = {
+        "authentication": "Bearer JWT",
+        "endpoints": [{
+            "featureId": "plot.schedule",
+            "method": "POST",
+            "path": "/api/v1/growing-schedules",
+            "description": "Create a schedule",
+            "successResponse": "ok",
+            "errorCodes": "400",
+        }],
+    }
+    result = SchemaValidator().validate(
+        ["재배 일정 관리"], json.dumps(_db()), json.dumps(api), json.dumps(_prd()), registry,
+    )
+
+    assert "API_FEATURE_COVERAGE" not in result.error_codes
+    assert "API_CONTRACT_MISSING" not in result.error_codes
+
+
+def test_api_registry_contract_missing_is_a_structured_blocker():
+    registry = [{
+        "featureId": "plot.schedule",
+        "name": "재배 일정 관리",
+        "apiContract": [{"method": "POST", "path": "/api/v1/growing-schedules"}],
+    }]
+    api = {
+        "authentication": "Bearer JWT",
+        "endpoints": [{
+            "featureId": "plot.schedule",
+            "method": "GET",
+            "path": "/api/v1/growing-schedules",
+            "description": "List schedules",
+            "successResponse": "ok",
+            "errorCodes": "400",
+        }],
+    }
+    result = SchemaValidator().validate(
+        ["재배 일정 관리"], json.dumps(_db()), json.dumps(api), json.dumps(_prd()), registry,
+    )
+
+    assert "API_CONTRACT_MISSING" in result.error_codes
+
+
 def test_prd_required_sections_are_validated():
     result = SchemaValidator().validate(
         FEATURES,
@@ -115,14 +164,44 @@ def test_prd_required_sections_are_validated():
     assert "PRD_FIELDS_REQUIRED" in result.error_codes
 
 
-def test_phase2_qa_rejection_is_advisory_to_phase3():
+def test_phase2_qa_rejection_blocks_phase3():
     state = _state(qa_approved=False, qa_api_issues=["응답 스키마 누락"])
 
     result = ValidationService(SchemaValidator()).validate(state)
 
-    assert result.validated is True
+    assert result.validated is False
     assert "QA_NOT_APPROVED" not in result.validation_error_codes
-    assert result.validation_repair_targets == []
+    assert result.validation_repair_targets == ["api"]
+
+
+def test_validation_tracks_current_and_resolved_blocker_bundle():
+    state = _state(
+        qa_approved=True,
+        validation_unresolved_blockers=["이전 repair blocker"],
+        validation_blockers=["이전 repair blocker"],
+    )
+
+    result = ValidationService(SchemaValidator()).validate(state)
+
+    assert result.validated is True
+    assert result.validation_unresolved_blockers == []
+    assert result.validation_blockers == []
+    assert result.validation_resolved_blockers == ["이전 repair blocker"]
+
+
+def test_validation_deduplicates_qa_and_schema_blockers():
+    state = _state(
+        qa_approved=False,
+        qa_db_blockers=["DB 스키마: users에 PRIMARY_KEY가 없습니다"],
+        qa_db_issues=["DB 스키마: users에 PRIMARY_KEY가 없습니다"],
+    )
+
+    result = ValidationService(SchemaValidator()).validate(state)
+
+    assert result.validated is False
+    assert result.validation_unresolved_blockers == [
+        "DB 스키마: users에 PRIMARY_KEY가 없습니다"
+    ]
 
 
 def test_structural_and_cross_artifact_errors_are_detected():
@@ -155,7 +234,7 @@ def test_structural_and_cross_artifact_errors_are_detected():
     assert {"db", "api"} <= set(result.repair_targets)
 
 
-def test_semantic_feature_coverage_gap_is_allowed():
+def test_feature_coverage_gap_is_rejected_for_backend_features():
     result = SchemaValidator().validate(
         ["사용자 로그인", "결제 환불"],
         json.dumps(_db(), ensure_ascii=False),
@@ -163,8 +242,63 @@ def test_semantic_feature_coverage_gap_is_allowed():
         json.dumps(_prd(), ensure_ascii=False),
     )
 
+    assert result.success is False
+    assert "DB_FEATURE_COVERAGE" in result.error_codes
+    assert "API_FEATURE_COVERAGE" in result.error_codes
+
+
+def test_strict_feature_coverage_does_not_accept_one_generic_token():
+    api = _api()
+    api["endpoints"][0]["description"] = "관리 기능"
+    result = SchemaValidator().validate(
+        ["사용자 로그인", "출결 자동 대조"],
+        json.dumps(_db(), ensure_ascii=False),
+        json.dumps(api, ensure_ascii=False),
+        json.dumps(_prd(), ensure_ascii=False),
+    )
+
+    assert "API_FEATURE_COVERAGE" in result.error_codes
+
+
+def test_prd_db_entity_mismatch_is_rejected():
+    prd = _prd()
+    prd["techStack"] = {"database": "courses(id PK, academy_id FK→academies.id)"}
+    result = SchemaValidator().validate(
+        FEATURES,
+        json.dumps(_db(), ensure_ascii=False),
+        json.dumps(_api(), ensure_ascii=False),
+        json.dumps(prd, ensure_ascii=False),
+    )
+
+    assert result.success is False
+    assert "PRD_DB_ENTITY_MISMATCH" in result.error_codes
+
+
+def test_duplicate_relationship_is_rejected():
+    db = _db()
+    db["relationships"].append("users (1:N) sessions")
+    result = SchemaValidator().validate(
+        FEATURES,
+        json.dumps(db, ensure_ascii=False),
+        json.dumps(_api(), ensure_ascii=False),
+        json.dumps(_prd(), ensure_ascii=False),
+    )
+
+    assert result.success is False
+    assert "DB_RELATIONSHIP_DUPLICATED" in result.error_codes
+
+
+def test_frontend_only_feature_does_not_require_db_or_api_coverage():
+    prd = _prd()
+    prd["coreFeatures"].append({"name": "반응형 웹 화면 지원(PC·태블릿)", "description": "PC와 태블릿에 맞는 반응형 화면"})
+    result = SchemaValidator().validate(
+        ["반응형 웹 화면 지원(PC·태블릿)"],
+        json.dumps(_db(), ensure_ascii=False),
+        json.dumps(_api(), ensure_ascii=False),
+        json.dumps(prd, ensure_ascii=False),
+    )
+
     assert result.success is True
-    assert not result.error_codes
 
 
 def test_common_fk_aliases_and_self_relationships_are_allowed():
@@ -213,7 +347,7 @@ def test_success_clears_stale_validation_state():
     assert result.validation_repair_targets == []
 
 
-def test_retry_stops_when_same_failure_repeats():
+def test_retry_stops_at_limit_when_same_failure_repeats():
     class Orchestration:
         def __init__(self):
             self.calls = 0
@@ -237,7 +371,93 @@ def test_retry_stops_when_same_failure_repeats():
 
     assert orchestration.calls == 1
     assert result.validated is False
-    assert "동일 검증 실패" in result.status_message
+    assert "동일 blocker 재발" in result.status_message
+
+
+def test_retry_repeats_full_blocker_bundle_until_retry_limit():
+    class Orchestration:
+        def __init__(self):
+            self.calls = 0
+
+        async def repair(self, state, _error, _pipeline_id, repair_targets=None):
+            self.calls += 1
+            return state
+
+    class Validation:
+        def validate(self, state):
+            return state.copy(
+                validated=False,
+                last_validation_error="표현만 바뀐 오류",
+                validation_blockers=["DB FK 대상 누락", "API endpoint 누락"],
+                validation_unresolved_blockers=["DB FK 대상 누락", "API endpoint 누락"],
+            )
+
+    state = _state(
+        validated=False,
+        last_validation_error="이전 오류",
+        validation_repair_targets=["db", "api"],
+        validation_blockers=["DB FK 대상 누락", "API endpoint 누락"],
+        validation_unresolved_blockers=["DB FK 대상 누락", "API endpoint 누락"],
+    )
+    orchestration = Orchestration()
+
+    result = asyncio.run(RetryService(max_retry=3).retry_with(state, orchestration, Validation()))
+
+    assert orchestration.calls == 1
+    assert result.validation_unresolved_blockers == ["DB FK 대상 누락", "API endpoint 누락"]
+    assert "동일 blocker 재발" in result.status_message
+
+
+def test_retry_timeout_consumes_remaining_retry_budget():
+    class Orchestration:
+        def __init__(self):
+            self.calls = 0
+
+        async def repair(self, state, _error, _pipeline_id, repair_targets=None):
+            self.calls += 1
+            raise TimeoutError("simulated timeout")
+
+    orchestration = Orchestration()
+    state = _state(
+        validated=False,
+        last_validation_error="DB FK 대상 누락",
+        validation_repair_targets=["db"],
+        validation_blockers=["DB FK 대상 누락"],
+        validation_unresolved_blockers=["DB FK 대상 누락"],
+    )
+
+    result = asyncio.run(RetryService(max_retry=3).retry_with(state, orchestration, ValidationService(SchemaValidator())))
+
+    assert orchestration.calls == 1
+    assert "동일 blocker 재발" in result.status_message
+    assert "REPAIR_TIMEOUT" in result.last_validation_error
+
+
+def test_retry_keeps_resolved_blockers_when_one_of_two_is_fixed():
+    class Orchestration:
+        async def repair(self, state, _error, _pipeline_id, repair_targets=None):
+            return state
+
+    class Validation:
+        def validate(self, state):
+            return state.copy(
+                validated=False,
+                validation_blockers=["API endpoint 누락"],
+                validation_unresolved_blockers=["API endpoint 누락"],
+                validation_resolved_blockers=["DB FK 대상 누락"],
+            )
+
+    state = _state(
+        validated=False,
+        validation_repair_targets=["db", "api"],
+        validation_blockers=["DB FK 대상 누락", "API endpoint 누락"],
+        validation_unresolved_blockers=["DB FK 대상 누락", "API endpoint 누락"],
+    )
+
+    result = asyncio.run(RetryService(max_retry=3).retry_with(state, Orchestration(), Validation()))
+
+    assert result.validation_resolved_blockers == ["DB FK 대상 누락"]
+    assert result.validation_unresolved_blockers == ["API endpoint 누락"]
 
 
 def test_retry_feedback_does_not_grow_across_attempts():

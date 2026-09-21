@@ -60,6 +60,36 @@ def uncovered_features(feature_list: list, haystack_texts: list) -> list[str]:
     return uncovered
 
 
+def strictly_uncovered_features(feature_list: list, item_texts: list) -> list[str]:
+    """기능별로 충분한 고유 토큰이 같은 산출물 항목에 있는지 검사한다.
+
+    기존 uncovered_features는 전체 문서에 토큰 하나만 있어도 커버된 것으로 보아
+    공통 단어가 많은 도메인에서 핵심 endpoint/table 누락을 놓칠 수 있다. 이 검사는
+    exact phrase 또는 고유 토큰의 절반 이상이 같은 항목에 있어야 통과시킨다.
+    """
+    items = [str(item).casefold() for item in item_texts if item is not None]
+    features = feature_list or []
+    tokens_per_feature = [_feature_tokens(feature) for feature in features]
+    doc_freq: dict[str, int] = {}
+    for tokens in tokens_per_feature:
+        for token in tokens:
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+    generic = {token for token, freq in doc_freq.items() if freq / (len(features) or 1) > _GENERIC_TOKEN_DOC_FREQ_RATIO}
+
+    missing = []
+    for feature, tokens in zip(features, tokens_per_feature):
+        if not tokens:
+            continue
+        normalized = " ".join(str(feature).casefold().split())
+        if any(normalized in item for item in items):
+            continue
+        specific = tokens - generic or tokens
+        required = max(1, (len(specific) + 1) // 2)
+        if not any(sum(token in item for token in specific) >= required for item in items):
+            missing.append(feature)
+    return missing
+
+
 def undercovered_features(feature_list: list, per_item_texts: list, minimum: int) -> list[str]:
     """기능별로 '매칭되는 항목 수'를 세어 minimum에 못 미치는 기능만 반환.
 

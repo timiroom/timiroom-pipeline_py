@@ -182,7 +182,34 @@ async def _run_pipeline_inner(
 
         if not validated.validated:
             logger.warning("HITL 요청 | 자동 검증 실패")
-            progress_svc.error(pipeline_id, "자동 검증 실패 — 관리자 검토가 필요합니다")
+            progress_svc.error(
+                pipeline_id,
+                "자동 검증 실패 — 관리자 검토가 필요합니다",
+                details={
+                    "validationErrors": validated.validation_error_codes,
+                    "validationMessage": validated.last_validation_error,
+                    "validationBlockers": validated.validation_unresolved_blockers,
+                    "resolvedBlockers": validated.validation_resolved_blockers,
+                    "validationBlockerComparison": {
+                        "resolved": validated.validation_resolved_blockers,
+                        "unresolved": validated.validation_unresolved_blockers,
+                    },
+                    "blockerDetails": validated.qa_blocker_details,
+                    "qa": {
+                        "approved": validated.qa_approved,
+                        "blockingIssues": {
+                            "db": validated.qa_db_blockers,
+                            "api": validated.qa_api_blockers,
+                            "prd": validated.qa_prd_blockers,
+                        },
+                        "warnings": {
+                            "db": validated.qa_db_warnings,
+                            "api": validated.qa_api_warnings,
+                            "prd": validated.qa_prd_warnings,
+                        },
+                    },
+                },
+            )
             return
 
         # Phase 4
@@ -192,21 +219,69 @@ async def _run_pipeline_inner(
             raise RuntimeError("Kafka 발행 pipelineId가 요청 pipelineId와 일치하지 않습니다")
         logger.info("파이프라인 완료 | pipelineId: %s", pipeline_id)
 
+        feature_spec = _parse_json(validated.feature_spec_document)
+        spec_features = feature_spec.get("features", []) if isinstance(feature_spec, dict) else []
+        core_count = sum(1 for item in spec_features if isinstance(item, dict) and item.get("source") == "prd_core")
+        supporting_count = sum(1 for item in spec_features if isinstance(item, dict) and item.get("source") == "supporting")
         result = {
             "projectName": validated.project_name,
             "featureList": validated.feature_list,
+            "projectPlan": validated.project_plan,
+            "featureSpecDocument": feature_spec,
+            "featureRegistry": validated.feature_registry,
+            "allFeatures": [
+                item.get("name") for item in validated.feature_registry
+                if isinstance(item, dict) and item.get("name")
+            ],
+            "featureSummary": {
+                "coreCount": core_count,
+                "supportingCount": supporting_count,
+                "totalCount": len(spec_features),
+            },
             "prdDocument": _parse_json(validated.prd_document),
             "dbSchema": _parse_json(validated.db_schema),
             "apiSpec": _parse_json(validated.api_spec),
             "marketResearch": validated.market_research,
             "status": validated.status_message,
+            "qa": {
+                "approved": validated.qa_approved,
+                "blockingIssues": {
+                    "db": validated.qa_db_blockers,
+                    "api": validated.qa_api_blockers,
+                    "prd": validated.qa_prd_blockers,
+                },
+                "warnings": {
+                    "db": validated.qa_db_warnings,
+                    "api": validated.qa_api_warnings,
+                    "prd": validated.qa_prd_warnings,
+                },
+                "blockerDetails": validated.qa_blocker_details,
+            },
             "retryCount": validated.retry_count,
+            "validationBlockers": validated.validation_unresolved_blockers,
+            "resolvedBlockers": validated.validation_resolved_blockers,
+            "validationBlockerComparison": {
+                "resolved": validated.validation_resolved_blockers,
+                "unresolved": validated.validation_unresolved_blockers,
+            },
+            "pdfFilesTotal": validated.pdf_files_total,
+            "pdfFilesProcessed": validated.pdf_files_processed,
+            "pdfFilesFailed": validated.pdf_files_failed,
         }
         progress_svc.complete(pipeline_id, result)
 
     except Exception as e:
         logger.error("파이프라인 실패 | %s", e, exc_info=True)
-        progress_svc.error(pipeline_id, str(e) or "알 수 없는 오류")
+        error_type = type(e).__name__
+        error_message = str(e).strip() or error_type
+        progress_svc.error(
+            pipeline_id,
+            error_message,
+            details={
+                "errorType": error_type,
+                "errorDetail": repr(e),
+            },
+        )
 
 
 def _parse_json(value: str | None) -> dict | list:

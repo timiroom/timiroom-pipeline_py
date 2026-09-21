@@ -15,6 +15,8 @@ class PipelineResultEvent(BaseModel):
     market_research: str = Field(default="", alias="marketResearch")
     db_schema: str = Field(alias="dbSchema", min_length=2)
     api_spec: str = Field(alias="apiSpec", min_length=2)
+    feature_spec_document: str = Field(default="{}", alias="featureSpecDocument")
+    feature_registry: list[dict] = Field(default_factory=list, alias="featureRegistry")
     retry_count: int = Field(default=0, alias="retryCount", ge=0)
     created_at: str = Field(alias="createdAt", min_length=1)
 

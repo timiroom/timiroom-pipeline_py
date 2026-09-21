@@ -22,9 +22,15 @@ class PipelineState:
     # Phase 1 결과
     user_query: str = ""
     context_prompt: str = ""
+    pdf_files_total: int = 0
+    pdf_files_processed: int = 0
+    pdf_files_failed: int = 0
 
     # PM 에이전트 결과
     feature_list: list[str] = field(default_factory=list)
+    feature_registry: list[dict[str, Any]] = field(default_factory=list)
+    project_plan: dict[str, Any] = field(default_factory=dict)
+    feature_spec_document: str = ""
     dba_instruction: str = ""
     api_instruction: str = ""
 
@@ -44,6 +50,15 @@ class PipelineState:
     qa_db_issues: list[str] = field(default_factory=list)
     qa_api_issues: list[str] = field(default_factory=list)
     qa_prd_issues: list[str] = field(default_factory=list)
+    qa_db_blockers: list[str] = field(default_factory=list)
+    qa_api_blockers: list[str] = field(default_factory=list)
+    qa_prd_blockers: list[str] = field(default_factory=list)
+    qa_db_warnings: list[str] = field(default_factory=list)
+    qa_api_warnings: list[str] = field(default_factory=list)
+    qa_prd_warnings: list[str] = field(default_factory=list)
+    qa_blocker_details: list[dict[str, Any]] = field(default_factory=list)
+    # Upstream/LLM 생성 실패를 품질 결함과 분리해 Phase3까지 보존한다.
+    generation_blockers: list[str] = field(default_factory=list)
 
     # Search 에이전트
     market_research: str = ""
@@ -60,6 +75,13 @@ class PipelineState:
     validation_error_codes: list[str] = field(default_factory=list)
     validation_repair_targets: list[str] = field(default_factory=list)
     validation_failure_fingerprints: list[str] = field(default_factory=list)
+    # Phase3 targeted repair budget. Keys are pm/prd/db/api and each domain is
+    # allowed one automatic repair per pipeline.
+    targeted_repair_attempts: dict[str, int] = field(default_factory=dict)
+    # Phase 3 blocker bundle: repair 전후에 어떤 결함이 남고 해결됐는지 추적한다.
+    validation_blockers: list[str] = field(default_factory=list)
+    validation_resolved_blockers: list[str] = field(default_factory=list)
+    validation_unresolved_blockers: list[str] = field(default_factory=list)
 
     def copy(self, **kwargs) -> PipelineState:
         return replace(self, **kwargs)
