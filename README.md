@@ -17,6 +17,27 @@ uvicorn main:app --host 0.0.0.0 --port 8081
 헬스체크는 `GET /actuator/health/readiness`, Swagger는 `/docs`입니다.
 Cohere Rerank는 기본 의존성의 비동기 HTTP 클라이언트로 호출하므로 별도 모델 설치가 필요하지 않습니다.
 
+## pipeline과 consistency 함께 실행
+
+`pipeline_py` 폴더에서 아래 명령을 실행하면 pipeline과
+`timiroom-consistency_py`가 함께 기동됩니다.
+
+```powershell
+docker compose up --build
+```
+
+- Pipeline: `http://localhost:8081`
+- Consistency: `http://localhost:8082`
+- Pipeline Swagger: `http://localhost:8081/docs`
+- Consistency Swagger: `http://localhost:8082/docs`
+
+Consistency의 `../timiroom-consistency_py/.env`가 먼저 존재해야 합니다.
+두 서비스만 백그라운드로 실행하려면 다음 명령을 사용합니다.
+
+```powershell
+docker compose up --build -d pipeline consistency
+```
+
 ## NAS 배포
 
 `develop` 반영 시 Docker Hub에 `timiroom-pipeline-py:sha-*` 이미지를 올리고,

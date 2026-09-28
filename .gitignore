@@ -19,6 +19,9 @@ ENV/
 # 빌드 / 배포
 dist/
 build/
+.backend-build/
+.gradle-home/
+.gradle-project-cache/
 *.egg-info/
 *.egg
 .eggs/
