@@ -39,7 +39,7 @@ class CommonFeature(BaseModel):
     selected: bool = False
     description: str | None = None
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 class CustomFeature(BaseModel):
@@ -47,14 +47,14 @@ class CustomFeature(BaseModel):
     priority: MoSCoW = MoSCoW.MUST
     description: str | None = None
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 class FeatureDefinition(BaseModel):
     common_features: list[CommonFeature] | None = Field(None, alias="commonFeatures")
     custom_features: list[CustomFeature] | None = Field(None, alias="customFeatures")
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 class FormData(BaseModel):

@@ -19,6 +19,20 @@ _MIN_TOKEN_LEN = 2
 # 보고 단독 매칭 근거로 인정하지 않는다 (예: 냉장고 앱에서 "재료"가 기능 대부분에 등장 →
 # 이 단어 하나로 "레시피 추천"이 "재료 등록" 엔드포인트에 매칭돼버리는 오탐 방지).
 _GENERIC_TOKEN_DOC_FREQ_RATIO = 0.34
+_ACTION_SYNONYMS = {
+    "등록": {"등록", "생성", "추가"},
+    "생성": {"등록", "생성", "추가"},
+    "추가": {"등록", "생성", "추가"},
+    "배정": {"배정", "할당", "지정"},
+    "할당": {"배정", "할당", "지정"},
+    "지정": {"배정", "할당", "지정"},
+    "기록": {"기록", "이력", "로그"},
+    "이력": {"기록", "이력", "로그"},
+    "로그": {"기록", "이력", "로그"},
+    "조회": {"조회", "목록", "검색"},
+    "목록": {"조회", "목록", "검색"},
+    "검색": {"조회", "목록", "검색"},
+}
 
 
 def _feature_tokens(feature: str) -> set[str]:
@@ -27,7 +41,12 @@ def _feature_tokens(feature: str) -> set[str]:
         return set()
     cleaned = re.sub(r"[()\[\]{}:,./·—\-!?'\"]", " ", feature)
     tokens = [t for t in re.split(r"\s+", cleaned) if len(t) >= _MIN_TOKEN_LEN]
-    return {t for t in tokens if t not in _STOPWORDS}
+    expanded: set[str] = set()
+    for token in tokens:
+        if token in _STOPWORDS:
+            continue
+        expanded.update(_ACTION_SYNONYMS.get(token, {token}))
+    return expanded
 
 
 def uncovered_features(feature_list: list, haystack_texts: list) -> list[str]:
