@@ -4,18 +4,27 @@ from types import SimpleNamespace
 import pytest
 
 from phase2.agents.api_agent import (
-    ApiAgent, _endpoint_soft_cap, _normalize_endpoints, _prune_plan,
-    _sanitize_plan_paths, _semantic_endpoint_key,
+    ApiAgent,
+    _endpoint_soft_cap,
+    _normalize_endpoints,
+    _prune_plan,
+    _sanitize_plan_paths,
+    _semantic_endpoint_key,
 )
 from phase2.agents.dba_agent import (
-    DbaAgent, _normalize_special_references, ensure_primary_keys, reconcile_fk_types,
-    normalize_table_contract_names, annotate_table_feature_ids,
+    DbaAgent,
+    _fk_target,
+    _normalize_special_references,
+    annotate_table_feature_ids,
+    ensure_primary_keys,
+    normalize_table_contract_names,
+    reconcile_fk_types,
 )
 from phase2.agents.feature_spec_agent import FeatureSpecAgent, _score_supporting
-from phase2.feature_registry import normalize_feature_registry
 from phase2.agents.prd_agent import reconcile_core_features
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent, _polish_market_research_text
+from phase2.feature_registry import normalize_feature_registry
 from phase2.llm_runtime import LlmRuntime
 from phase2.orchestration_graph import OrchestrationGraph
 from phase2.state import PipelineState
