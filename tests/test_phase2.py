@@ -155,6 +155,16 @@ def test_dba_fk_constraints_keep_reference_target_and_type():
     assert "REFERENCES users(id)" in user_id["constraints"]
 
 
+def test_dba_buyer_and_seller_ids_fall_back_to_users_when_no_special_table_exists():
+    lookup = {
+        "users": "users",
+        "inquiries": "inquiries",
+    }
+
+    assert _fk_target("buyer_id", lookup) == "users"
+    assert _fk_target("seller_id", lookup) == "users"
+
+
 def test_dba_backstop_adds_missing_pk_and_unique_compound_fk_target():
     tables = [
         {"name": "pet_guardians", "columns": [{"name": "id", "type": "BIGINT", "constraints": ""},

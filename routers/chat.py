@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import unicodedata
 
 from fastapi import APIRouter
@@ -271,10 +272,16 @@ class ChatRequest(BaseModel):
 
 
 async def _call_openai(client, messages: list[dict], max_tokens: int) -> str:
-    """OpenAI 호출 (재시도 3회)"""
-    for attempt in range(3):
+    """채팅용 OpenAI 호출. SDK 재시도와 중복되지 않도록 명시적으로만 재시도한다."""
+    from main import settings
+
+    request_client = client.with_options(max_retries=0)
+    # 채팅은 빠른 피드백이 우선이므로 최대 1회만 재시도한다.
+    max_attempts = 1 + min(settings.openai_max_retries, 1)
+    started = time.perf_counter()
+    for attempt in range(max_attempts):
         try:
-            resp = await client.chat.completions.create(
+            resp = await request_client.chat.completions.create(
                 model=_chat_model(),
                 max_completion_tokens=max_tokens,
                 temperature=_TEMPERATURE,
@@ -284,10 +291,14 @@ async def _call_openai(client, messages: list[dict], max_tokens: int) -> str:
                 response_format={"type": "json_object"},
                 messages=messages,
             )
+            logger.info(
+                "채팅 LLM 응답 완료 | attempt=%d/%d elapsed=%.2fs max_tokens=%d",
+                attempt + 1, max_attempts, time.perf_counter() - started, max_tokens,
+            )
             return resp.choices[0].message.content or ""
         except (InternalServerError, APITimeoutError, APIConnectionError) as e:
             logger.warning("OpenAI 채팅 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
-            if attempt < 2:
+            if attempt + 1 < max_attempts:
                 await asyncio.sleep(3 * (attempt + 1))
             else:
                 raise
@@ -657,7 +668,7 @@ async def message(req: ChatRequest) -> dict:
         if q_idx >= _QUESTION_COUNT:
             return await _finish_collection(req.messages, user_msg_count, openai_client)
 
-        raw = await _call_openai(openai_client, collection_messages, max_tokens=800)
+        raw = await _call_openai(openai_client, collection_messages, max_tokens=600)
         logger.debug("Collection raw (%.400s)", raw)
 
         node = try_parse_json(raw)
@@ -674,25 +685,14 @@ async def message(req: ChatRequest) -> dict:
             or node.get("suggestion")  # 단수형 방어
         )
 
-        # 프롬프트 에코 방어 — 지시문의 예시 문장을 그대로 복사한 질문이면 이유를 명시해 재생성
+        # 프롬프트 에코 방어. 추가 LLM 재생성은 하지 않고 fallback을 사용해
+        # 한 번의 사용자 메시지가 여러 upstream 호출로 늘어나지 않게 한다.
         if not _is_valid_question(question):
-            logger.warning("질문이 프롬프트 에코/무효 (idx=%d): %r — 재생성", q_idx, question)
-            question, retry_suggestions = await _regenerate_question(
-                openai_client, collection_messages, q_idx,
-            )
-            if len(retry_suggestions) > len(suggestions):
-                suggestions = retry_suggestions
+            logger.warning("질문이 프롬프트 에코/무효 (idx=%d): %r — fallback 사용", q_idx, question)
 
-        # suggestions 보강 1단계: 맥락 기반 동적 생성
+        # suggestions가 부족해도 추가 LLM 호출을 하지 않고 정적 fallback으로 보충한다.
         if len(suggestions) < 3:
-            logger.warning("suggestions 부족 (%d/3, idx=%d) — 동적 생성 시도", len(suggestions), q_idx)
-            dynamic = await _generate_dynamic_suggestions(q_idx, context, openai_client)
-            if len(dynamic) > len(suggestions):
-                suggestions = dynamic
-
-        # 2단계: 그래도 부족하면 실제로 생성된 항목은 살리고 나머지만 정적 항목으로 채운다
-        if len(suggestions) < 3:
-            logger.warning("suggestions 생성 실패 (%d/3, idx=%d) — 정적 fallback 보충", len(suggestions), q_idx)
+            logger.warning("suggestions 부족 (%d/3, idx=%d) — 정적 fallback 보충", len(suggestions), q_idx)
             existing = {_normalize(s) for s in suggestions}
             for s in _QUESTIONS[q_idx]["fallback_suggestions"]:
                 if len(suggestions) >= 3:

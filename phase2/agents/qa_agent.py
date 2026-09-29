@@ -720,7 +720,7 @@ class QaAgent:
                         stem.removesuffix("y") + "ies",
                     })
                     if stem in {
-                        "owner", "renter", "borrower", "requester", "provider",
+                        "owner", "renter", "borrower", "requester", "provider", "buyer", "seller",
                         "actor", "creator", "uploader", "assignee", "reviewer",
                     } or stem.endswith("_user") or stem.endswith("_by"):
                         candidates.update({"user", "users"})

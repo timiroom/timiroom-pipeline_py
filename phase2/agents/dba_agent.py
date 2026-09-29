@@ -299,7 +299,7 @@ def _fk_target(col_name, name_lookup: dict[str, str]) -> str | None:
     # created_by_id, recorded_by_id, actor_user_id 같은 감사/행위자 FK는 users를 가리킨다.
     if stem.endswith("_user") or stem.endswith("_by") or stem in {
         "actor", "owner", "creator", "uploader", "assignee", "reviewer", "signer",
-        "renter", "borrower", "requester", "provider", "owner_user", "created_by_user", "updated_by_user", "recorded_by_user",
+        "renter", "borrower", "requester", "provider", "buyer", "seller", "owner_user", "created_by_user", "updated_by_user", "recorded_by_user",
         "processed_by_user", "changed_by_user", "actor_user", "generated_by_user",
         "user", "student", "member", "customer", "client", "operator",
         "teacher", "instructor", "participant", "applicant", "requester_user",
