@@ -43,14 +43,35 @@ jobs:
 
       - name: Update NAS GitOps image and sealed secret
         env:
-          ALL_SECRETS_JSON: ${{ toJSON(secrets) }}
+          PIPELINE_DB_URL: ${{ secrets.PIPELINE_DB_URL }}
+          PIPELINE_UPSTAGE_API_KEY: ${{ secrets.PIPELINE_UPSTAGE_API_KEY }}
+          PIPELINE_OPENAI_API_KEY: ${{ secrets.PIPELINE_OPENAI_API_KEY }}
+          PIPELINE_COHERE_API_KEY: ${{ secrets.PIPELINE_COHERE_API_KEY }}
+          PIPELINE_EXAONE_API_KEY: ${{ secrets.PIPELINE_EXAONE_API_KEY }}
+          PIPELINE_EXAONE_ENDPOINT_ID: ${{ secrets.PIPELINE_EXAONE_ENDPOINT_ID }}
         run: |
+          for required in \
+            PIPELINE_DB_URL \
+            PIPELINE_UPSTAGE_API_KEY \
+            PIPELINE_OPENAI_API_KEY \
+            PIPELINE_COHERE_API_KEY; do
+            if [ -z "${!required}" ]; then
+              echo "Required production secret is empty: $required" >&2
+              exit 1
+            fi
+          done
+
           git clone https://${{ secrets.GH_PAT }}@github.com/timiroom/timiroom-ops.git
           cd timiroom-ops/apps/rag-pipeline
           kustomize edit set image rag-pipeline-image=${{ secrets.DOCKER_USERNAME }}/timiroom-pipeline-py:${{ env.IMAGE_TAG }}
 
-          echo "$ALL_SECRETS_JSON" \
-            | jq -r 'to_entries[] | select(.key | startswith("PIPELINE_")) | "\(.key | sub("^PIPELINE_"; ""))=\(.value)"' \
+          printf '%s\n' \
+            "DB_URL=$PIPELINE_DB_URL" \
+            "UPSTAGE_API_KEY=$PIPELINE_UPSTAGE_API_KEY" \
+            "OPENAI_API_KEY=$PIPELINE_OPENAI_API_KEY" \
+            "COHERE_API_KEY=$PIPELINE_COHERE_API_KEY" \
+            "EXAONE_API_KEY=$PIPELINE_EXAONE_API_KEY" \
+            "EXAONE_ENDPOINT_ID=$PIPELINE_EXAONE_ENDPOINT_ID" \
             > temp-secrets.env
           test -s temp-secrets.env
           kubectl create secret generic rag-pipeline-secrets -n timiroom \
