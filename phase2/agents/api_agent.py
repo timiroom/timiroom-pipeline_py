@@ -9,6 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
+from phase2.agent_contract import feature_methods, requires_auth
 from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note, strictly_uncovered_features
 from phase2.feature_scope import backend_features
 from phase2.feature_registry import normalize_feature_registry, registry_text
@@ -142,6 +143,166 @@ def _existing_paths_note(paths: list[str] | None) -> str:
         "\n- ⚠️ 아래는 이미 설계된 엔드포인트입니다. 똑같은 method+path를 다시 만들지 말고,\n"
         "  담당 기능에 필요한데 아직 없는 것만 새로 설계하세요:\n" + listed + "\n"
     )
+
+
+def _parse_endpoint_text(raw: str, skeleton: dict) -> dict | None:
+    """Parse the bounded plain-text worker format without changing its identity fields."""
+    labels = {
+        "METHOD": "method", "PATH": "path", "DESCRIPTION": "description",
+        "AUTH_REQUIRED": "authRequired", "REQUEST_BODY": "requestBody",
+        "SUCCESS_RESPONSE": "successResponse", "ERROR_CODES": "errorCodes",
+    }
+    values: dict[str, str] = {}
+    current = None
+    for raw_line in (raw or "").replace("\r", "").splitlines():
+        line = raw_line.strip().strip("`*- ")
+        if not line or line.upper().startswith("SELF_CHECK:"):
+            continue
+        match = re.match(r"^([A-Z_]+)\s*:\s*(.*)$", line, re.I)
+        if match and match.group(1).upper() in labels:
+            current = labels[match.group(1).upper()]
+            values[current] = match.group(2).strip()
+        elif current:
+            values[current] = f"{values[current]} {line}".strip()
+    if not values:
+        return None
+    result = dict(skeleton)
+    result.update(values)
+    result["method"] = str(skeleton.get("method") or result.get("method") or "GET").upper()
+    result["path"] = str(skeleton.get("path") or result.get("path") or "/api/v1/unknown")
+    result["description"] = str(result.get("description") or skeleton.get("description") or "").strip()
+    if not result["description"]:
+        return None
+    result["authRequired"] = str(result.get("authRequired", True)).lower() in {"true", "1", "yes", "필요"}
+    result["requestBody"] = result.get("requestBody") or ("없음" if result["method"] in {"GET", "DELETE"} else "요청 데이터")
+    result["successResponse"] = result.get("successResponse") or "성공 응답"
+    result["errorCodes"] = result.get("errorCodes") or "400 - 잘못된 요청, 500 - 서버 오류"
+    return result
+
+
+def _feature_resource_slug(feature: str, index: int) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(feature or "").lower()).strip("-")
+    return f"{slug[:40]}-{index + 1}" if slug else f"feature-{index + 1}"
+
+
+def _feature_methods(feature: str) -> tuple[str, ...]:
+    return tuple(feature_methods(feature))
+
+
+def _api_feature_mappings(endpoints: list[dict], db_schema: str, feature_list: list[str]) -> list[dict]:
+    db = try_parse_json(db_schema or "{}") or {}
+    table_by_feature = {
+        str(item.get("featureName")): str(item.get("table") or "")
+        for item in db.get("featureMappings") or [] if isinstance(item, dict)
+    }
+    result = []
+    for feature in feature_list or []:
+        selected = [ep for ep in endpoints or [] if str(ep.get("featureName") or "") == str(feature)]
+        table = table_by_feature.get(str(feature), "")
+        if not selected and table:
+            prefix = f"/api/v1/{table.replace('_', '-')}"
+            selected = [ep for ep in endpoints or [] if str(ep.get("path") or "").startswith(prefix)]
+        if feature == "사용자별 데이터 접근 제어":
+            selected = [ep for ep in endpoints or [] if ep.get("authRequired") and not str(ep.get("path") or "").startswith("/api/v1/auth/")]
+        result.append({
+            "featureName": str(feature),
+            "table": table,
+            "operations": [{"method": str(ep.get("method") or ""), "path": str(ep.get("path") or "")} for ep in selected],
+        })
+    return result
+
+
+def _api_type(db_type: str) -> str:
+    value = str(db_type or "").upper()
+    if value in {"BIGINT", "INT", "INTEGER", "SMALLINT"}:
+        return "integer"
+    if value.startswith(("DECIMAL", "NUMERIC", "REAL", "DOUBLE")):
+        return "number"
+    if value == "BOOLEAN":
+        return "boolean"
+    if value == "JSONB":
+        return "object"
+    return "string"
+
+
+def _align_endpoints_to_db(endpoints: list[dict], db_schema: str, prd_document: str = "", requirement_text: str = "") -> list[dict]:
+    """Make API contracts concrete from the finalized tables without asking the model again."""
+    db = try_parse_json(db_schema or "{}") or {}
+    tables = [table for table in db.get("tables") or [] if isinstance(table, dict)]
+    by_name = {str(table.get("name") or ""): table for table in tables}
+    aliases = {
+        "ingredients": "inventory_items", "expiry-notifications": "expiration_notifications",
+        "assignees": "assigned_staff", "users": "tasks",
+    }
+    aligned = []
+    for original in endpoints or []:
+        endpoint = dict(original)
+        method = str(endpoint.get("method") or "GET").upper()
+        path = str(endpoint.get("path") or "")
+        resource = path.removeprefix("/api/v1/").split("/")[0].replace("-", "_")
+        table_name = aliases.get(resource, resource)
+        description = str(endpoint.get("description") or "")
+        if resource == "users" and "할 일" not in description:
+            table_name = "users"
+        table = by_name.get(table_name)
+        if table is None:
+            table = next((item for name, item in by_name.items() if name.replace("_", "-") == resource), None)
+            table_name = str(table.get("name")) if table else table_name
+        if table:
+            path = f"/api/v1/{table_name.replace('_', '-')}" + ("/{id}" if "/{id}" in path else "")
+            endpoint["path"] = path
+            columns = [column for column in table.get("columns") or [] if isinstance(column, dict)]
+            writable = [column for column in columns if str(column.get("name")) not in {"id", "created_at", "updated_at"} and not str(column.get("name", "")).endswith("_id")]
+            if method in {"POST", "PUT", "PATCH"}:
+                endpoint["requestBody"] = ", ".join(f"{column.get('name')}: {_api_type(column.get('type'))}" for column in writable) or "payload: object"
+            elif method in {"GET", "DELETE"}:
+                endpoint["requestBody"] = "없음"
+            endpoint["successResponse"] = endpoint.get("successResponse") if "[]" in str(endpoint.get("successResponse") or "") else ("items: array" if method == "GET" and "/{id}" not in path else "id: integer")
+        endpoint["errorCodes"] = "400, 401, 404, 500" if endpoint.get("authRequired") else "400, 404, 500"
+        if method in {"POST", "PUT", "PATCH", "DELETE"}:
+            endpoint["transactionRules"] = "단일 DB 트랜잭션으로 검증과 변경을 처리하고 실패 시 롤백한다."
+        aligned.append(endpoint)
+    return aligned
+
+
+def _ensure_auth_endpoints(endpoints: list[dict], auth_required: bool) -> list[dict]:
+    if not auth_required:
+        return endpoints
+    required = [
+        ("POST", "/api/v1/auth/signup", "회원 가입 및 로그인"),
+        ("POST", "/api/v1/auth/login", "회원 가입 및 로그인"),
+        ("POST", "/api/v1/auth/refresh", "인증 세션 관리"),
+        ("POST", "/api/v1/auth/logout", "인증 세션 관리"),
+        ("GET", "/api/v1/users/me", "내 정보 및 계정 관리"),
+        ("PATCH", "/api/v1/users/me", "내 정보 및 계정 관리"),
+        ("DELETE", "/api/v1/users/me", "내 정보 및 계정 관리"),
+    ]
+    existing = {(str(ep.get("method") or "").upper(), str(ep.get("path") or "")) for ep in endpoints or []}
+    result = [ep for ep in endpoints or [] if str(ep.get("path") or "") not in {"/api/v1/users/profile", "/api/v1/users/register"}]
+    for method, path, feature in required:
+        if (method, path) not in existing:
+            result.append({"method": method, "path": path, "featureName": feature, "description": f"{feature}: 계약 처리", "authRequired": not path.endswith(("signup", "login", "refresh")), "requestBody": "없음" if method in {"GET", "DELETE"} else "payload: object", "successResponse": "id: integer", "errorCodes": "400, 401, 404, 500"})
+    return result
+
+
+def _ensure_feature_endpoint_groups(
+    endpoints: list[dict], db_schema: str, feature_list: list[str], prd_document: str = "",
+) -> list[dict]:
+    result = _align_endpoints_to_db(list(endpoints or []), db_schema, prd_document)
+    for feature in feature_list or []:
+        related = [ep for ep in result if str(ep.get("featureName") or "") == str(feature)]
+        table = str(feature).lower().replace(" ", "-")
+        if not related:
+            path = f"/api/v1/{table}"
+            for method in _feature_methods(str(feature)):
+                result.append(_align_endpoints_to_db([{
+                    "method": method,
+                    "path": path if method in {"GET", "POST"} else f"{path}/{{id}}",
+                    "featureName": feature,
+                    "description": f"{feature}: 계약 처리",
+                    "authRequired": requires_auth(prd_document, [str(feature)]),
+                }], db_schema, prd_document)[0])
+    return result
 
 ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
 아래 엔드포인트 스켈레톤 1개에 대한 상세 REST API 스펙을 JSON으로 작성하세요.

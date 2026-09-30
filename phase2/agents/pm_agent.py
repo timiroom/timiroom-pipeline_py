@@ -107,6 +107,53 @@ def repair_feature_name(name) -> str | None:
     logger.warning("PM 기능명 손상(%s) — 제외: %r", reason, stripped)
     return None
 
+
+def _split_detail(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"\s*[;,]\s*", str(value or "")) if part.strip()]
+
+
+def _parse_feature_detail(raw: str) -> dict[str, list[str]]:
+    result = {key: [] for key in ("actions", "dataRequirements", "permissionRules", "errorCases", "acceptanceCriteria", "ownership", "states", "stateTransitions", "transactionRules")}
+    labels = {"ACTIONS": "actions", "DATA": "dataRequirements", "RULES": "permissionRules", "ERRORS": "errorCases", "ACCEPTANCE": "acceptanceCriteria", "OWNERSHIP": "ownership", "STATES": "states", "TRANSITIONS": "stateTransitions", "TRANSACTIONS": "transactionRules"}
+    for line in (raw or "").replace("\r", "").splitlines():
+        if ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        key = labels.get(label.strip().upper())
+        if key:
+            result[key] = _split_detail(value)
+    return result
+
+
+def _parse_plain_pm(raw: str, form_features: list[str]) -> dict:
+    features, specs = [], []
+    current = None
+    dba_instruction = api_instruction = ""
+    fields = {"PARENT": "parentFeature", "ORIGIN": "origin", "SOURCE": "source", "RATIONALE": "rationale", "PRIORITY": "priority", "ACTIONS": "actions", "DATA": "dataRequirements", "RULES": "permissionRules", "ERRORS": "errorCases", "ACCEPTANCE": "acceptanceCriteria"}
+    for line in (raw or "").replace("\r", "").splitlines():
+        line = line.strip().strip("`*- ")
+        upper = line.upper()
+        if upper.startswith("FEATURE:"):
+            if current:
+                specs.append(current)
+            value = line.split(":", 1)[1].strip()
+            if value:
+                features.append(value)
+                current = {"name": value}
+        elif upper.startswith("DBA_INSTRUCTION:"):
+            dba_instruction = line.split(":", 1)[1].strip()
+        elif upper.startswith("API_INSTRUCTION:"):
+            api_instruction = line.split(":", 1)[1].strip()
+        elif current and ":" in line:
+            label, value = line.split(":", 1)
+            key = fields.get(label.strip().upper())
+            if key:
+                current[key] = _split_detail(value) if key in {"source", "actions", "dataRequirements", "permissionRules", "errorCases", "acceptanceCriteria"} else value.strip()
+    if current:
+        specs.append(current)
+    names = ", ".join(form_features or features) or "승인된 기능"
+    return {"featureList": features, "featureSpecs": specs, "dbaInstruction": dba_instruction or f"{names}에 필요한 테이블과 외래키를 설계합니다.", "apiInstruction": api_instruction or f"{names}의 REST API 계약을 설계합니다.", "selfCheck": "PASS"}
+
 # 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
 _TOP_P = 0.95

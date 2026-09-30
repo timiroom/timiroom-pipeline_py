@@ -24,6 +24,50 @@ from phase2.state import PipelineState
 logger = logging.getLogger(__name__)
 
 
+def _apply_review_patches(domain: str, draft_data: dict, patches: dict) -> dict:
+    """Apply only named QA patches while preserving unrelated generated output."""
+    if not isinstance(draft_data, dict) or not isinstance(patches, dict):
+        return draft_data
+    result = dict(draft_data)
+    if domain == "db":
+        updates = patches.get("tables")
+        if isinstance(updates, dict):
+            updates = [dict(value, name=name) for name, value in updates.items() if isinstance(value, dict)]
+        if isinstance(updates, list):
+            current = {str(item.get("name")): item for item in result.get("tables") or [] if isinstance(item, dict)}
+            for item in updates:
+                if isinstance(item, dict) and item.get("name"):
+                    current[str(item["name"])] = item
+            result["tables"] = list(current.values())
+        if isinstance(patches.get("relationships"), list):
+            result["relationships"] = list(dict.fromkeys([*(result.get("relationships") or []), *patches["relationships"]]))
+    elif domain == "api" and isinstance(patches.get("endpoints"), list):
+        current = {(str(item.get("method") or "").upper(), str(item.get("path") or "")): item for item in result.get("endpoints") or [] if isinstance(item, dict)}
+        for item in patches["endpoints"]:
+            if isinstance(item, dict):
+                current[(str(item.get("method") or "").upper(), str(item.get("path") or ""))] = item
+        result["endpoints"] = list(current.values())
+    elif domain == "prd":
+        for key, value in patches.items():
+            if isinstance(value, list):
+                result[key] = value
+            elif key in {"projectOverview", "background", "authentication"}:
+                result[key] = value
+    return result
+
+
+def _derive_patches_from_full_output(domain: str, draft_data: dict, fixed: dict) -> dict:
+    if not isinstance(fixed, dict):
+        return {}
+    if domain == "db":
+        return {key: fixed[key] for key in ("tables", "relationships") if isinstance(fixed.get(key), list)}
+    if domain == "api":
+        return {key: fixed[key] for key in ("endpoints", "authentication") if key in fixed}
+    if domain == "prd":
+        return {key: fixed[key] for key in ("coreFeatures", "goals", "kpi", "userPersonas", "releaseSchedule", "mvpScope") if key in fixed}
+    return {}
+
+
 def _same_table_name(left: str, right: str) -> bool:
     """Compare canonical table names with regular plural variants (classes/class)."""
     return bool(left and right) and (

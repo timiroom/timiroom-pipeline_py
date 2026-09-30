@@ -773,6 +773,104 @@ def reconcile_fk_types(tables: list) -> list:
     return tables
 
 
+def _ensure_column(table: dict, name: str, col_type: str, constraints: str = "") -> None:
+    for column in table.setdefault("columns", []):
+        if isinstance(column, dict) and str(column.get("name")) == name:
+            column.update({"type": col_type, "constraints": constraints})
+            return
+    table["columns"].append({"name": name, "type": col_type, "constraints": constraints})
+
+
+def _ensure_auth_contract_tables(tables: list[dict]) -> list[dict]:
+    users = next((table for table in tables if table.get("name") == "users"), None)
+    if users is None:
+        users = {"name": "users", "description": "회원 가입 및 로그인", "columns": [], "indexes": []}
+        tables.append(users)
+    for name, typ, constraint in (("id", "BIGINT", "PRIMARY_KEY"), ("email", "VARCHAR(320)", "NOT_NULL UNIQUE"), ("password_hash", "VARCHAR(255)", "NOT_NULL"), ("created_at", "TIMESTAMPTZ", "NOT_NULL")):
+        _ensure_column(users, name, typ, constraint)
+    sessions = next((table for table in tables if table.get("name") == "refresh_tokens"), None)
+    if sessions is None:
+        sessions = {"name": "refresh_tokens", "description": "인증 세션 관리", "columns": [], "indexes": []}
+        tables.append(sessions)
+    _ensure_column(sessions, "id", "BIGINT", "PRIMARY_KEY")
+    _ensure_column(sessions, "user_id", "BIGINT", "NOT_NULL FOREIGN_KEY REFERENCES users(id)")
+    _ensure_column(sessions, "token_hash", "VARCHAR(255)", "NOT_NULL UNIQUE")
+    _ensure_column(sessions, "expires_at", "TIMESTAMPTZ", "NOT_NULL")
+    return tables
+
+
+def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None) -> list[dict]:
+    result = []
+    for spec in feature_specs or []:
+        if not isinstance(spec, dict) or not spec.get("name"):
+            continue
+        name = str(spec["name"])
+        if name in {"회원 가입 및 로그인", "내 정보 및 계정 관리", "사용자별 데이터 접근 제어"}:
+            table = next((item for item in tables if item.get("name") == "users"), None)
+        elif name == "인증 세션 관리":
+            table = next((item for item in tables if item.get("name") == "refresh_tokens"), None)
+        else:
+            table = next((item for item in tables if name in str(item.get("description") or "")), None)
+            if table is None:
+                table = next((item for item in tables if item.get("name") not in {"users", "refresh_tokens"}), None)
+        result.append({"featureName": name, "table": str(table.get("name")) if table else ""})
+    return result
+
+
+def enforce_schema_contracts(tables: list[dict], feature_list: list[str] | None = None, prd_document: str = "") -> list[dict]:
+    return ensure_domain_columns(reconcile_fk_types(ensure_primary_keys(tables or [])))
+
+
+def ensure_domain_columns(tables: list[dict]) -> list[dict]:
+    for table in tables or []:
+        for column in table.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            typ = str(column.get("type") or "").upper()
+            if typ in {"DATETIME", "TIMESTAMP WITH TIME ZONE"}:
+                column["type"] = "TIMESTAMPTZ"
+            elif typ == "INT":
+                column["type"] = "INTEGER"
+            column["constraints"] = re.sub(r"\bAUTO_INCREMENT\b|\bON UPDATE\b", "", str(column.get("constraints") or ""), flags=re.I).strip()
+    return tables
+
+
+def _parse_table_plan_text(raw: str) -> list[dict]:
+    result, seen = [], set()
+    for line in (raw or "").splitlines():
+        if not line.upper().startswith("TABLE:"):
+            continue
+        parts = [part.strip() for part in line.split("|||", 1)]
+        name = parts[0].split(":", 1)[1].strip().lower()
+        if _VALID_TABLE_NAME_RE.match(name) and name not in seen:
+            seen.add(name)
+            result.append({"name": name, "purpose": parts[1] if len(parts) > 1 else name})
+    return result
+
+
+def _parse_table_text(raw: str, name: str, purpose: str) -> dict | None:
+    description, columns, indexes = purpose, [], []
+    for line in (raw or "").splitlines():
+        line = line.strip().strip("`*- ")
+        upper = line.upper()
+        if upper.startswith("DESCRIPTION:"):
+            description = line.split(":", 1)[1].strip() or purpose
+        elif upper.startswith("COLUMN:") and line.split(":", 1)[1].strip():
+            columns.append(line.split(":", 1)[1].strip())
+        elif upper.startswith("INDEX:") and line.split(":", 1)[1].strip():
+            indexes.append(line.split(":", 1)[1].strip())
+    return {"name": name, "description": description, "columns": columns, "indexes": indexes} if columns else None
+
+
+def enforce_feature_relation_contracts(tables: list[dict], feature_list: list[str], auth_required: bool) -> list[dict]:
+    principal = next((table for table in tables if table.get("name") in {"users", "accounts", "members"}), None)
+    for table in tables:
+        if principal and auth_required and table is not principal and table.get("name") != "refresh_tokens":
+            _ensure_reference_column(table, str(principal["name"]))
+        table["columns"] = [column for column in table.get("columns") or [] if isinstance(column, dict)]
+    return reconcile_fk_types(tables)
+
+
 def _existing_relationship_pairs(relationships: list, table_names: set[str]) -> set[frozenset[str]]:
     """각 relationship 문자열에 실제 테이블명이 몇 개 언급됐는지 확인해 이미 다뤄진
     테이블 쌍을 추출한다 — LLM이 일부 관계만 채운 경우 FK 합성이 이미 다룬 쌍까지

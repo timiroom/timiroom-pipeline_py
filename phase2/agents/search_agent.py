@@ -16,6 +16,22 @@ _TEMPERATURE = 1.0
 _TOP_P = 0.95
 _PRESENCE_PENALTY = 0.0
 
+_STATISTICAL_PHRASES = (
+    "1인 가구", "맞벌이 가구", "청년", "고령자", "소상공인", "자영업",
+    "전자상거래", "온라인 쇼핑", "식품 소비", "반려동물", "취업", "주거",
+)
+
+
+def _select_public_search_keyword(user_query: str, model_domain: str) -> str:
+    compact = re.sub(r"\s+", " ", user_query or "")
+    for phrase in _STATISTICAL_PHRASES:
+        if phrase in compact:
+            return phrase
+    household = re.search(r"\b\d+인\s*가구\b", compact)
+    if household:
+        return re.sub(r"\s*", "", household.group(0)).replace("가구", " 가구")
+    return model_domain
+
 
 class SearchAgent:
 

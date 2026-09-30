@@ -1,5 +1,4 @@
 import asyncio
-import io
 import logging
 import logging.config
 import sys
@@ -7,11 +6,18 @@ import sys
 import psycopg2
 import httpx
 
-# Windows cp949 터미널에서 UTF-8 출력 강제
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "buffer"):
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+# Windows cp949 터미널에서 UTF-8 출력 강제.
+# 기존 스트림을 새 TextIOWrapper로 감싸면 pytest 캡처 스트림의 소유권을
+# 가져가 종료 시 캡처 파일을 닫을 수 있으므로, 지원되는 경우 설정만 갱신한다.
+def _configure_utf8_stdio():
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_utf8_stdio()
 
 from contextlib import asynccontextmanager
 

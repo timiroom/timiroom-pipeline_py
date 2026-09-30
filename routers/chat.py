@@ -241,6 +241,23 @@ def _is_valid_question(text) -> bool:
     return isinstance(text, str) and len(text.strip()) >= _MIN_MESSAGE_LEN and not _is_echo(text)
 
 
+def _extract_question_from_raw(raw: str) -> str | None:
+    try:
+        parsed = json.loads((raw or "").strip().strip("`"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("MESSAGE", "message", "question"):
+            value = parsed.get(key)
+            if isinstance(value, str) and _is_valid_question(value):
+                return value
+    for line in (raw or "").splitlines():
+        line = re.sub(r"^(?:MESSAGE|질문)\s*[:：]\s*", "", line.strip(), flags=re.I)
+        if _is_valid_question(line):
+            return line
+    return None
+
+
 def _clean_suggestions(raw) -> list[str]:
     """자리표시자·에코·중복·과도하게 짧은 항목을 제거하고 최대 3개로 정리."""
     if not isinstance(raw, list):
@@ -260,6 +277,69 @@ def _clean_suggestions(raw) -> list[str]:
         if len(out) == 3:
             break
     return out
+
+
+def _parse_labeled_text(raw: str, repeated: set[str] | None = None) -> dict[str, str | list[str]]:
+    repeated = repeated or set()
+    result: dict[str, str | list[str]] = {}
+    for line in (raw or "").splitlines():
+        if ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        label, value = label.strip().upper(), value.strip()
+        if not label or not value:
+            continue
+        if label in repeated:
+            result.setdefault(label, [])
+            if isinstance(result[label], list):
+                result[label].append(value)
+        else:
+            result[label] = value
+    return result
+
+
+def _is_valid_generated_project_name(text: str) -> bool:
+    value = (text or "").strip()
+    if not (2 <= len(value) <= 24) or " " in value or _is_echo(value):
+        return False
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", value):
+        return True
+    return bool(re.fullmatch(r"[가-힣A-Za-z0-9]+", value)) and value.endswith(("메이트", "플로우", "허브", "보드", "노트", "링크", "체크", "매니저", "톡", "업", "온"))
+
+
+def _extract_service_subject(state: dict) -> str:
+    source = " ".join([str(state.get("idea") or ""), *[str(item) for item in state.get("answers") or []]])
+    match = re.search(r"(?:에서|으로)\s+(.{2,16}?)(?:을|를)\s+(?:자동|한눈|통합|정리|모으|관리)", source)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"(.{2,16}?)(?:이|가)\s+(?:한눈|자동|통합)", source)
+    return match.group(1).strip() if match else "핵심 항목"
+
+
+def _contextual_fallback_suggestions(stage: int, state: dict) -> list[str]:
+    if stage != 5:
+        return _QUESTIONS[stage].get("fallback_suggestions", []) if 0 <= stage < len(_QUESTIONS) else []
+    subject = _extract_service_subject(state)
+    return [
+        f"{subject} 등록, {subject} 목록 조회, {subject} 수정 및 삭제",
+        f"{subject} 자동 분류, {subject} 우선순위 설정, {subject} 변경 알림",
+        f"{subject} 검색 및 필터, {subject} 공유, {subject} 변경 이력 조회",
+    ]
+
+
+def _clean_stage_suggestions(raw, stage: int, context: str = "") -> list[str]:
+    cleaned = _clean_suggestions(raw)
+    if stage == 5:
+        cleaned = [item for item in cleaned if len([part for part in item.split(",") if part.strip()]) >= 3]
+    return cleaned[:3]
+
+
+def _collect_interview_state(messages: list["ChatMessageDto"]) -> dict:
+    user_answers = [message.content.strip() for message in messages if message.role == "user" and message.content.strip()]
+    if not user_answers:
+        return {"idea": "", "answers": [], "stage": 0, "invalid": None, "extras": []}
+    answers = user_answers[1:]
+    return {"idea": user_answers[0], "answers": answers, "stage": min(len(answers), 7), "invalid": None, "extras": []}
 
 
 class ChatMessageDto(BaseModel):

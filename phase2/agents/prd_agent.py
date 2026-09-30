@@ -519,6 +519,46 @@ def _fallback_section(section_key: str, feature_list: list[str], user_query: str
             "background": f"'{(user_query or '이 서비스')[:80]}' 요구사항을 기반으로 한 서비스입니다. "
                           "자동 생성에 실패하여 상세 배경 설명이 채워지지 않았습니다. 수동 보완이 필요합니다.",
         }
+
+
+def _parse_plain_section(section: str, raw: str, feature_list: list[str], user_query: str) -> dict | None:
+    labels: dict[str, str] = {}
+    current = None
+    for raw_line in (raw or "").replace("\r", "").splitlines():
+        line = raw_line.strip().strip("`*- ")
+        if not line:
+            continue
+        match = re.match(r"^([A-Za-z_]+)\s*:\s*(.*)$", line)
+        if match:
+            current = match.group(1).upper()
+            labels[current] = match.group(2).strip()
+        elif current:
+            labels[current] = f"{labels[current]} {line}".strip()
+    if section == "projectOverview":
+        overview = labels.get("OVERVIEW") or user_query
+        background = labels.get("BACKGROUND") or f"{user_query}에서 확인된 문제를 해결할 시장 기회가 있습니다."
+        return {"projectOverview": overview, "background": background}
+    if section == "mvpScope":
+        features = [item for item in feature_list if isinstance(item, str) and item.strip()]
+        split = max(1, min(3, len(features)))
+        return {"mvpScope": {"included": features[:split], "excluded": features[split:], "rationale": labels.get("RATIONALE") or "사용자 가치와 구현 의존도가 높은 기능을 우선합니다."}}
+    if section == "techStack":
+        mapping = {"BACKEND": "backend", "FRONTEND": "frontend", "DATABASE": "database", "CACHE": "cache", "MESSAGE_QUEUE": "messageQueue", "CDN": "cdn", "MONITORING": "monitoring", "AUTH": "auth"}
+        tech = {}
+        for label, field in mapping.items():
+            if labels.get(label):
+                tech[field] = labels[label]
+        return {"techStack": tech}
+    return None
+
+
+def _build_plain_section_prompt(section: str, ctx: dict) -> str:
+    common = f"요구사항: {ctx.get('user_query', '')}\n기능 목록: {ctx.get('feature_str', '')}\n"
+    if section == "projectOverview":
+        return common + "OVERVIEW: 서비스 개요\nBACKGROUND: 시장 배경"
+    if section == "mvpScope":
+        return common + "RATIONALE: MVP 포함·제외 기준"
+    return common + "BACKEND: 기술과 선택 이유\nFRONTEND: 기술과 선택 이유\nDATABASE: 기술과 선택 이유\nAUTH: 인증 방식"
     if section_key == "goalsKpi":
         return {
             "goals": [f"{f}을(를) 통해 사용자 핵심 문제를 해결하여 서비스 목표에 기여한다" for f in features[:3]],
