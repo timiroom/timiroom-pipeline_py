@@ -7,8 +7,8 @@ from pydantic import ValidationError
 from phase1.document_ingestion import DocumentIngestionService
 from phase2.state import PipelineState
 from phase4.event import PipelineResultEvent
-from phase4.kafka_consumer import KafkaConsumerService
 from phase4.kafka_connection import build_kafka_client_options
+from phase4.kafka_consumer import KafkaConsumerService
 from phase4.kafka_producer import KafkaProducerService
 
 
