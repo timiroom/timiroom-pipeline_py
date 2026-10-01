@@ -8,6 +8,7 @@ from phase1.document_ingestion import DocumentIngestionService
 from phase2.state import PipelineState
 from phase4.event import PipelineResultEvent
 from phase4.kafka_consumer import KafkaConsumerService
+from phase4.kafka_connection import build_kafka_client_options
 from phase4.kafka_producer import KafkaProducerService
 
 
@@ -124,6 +125,24 @@ def test_consumer_is_configured_for_manual_commit(monkeypatch):
 
     assert captured["enable_auto_commit"] is False
     assert captured["max_poll_interval_ms"] == 900_000
+
+
+def test_plaintext_kafka_keeps_legacy_client_options():
+    assert build_kafka_client_options() == {}
+
+
+def test_sasl_ssl_kafka_passes_authentication_and_tls_options():
+    options = build_kafka_client_options(
+        security_protocol="SASL_SSL",
+        sasl_mechanism="SCRAM-SHA-512",
+        sasl_username="local-pipeline",
+        sasl_password="test-password",
+    )
+    assert options["security_protocol"] == "SASL_SSL"
+    assert options["sasl_mechanism"] == "SCRAM-SHA-512"
+    assert options["sasl_plain_username"] == "local-pipeline"
+    assert options["sasl_plain_password"] == "test-password"
+    assert options["ssl_context"].check_hostname is True
 
 
 def test_consumer_commits_only_after_processing():

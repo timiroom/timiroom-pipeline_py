@@ -58,6 +58,7 @@ from phase3.retry_service import RetryService
 from phase3.schema_validator import SchemaValidator
 from phase3.validation_service import ValidationService
 from phase4.kafka_consumer import KafkaConsumerService
+from phase4.kafka_connection import build_kafka_client_options
 from phase4.kafka_producer import KafkaProducerService
 
 # ── 로깅 설정 (requestId 컨텍스트 포함) ──────────────────────────
@@ -205,11 +206,21 @@ retry_service = RetryService(
 
 # ── Phase 4 ───────────────────────────────────────────────────────
 
+kafka_client_options = build_kafka_client_options(
+    security_protocol=settings.kafka_security_protocol,
+    sasl_mechanism=settings.kafka_sasl_mechanism,
+    sasl_username=settings.kafka_sasl_plain_username,
+    sasl_password=settings.kafka_sasl_plain_password,
+    ssl_cafile=settings.kafka_ssl_cafile,
+    ssl_check_hostname=settings.kafka_ssl_check_hostname,
+)
+
 kafka_producer_service = KafkaProducerService(
     bootstrap_servers=settings.kafka_bootstrap_servers,
     topic=settings.kafka_topic_pipeline_result,
     db_url=settings.db_url,
     max_publish_retry=settings.kafka_publish_max_retry,
+    kafka_client_options=kafka_client_options,
 )
 kafka_consumer_service = KafkaConsumerService(
     bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -218,6 +229,7 @@ kafka_consumer_service = KafkaConsumerService(
     ingestion_service=document_ingestion_service,
     dead_letter_topic=settings.kafka_topic_dead_letter,
     max_poll_interval_ms=settings.kafka_max_poll_interval_ms,
+    kafka_client_options=kafka_client_options,
 )
 
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import OffsetAndMetadata, TopicPartition
@@ -25,6 +26,7 @@ class KafkaConsumerService:
         ingestion_service: DocumentIngestionService,
         dead_letter_topic: str | None = None,
         max_poll_interval_ms: int = 900_000,
+        kafka_client_options: dict[str, Any] | None = None,
     ):
         self._bootstrap = bootstrap_servers
         self._topic = topic
@@ -32,6 +34,7 @@ class KafkaConsumerService:
         self._ingestion = ingestion_service
         self._dlq_topic = dead_letter_topic
         self._max_poll_interval_ms = max_poll_interval_ms
+        self._kafka_client_options = dict(kafka_client_options or {})
         self._consumer: AIOKafkaConsumer | None = None
         self._dlq_producer: AIOKafkaProducer | None = None
         self._main_task: asyncio.Task | None = None
@@ -85,6 +88,7 @@ class KafkaConsumerService:
             auto_offset_reset="earliest",
             enable_auto_commit=False,
             max_poll_interval_ms=self._max_poll_interval_ms,
+            **self._kafka_client_options,
         )
 
     async def _consume_loop(self) -> None:
@@ -131,6 +135,7 @@ class KafkaConsumerService:
                 bootstrap_servers=self._bootstrap,
                 acks="all",
                 enable_idempotence=True,
+                **self._kafka_client_options,
             )
             await producer.start()
             self._dlq_producer = producer
