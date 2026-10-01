@@ -20,7 +20,12 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: ruff check config/settings.py tests
+      # Unit tests import the application module but do not make OpenAI calls.
+      # Supply a non-secret placeholder so client construction does not require
+      # an operational credential in GitHub Actions.
       - run: pytest -q
+        env:
+          OPENAI_API_KEY: ci-test-placeholder
       - run: python -m compileall -q common config phase1 phase2 phase3 phase4 routers main.py migrate_db.py
 
   docker:
