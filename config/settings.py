@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     kafka_consumer_group_id: str = "rag-pipeline-group"
     kafka_publish_max_retry: int = 3
     kafka_max_poll_interval_ms: int = 900000
+    # Defaults keep the existing in-cluster PLAINTEXT Kafka connection working.
+    kafka_security_protocol: str = "PLAINTEXT"
+    kafka_sasl_mechanism: str = ""
+    kafka_sasl_plain_username: str = ""
+    kafka_sasl_plain_password: str = ""
+    kafka_ssl_cafile: str = ""
+    kafka_ssl_check_hostname: bool = True
 
     # ── RAG ───────────────────────────────────────────────────────
     rag_chunk_size: int = 512
@@ -109,6 +116,15 @@ class Settings(BaseSettings):
             raise ValueError("KAFKA_PUBLISH_MAX_RETRY는 1 이상이어야 합니다")
         if self.kafka_max_poll_interval_ms <= 0:
             raise ValueError("KAFKA_MAX_POLL_INTERVAL_MS는 1 이상이어야 합니다")
+        protocol = self.kafka_security_protocol.upper()
+        if protocol not in {"PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"}:
+            raise ValueError("KAFKA_SECURITY_PROTOCOL이 지원되지 않습니다")
+        if protocol.startswith("SASL_") and not (
+            self.kafka_sasl_mechanism
+            and self.kafka_sasl_plain_username
+            and self.kafka_sasl_plain_password
+        ):
+            raise ValueError("SASL Kafka 연결에는 mechanism, username, password가 필요합니다")
         return self
 
     def get_allowed_origins(self) -> list[str]:

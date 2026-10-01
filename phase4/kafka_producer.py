@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from typing import Any
 from datetime import UTC, datetime
 
 import psycopg2
@@ -82,6 +83,7 @@ class KafkaProducerService:
         db_url: str,
         max_publish_retry: int = 3,
         outbox: KafkaOutbox | None = None,
+        kafka_client_options: dict[str, Any] | None = None,
     ):
         if max_publish_retry <= 0:
             raise ValueError("max_publish_retry는 1 이상이어야 합니다")
@@ -89,6 +91,7 @@ class KafkaProducerService:
         self._bootstrap = bootstrap_servers
         self._max_publish_retry = max_publish_retry
         self._outbox = outbox or KafkaOutbox(db_url)
+        self._kafka_client_options = dict(kafka_client_options or {})
         self._producer: AIOKafkaProducer | None = None
         self._ready = False
         self._main_task: asyncio.Task | None = None
@@ -196,6 +199,7 @@ class KafkaProducerService:
                 key_serializer=lambda key: key.encode("utf-8") if key else None,
                 acks="all",
                 enable_idempotence=True,
+                **self._kafka_client_options,
             )
             try:
                 await producer.start()
