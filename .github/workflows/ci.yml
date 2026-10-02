@@ -11,6 +11,11 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # main 모듈 import 시 SDK client가 생성된다. 단위 테스트는 외부 API를
+      # 호출하지 않으므로 운영 secret 대신 명시적인 비운영 placeholder를 쓴다.
+      OPENAI_API_KEY: ci-not-a-real-key
+      UPSTAGE_API_KEY: ci-not-a-real-key
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
