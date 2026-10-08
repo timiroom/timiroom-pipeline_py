@@ -242,6 +242,7 @@ def _api_type(db_type: str) -> str:
 
 def _align_endpoints_to_db(
     endpoints: list[dict], db_schema: str, prd_document: str = "", requirement_text: str = "",
+    *, declared_table_name: str | None = None,
 ) -> list[dict]:
     """API manager owns the final contract and derives field names from the finalized ERD."""
     db = try_parse_json(db_schema or "{}") or {}
@@ -272,9 +273,10 @@ def _align_endpoints_to_db(
                 aligned.append(own_ep)
             continue
         slug = path.removeprefix("/api/v1/").split("/", 1)[0]
-        table = tables.get(slug.replace("-", "_"))
+        declared_table = tables.get(declared_table_name or "")
+        table = declared_table or tables.get(slug.replace("-", "_"))
         feature_label = str(ep.get("featureName") or ep.get("description") or "").split(":", 1)[0].strip()
-        if table and (_column_names(table) & {"credential_hash", "password_hash", "login_id"}):
+        if table and not declared_table and (_column_names(table) & {"credential_hash", "password_hash", "login_id"}):
             if not any(token in feature_label.lower() for token in ("로그인", "회원", "계정", "auth", "user account")):
                 table = None
         if not table:
@@ -339,10 +341,11 @@ def _align_endpoints_to_db(
                 ep["path"] = path
                 slug = normalized_slug
         # A catalog endpoint must not accidentally own user-specific mutable state.
-        # If one unambiguous stateful aggregate references that catalog, make it the API resource.
+        # A declared table remains authoritative. Inference needs endpoint intent;
+        # an incoming FK alone does not turn a catalog read into personal data.
         table_columns = _column_names(table) if table else set()
         is_stateful_resource = bool(table and "user_id" in table_columns and table_columns & _STATE_FIELD_NAMES)
-        if table and not is_stateful_resource and "user_id" not in table_columns:
+        if table and not declared_table and not is_stateful_resource and "user_id" not in table_columns:
             aggregate = _stateful_aggregate_for_catalog(str(table.get("name") or ""), tables)
             endpoint_meaning = str(ep.get("featureName") or ep.get("description") or "")
             catalog_score = max(
@@ -353,7 +356,17 @@ def _align_endpoints_to_db(
                 relevance_score(str(aggregate.get("description") or ""), endpoint_meaning),
                 relevance_score(endpoint_meaning, str(aggregate.get("description") or "")),
             ) if aggregate else 0.0
-            if aggregate:
+            requested_fields = set(re.findall(r"\b([a-z][a-z0-9_]*)\s*:", str(ep.get("requestBody") or "")))
+            aggregate_state_fields = (_column_names(aggregate) - table_columns) & _STATE_FIELD_NAMES if aggregate else set()
+            stateful_intent = (
+                aggregate_score > catalog_score
+                or bool(requested_fields & aggregate_state_fields)
+                or (bool(ep.get("authRequired")) and bool(re.search(
+                    r"등록|추가|저장|수정|변경|삭제|소비|\b(?:add|create|save|update|delete|consume)\b",
+                    endpoint_meaning, re.I,
+                )))
+            )
+            if aggregate and stateful_intent:
                 old_slug = slug
                 table = aggregate
                 slug = str(table["name"]).replace("_", "-")
@@ -856,7 +869,10 @@ def finalize_api_contracts(
         ):
             resource, _, suffix = original_path.removeprefix("/api/v1/").partition("/")
             draft["path"] = f"/api/v1/{candidates[0].replace('_', '-')}" + (f"/{suffix}" if suffix else "")
-        contracts = _align_endpoints_to_db([draft], db_schema, prd_document, requirement_text)
+        contracts = _align_endpoints_to_db(
+            [draft], db_schema, prd_document, requirement_text,
+            declared_table_name=candidates[0] if explicit_route and len(candidates) == 1 else None,
+        )
         for contract in contracts:
             if explicit_route:
                 contract["path"] = original_path

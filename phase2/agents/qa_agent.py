@@ -24,7 +24,7 @@ from phase2.state import PipelineState
 from phase2.agents.dba_agent import _build_name_lookup
 from phase2.agents.api_agent import _endpoint_quality_issues, _feature_methods, _feature_resource_slug
 from phase2.agent_contract import IssueSeverity, classify_issue, feature_relation_kind, requires_auth
-from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts
+from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts, scoped_unique_columns
 
 logger = logging.getLogger(__name__)
 
@@ -949,7 +949,20 @@ class QaAgent:
             name: {str(c.get("name")) for c in table.get("columns") or [] if isinstance(c, dict)}
             for name, table in tables.items()
         }
-        combined_prd = json.dumps(prd, ensure_ascii=False).lower()
+        # Goals/KPIs and excluded capabilities are not storage requirements.
+        # Inspect business requirements without allowing metadata from an
+        # unrelated domain to introduce state or notification tables.
+        scope = prd.get("mvpScope") if isinstance(prd.get("mvpScope"), dict) else {}
+        excluded = {str(item) for item in scope.get("excluded") or []}
+        core_features = [
+            feature for feature in prd.get("coreFeatures") or []
+            if isinstance(feature, dict) and str(feature.get("name") or "") not in excluded
+        ]
+        combined_prd = json.dumps({
+            "projectOverview": prd.get("projectOverview"),
+            "background": prd.get("background"),
+            "coreFeatures": core_features,
+        }, ensure_ascii=False).lower()
         refs: dict[str, set[str]] = {}
         for name, table in tables.items():
             refs[name] = set()
@@ -1091,24 +1104,19 @@ class QaAgent:
                 if not (refs.get(table_name, set()) & principal_tables):
                     db_issues.append(f"배정 주체 FK 누락: {table_name} ({feature})")
 
-        duplicate_required = bool(re.search(
-            r"(?:중복.{0,20}(?:방지|차단|금지)|중복\s*예약|동일.{0,20}(?:한\s*번|1회)|하나만)", combined_prd,
-        ))
-        if duplicate_required:
-            for table_name, names in columns.items():
-                if any(token in table_name for token in ("record", "history", "log", "event")):
-                    continue
-                fk_ids = []
-                for column in tables[table_name].get("columns") or []:
-                    if isinstance(column, dict) and re.search(
-                        r"REFERENCES\s+", str(column.get("constraints") or ""), re.I
-                    ):
-                        fk_ids.append(str(column.get("name") or ""))
-                if len(fk_ids) < 2:
-                    continue
-                index_text = " ".join(str(index).lower() for index in tables[table_name].get("indexes") or [])
-                if "unique" not in index_text or not all(column in index_text for column in fk_ids[:2]):
-                    db_issues.append(f"중복 방지 UNIQUE 제약 누락: {table_name}")
+        for table_name, table in tables.items():
+            required_keys = scoped_unique_columns(table, list(tables.values()), core_features)
+            if not required_keys:
+                continue
+            # The declared key must be covered by one composite unique index;
+            # separate ordinary indexes cannot complete an unrelated UNIQUE.
+            unique_keys = []
+            for index in table.get("indexes") or []:
+                match = re.search(r"\bUNIQUE\b[^()]*\(([^()]*)\)", str(index), re.IGNORECASE)
+                if match:
+                    unique_keys.append({part.strip().strip('"').lower() for part in match.group(1).split(",")})
+            if set(required_keys) not in unique_keys:
+                db_issues.append(f"중복 방지 UNIQUE 제약 누락: {table_name}")
         occurrence_fields = {
             "occurred_at", "recorded_at", "event_at", "completed_at", "processed_at",
             "started_at", "ended_at", "effective_at",

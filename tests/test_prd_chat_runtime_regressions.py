@@ -109,3 +109,27 @@ def test_chat_name_candidates_reject_generated_sentences_and_use_contextual_fall
     assert result["stage"] == "naming"
     assert len(result["suggestions"]) == 3
     assert all("과제와시험일정" in name for name in result["suggestions"])
+
+
+def test_chat_accepts_corrected_project_name_after_rejected_name(monkeypatch):
+    async def unexpected_provider(*_args, **_kwargs):
+        raise AssertionError("Completed interview must not invoke a provider")
+
+    monkeypatch.setattr(chat, "_call_openai", unexpected_provider)
+    answers = [
+        "대학생 과제 관리 서비스를 만들고 싶어요", "모바일 앱",
+        "시험과 과제 마감일을 자주 놓쳐요", "메모 앱에 기록해요",
+        "과제와 시험 일정이 한눈에 보이면 좋겠어요", "여러 과목을 수강하는 대학생",
+        "일정 등록, 과목 분류, 마감 알림", "?",
+    ]
+    messages = [chat.ChatMessageDto(role="user", content=value) for value in answers]
+    rejected = asyncio.run(chat.message(chat.ChatRequest(messages=messages)))["data"]
+    corrected = asyncio.run(chat.message(chat.ChatRequest(messages=[
+        *messages, chat.ChatMessageDto(role="user", content="캠퍼스플래너"),
+    ])))["data"]
+
+    assert not rejected["isComplete"]
+    assert rejected["stage"] == "naming"
+    assert corrected["isComplete"]
+    assert corrected["formData"]["projectName"] == "캠퍼스플래너"
+    assert len(corrected["formData"]["featureDefinition"]["customFeatures"]) == 3

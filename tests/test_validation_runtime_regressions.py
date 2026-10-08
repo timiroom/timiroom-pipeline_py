@@ -1,6 +1,8 @@
 import asyncio
 import json
 
+import pytest
+
 from phase2.agents.qa_agent import QaAgent
 from phase2.orchestration_graph import OrchestrationGraph
 from phase2.state import PipelineState
@@ -182,20 +184,21 @@ def test_item_repair_consumes_domain_budget_and_does_not_repeat_provider_failure
     assert asyncio.run(graph._repair_once(failed, None)).api_spec == ""
 
 
-def test_feature_contract_validates_the_declared_identity_owner():
+@pytest.mark.parametrize(("owner_entity", "owner_key"), [("members", "member_id"), ("users", "user_id")])
+def test_feature_contract_validates_the_declared_identity_owner(owner_entity, owner_key):
     spec = {
         "name": "문서 등록", "ownership": {
-            "scope": "USER", "ownerEntity": "members", "ownerKey": "member_id",
+            "scope": "USER", "ownerEntity": owner_entity, "ownerKey": owner_key,
         }, "transactionRules": ["원자 저장"],
     }
     db = {
         "tables": [
-            {"name": "members", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
+            {"name": owner_entity, "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
             {"name": "documents", "description": "문서 등록", "columns": [
                 {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
-                {"name": "member_id", "type": "BIGINT", "constraints": "FOREIGN_KEY REFERENCES members(id)"},
+                {"name": owner_key, "type": "BIGINT", "constraints": f"FOREIGN_KEY REFERENCES {owner_entity}(id)"},
             ]},
-        ], "relationships": ["members (1:N) documents"],
+        ], "relationships": [f"{owner_entity} (1:N) documents"],
         "featureMappings": [{"featureName": "문서 등록", "table": "documents"}],
     }
     api = {
@@ -213,3 +216,26 @@ def test_feature_contract_validates_the_declared_identity_owner():
     result = SchemaValidator().validate(["문서 등록"], json.dumps(db), json.dumps(api), [spec])
 
     assert result.success, result.errors
+
+
+def test_phase3_enforces_explicit_local_identity_contract_without_inventing_other_routes():
+    spec = {
+        "name": "비밀번호 로그인", "transactionRules": ["원자 검증"],
+        "dbContract": {"tables": ["users", "refresh_tokens"]},
+        "apiContract": [{"method": "POST", "path": "/api/v1/auth/login"}],
+    }
+    db = {
+        "tables": [{"name": "users", "columns": []}],
+        "featureMappings": [{"featureName": "비밀번호 로그인", "table": "users"}],
+    }
+    api = {
+        "endpoints": [{"method": "POST", "path": "/api/v1/status", "requestBody": "code: string",
+                       "successResponse": "status: string", "errorCodes": "400, 500", "transactionRules": "원자 검증"}],
+        "featureMappings": [{"featureName": "비밀번호 로그인", "operations": [{"method": "POST", "path": "/api/v1/status"}]}],
+    }
+
+    errors = SchemaValidator()._check_feature_contracts([spec], json.dumps(db), json.dumps(api))
+
+    assert any("refresh_tokens" in issue for issue in errors)
+    assert any("/api/v1/auth/login" in issue for issue in errors)
+    assert not any("/signup" in issue or "/logout" in issue or "/users/me" in issue for issue in errors)

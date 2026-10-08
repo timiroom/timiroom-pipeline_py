@@ -468,6 +468,12 @@ def _is_valid_project_name(text: str) -> bool:
     )
 
 
+def _project_name_answer(state: dict) -> str:
+    """Use the latest naming answer so a rejected attempt can be corrected."""
+    answer = state["extras"][-1] if state["extras"] else ""
+    return re.sub(r"^(프로젝트\s*)?이름(은|으로|:)\s*", "", answer).strip()
+
+
 def _fallback_project_name_candidates(state: dict) -> list[str]:
     subject = _extract_service_subject(state)
     stem_tokens = [
@@ -838,8 +844,7 @@ async def _synthesize_form_data(messages: list[ChatMessageDto], client) -> dict 
     platform = "WEB_APP" if ("WEB_APP" in platform_text.upper() or ("웹" in platform_text and "앱" in platform_text)) else (
         "APP" if ("APP" in platform_text.upper() or "앱" in platform_text or "모바일" in platform_text) else "WEB"
     )
-    project_name = state["extras"][0] if state["extras"] else ""
-    project_name = re.sub(r"^(프로젝트\s*)?이름(은|으로|:)\s*", "", project_name).strip()
+    project_name = _project_name_answer(state)
 
     features = _split_features(feature_text)
     if len(features) < 3:
@@ -915,7 +920,7 @@ async def _finish_collection(
                 "formData": None,
                 "stage": "naming",
             })
-    elif not _is_valid_project_name(state["extras"][0]):
+    elif not _is_valid_project_name(_project_name_answer(state)):
         return ok({
             "message": "프로젝트 이름이 비어 있거나 완성되지 않았어요. 사용할 이름을 2자 이상으로 입력해 주세요.",
             "isComplete": False,
@@ -927,9 +932,6 @@ async def _finish_collection(
     # 2단계: FormData 합성
     form_data = await _synthesize_form_data(messages, client)
     if form_data:
-        if state["extras"]:
-            form_data["projectName"] = state["extras"][0].strip()
-
         return ok({
             "message": "좋아요! 충분한 정보가 모였어요. 지금 바로 프로젝트를 시작할게요!",
             "isComplete": True,

@@ -21,7 +21,10 @@ from phase2.feature_registry import (
 from phase2.json_utils import try_parse_json, has_suspicious_script
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
-from phase2.quality_rules import relevance_score, required_field_concepts, self_check_passed
+from phase2.quality_rules import (
+    matching_table_features, relevance_score, required_field_concepts,
+    scoped_unique_columns, self_check_passed,
+)
 from phase2.agent_contract import feature_relation_kind, requires_auth
 
 logger = logging.getLogger(__name__)
@@ -1174,12 +1177,15 @@ def _parse_table_text(raw: str, name: str, purpose: str) -> dict | None:
 
 def enforce_feature_relation_contracts(
     tables: list[dict], feature_list: list[str], auth_required: bool,
+    prd_document: str = "",
 ) -> list[dict]:
     """Materialize manager-owned root/association/event contracts after worker output.
 
     Matching uses each table's retained feature description. No service entity name or
     actor vocabulary is assumed.
     """
+    prd = try_parse_json(prd_document or "{}") or {}
+    core_features = [item for item in prd.get("coreFeatures") or [] if isinstance(item, dict)]
     feature_tables: list[tuple[str, dict, str]] = []
     for feature in feature_list or []:
         if str(feature) in {
@@ -1251,7 +1257,8 @@ def enforce_feature_relation_contracts(
             root = root_candidates[0]
     principal = next((table for table in tables if _is_principal_table(table)), None)
     for _feature, table, kind in feature_tables:
-        if root and table is not root and kind in {"association", "event", "derived"}:
+        if (root and table is not root and kind in {"association", "event", "derived"}
+                and (not core_features or _declares_upstream_relation(table, root, tables, core_features))):
             _ensure_reference_column(table, str(root["name"]))
         if auth_required and principal and table is not principal:
             _ensure_reference_column(table, str(principal["name"]))
@@ -2490,6 +2497,7 @@ class DbaAgent:
             tables = enforce_feature_relation_contracts(
                 tables, ctx.get("feature_list", []),
                 requires_auth(ctx.get("prd_document", ""), ctx.get("feature_list", []), ctx.get("context", "")),
+                ctx.get("prd_document", ""),
             )
         tables = reconcile_fk_types(tables)
         relationships = _normalize_relationships(relationships, tables)
@@ -2703,6 +2711,26 @@ def _ensure_unique_index(table: dict, columns: tuple[str, ...]) -> None:
         table["indexes"].append(statement)
 
 
+def _declares_upstream_relation(
+    downstream: dict, upstream: dict, tables: list[dict], features: list[dict],
+) -> bool:
+    """Shared identifiers alone do not declare a business dependency."""
+    upstream_features = matching_table_features(upstream, tables, features)
+    for feature in matching_table_features(downstream, tables, features):
+        prose = " ".join([str(feature.get("description") or ""), *map(str, feature.get("requirements") or [])])
+        if not re.search(r"(?:\s후\b|이후|선행|참조|연결|종속|완료한|\b(?:after|following|requires?|references?|depends?\s+on)\b)", prose, re.I):
+            continue
+        if re.search(rf"\b{re.escape(str(upstream.get('name') or ''))}\b", prose, re.I):
+            return True
+        own_tokens = set(re.findall(r"[가-힣A-Za-z0-9]+", str(feature.get("name") or "")))
+        for prior in upstream_features:
+            prior_name = str(prior.get("name") or "")
+            distinct = set(re.findall(r"[가-힣A-Za-z0-9]+", prior_name)) - own_tokens
+            if prior_name and (prior_name in prose or any(len(token) >= 2 and token in prose for token in distinct)):
+                return True
+    return False
+
+
 def _apply_prd_semantic_contracts(tables: list[dict], prd_document: str) -> None:
     """Project explicit PRD fields, duplicate rules and action chains into the ERD."""
     prd = try_parse_json(prd_document or "{}") or {}
@@ -2750,20 +2778,6 @@ def _apply_prd_semantic_contracts(tables: list[dict], prd_document: str) -> None
             _ensure_column(owner, canonical, col_type, constraints or "NULL")
             names.add(canonical)
             logger.info("DBA PRD 요구 필드 보강 — %s.%s", owner.get("name"), canonical)
-
-    combined = json.dumps(prd, ensure_ascii=False)
-    duplicate_required = bool(re.search(
-        r"(?:중복.{0,20}(?:방지|차단|금지)|동일.{0,20}(?:한\s*번|1회)|하나만)", combined
-    ))
-    if duplicate_required:
-        for table in tables:
-            fk_columns = [
-                str(column.get("name") or "")
-                for column in table.get("columns") or [] if isinstance(column, dict)
-                and str(column.get("name") or "").endswith("_id")
-            ]
-            if len(fk_columns) >= 2:
-                _ensure_unique_index(table, tuple(fk_columns[:2]))
 
     # Relationship inference below is intentionally PRD-driven.  Table names
     # alone (for example, a generic "applications" table) are not enough
@@ -2819,17 +2833,13 @@ def _apply_prd_semantic_contracts(tables: list[dict], prd_document: str) -> None
             )
             logger.info("DBA 행위 대상 보강 — %s.%s", table_name, fk_name)
 
-    duplicate_required = bool(re.search(r"(?:중복.{0,20}(?:방지|차단|금지)|중복\s*예약|동일.{0,20}(?:한\s*번|1회)|하나만)", combined))
-    if duplicate_required:
-        for table in tables:
-            names = {str(column.get("name")) for column in table.get("columns") or [] if isinstance(column, dict)}
-            actor_ids = sorted(name for name in names if name.endswith("_id") and name[:-3] in _ACTOR_ID_BASES)
-            target_ids = sorted(name for name in names if name.endswith("_id") and name not in actor_ids)
-            if actor_ids and target_ids:
-                _ensure_unique_index(table, (target_ids[0], actor_ids[0]))
+    for table in tables:
+        unique_columns = scoped_unique_columns(table, tables, core_features)
+        if unique_columns:
+            _ensure_unique_index(table, unique_columns)
 
-    # A downstream record that repeats the same actor/target identifiers as one
-    # upstream action should reference that action directly for auditable state.
+    # Shared identifiers can support an explicitly requested action dependency;
+    # they cannot establish that dependency on their own.
     for downstream in tables:
         down_name = str(downstream.get("name") or "")
         if not any(token in down_name for token in _DOWNSTREAM_ACTION_TOKENS):
@@ -2841,6 +2851,8 @@ def _apply_prd_semantic_contracts(tables: list[dict], prd_document: str) -> None
         for upstream in tables:
             up_name = str(upstream.get("name") or "")
             if upstream is downstream or any(token in up_name for token in _DOWNSTREAM_ACTION_TOKENS):
+                continue
+            if not _declares_upstream_relation(downstream, upstream, tables, core_features):
                 continue
             up_ids = {str(c.get("name")) for c in upstream.get("columns") or [] if isinstance(c, dict) and str(c.get("name", "")).endswith("_id")}
             shared = down_ids & up_ids

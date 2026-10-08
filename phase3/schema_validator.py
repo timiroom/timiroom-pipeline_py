@@ -403,7 +403,6 @@ class SchemaValidator:
             for ep in api.get("endpoints") or [] if isinstance(ep, dict)
         }
         errors: list[str] = []
-        canonical_identity_required = False
         for spec in feature_specs:
             if not isinstance(spec, dict) or not spec.get("name"):
                 continue
@@ -412,9 +411,19 @@ class SchemaValidator:
             scope = str(ownership.get("scope") or "").upper()
             owner_entity = str(ownership.get("ownerEntity") or "users")
             owner_key = str(ownership.get("ownerKey") or "user_id")
-            canonical_identity_required = canonical_identity_required or (
-                scope in {"USER", "SHARED"} and owner_entity == "users"
-            )
+            db_contract = spec.get("dbContract") if isinstance(spec.get("dbContract"), dict) else {}
+            for declared in db_contract.get("tables") or []:
+                declared_table = str(
+                    declared.get("name") or declared.get("table") or ""
+                ) if isinstance(declared, dict) else str(declared)
+                if declared_table and declared_table not in tables:
+                    errors.append(f"DB 기능 계약 테이블 누락: {name} → {declared_table}")
+            for operation in spec.get("apiContract") or []:
+                if not isinstance(operation, dict):
+                    continue
+                key = (str(operation.get("method") or "GET").upper(), str(operation.get("path") or ""))
+                if key[1] and key not in endpoints:
+                    errors.append(f"API 기능 계약 엔드포인트 누락: {name} → {key[0]} {key[1]}")
             if not spec.get("transactionRules"):
                 errors.append(f"기능 계약: 트랜잭션 규칙 누락 — {name}")
             if spec.get("states") and not spec.get("stateTransitions"):
@@ -456,15 +465,4 @@ class SchemaValidator:
                         errors.append(f"API {field} 계약 누락: {key[0]} {key[1]}")
                 if key[0] in {"POST", "PATCH", "PUT", "DELETE"} and not endpoint.get("transactionRules"):
                     errors.append(f"API 트랜잭션 계약 누락: {key[0]} {key[1]}")
-        if canonical_identity_required:
-            if "users" not in tables or "refresh_tokens" not in tables:
-                errors.append("DB 인증 계약 누락: users와 refresh_tokens 테이블이 필요합니다")
-            required_paths = {
-                ("POST", "/api/v1/auth/signup"), ("POST", "/api/v1/auth/login"),
-                ("POST", "/api/v1/auth/refresh"), ("POST", "/api/v1/auth/logout"),
-                ("GET", "/api/v1/users/me"),
-            }
-            missing_paths = sorted(required_paths - set(endpoints))
-            if missing_paths:
-                errors.append(f"API 인증·회원 계약 누락: {missing_paths}")
         return list(dict.fromkeys(errors))
