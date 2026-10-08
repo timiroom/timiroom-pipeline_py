@@ -88,7 +88,12 @@ def ensure_registry_core_features(core_features, feature_hints, registry) -> lis
         for item in items
     }
     existing_names = {str(item.get("name") or "").strip().casefold() for item in items}
-    for hint in feature_hints or []:
+    required_names = [
+        item.get("name") for item in registry or [] if isinstance(item, dict)
+        and (str(item.get("source") or "").lower() in {"core", "prd_core"}
+             or str(item.get("priority") or "").upper() == "P0")
+    ]
+    for hint in dict.fromkeys([*(feature_hints or []), *required_names]):
         name = str(hint or "").strip()
         if not name or name.casefold() in existing_names:
             continue
@@ -881,11 +886,11 @@ class PrdAgent:
                 )
                 repaired["coreFeatures"] = ensure_registry_core_features(
                     repaired["coreFeatures"], state.feature_list,
-                    normalize_feature_registry(state.feature_registry, state.feature_list),
+                    normalize_feature_registry(state.feature_registry, state.feature_list, preserve_extra=True),
                 )
                 attach_feature_ids(
                     repaired["coreFeatures"],
-                    normalize_feature_registry(state.feature_registry, state.feature_list),
+                    normalize_feature_registry(state.feature_registry, state.feature_list, preserve_extra=True),
                 )
                 self._reconcile_priorities(repaired["coreFeatures"], repaired.get("mvpScope"))
             self._apply_phase1_priorities(repaired, state)

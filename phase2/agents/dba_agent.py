@@ -25,7 +25,7 @@ from phase2.quality_rules import (
     matching_table_features, relevance_score, required_field_concepts,
     scoped_unique_columns, self_check_passed,
 )
-from phase2.agent_contract import feature_relation_kind, requires_auth
+from phase2.agent_contract import feature_relation_kind, requires_auth, normalize_api_path
 
 logger = logging.getLogger(__name__)
 
@@ -603,6 +603,43 @@ def _ensure_contract_tables(tables: list[dict], registry: list[dict] | None) -> 
             })
             existing.add(name)
             logger.warning("DBA dbContract 테이블 누락 — 최소 스키마 보강: %s", name)
+    refresh_contracts = [item for item in registry or [] if any(
+        isinstance(operation, dict) and str(operation.get("method") or "GET").upper() == "POST"
+        and normalize_api_path(str(operation.get("path") or "")) == "/api/v1/auth/refresh"
+        for operation in item.get("apiContract") or []
+    )]
+    if refresh_contracts:
+        owners = {str((item.get("ownership") or {}).get("ownerEntity") or "users") for item in refresh_contracts}
+        owners &= {str(table.get("name")) for table in tables}
+        store_names = {"refresh_tokens"}
+        for item in refresh_contracts:
+            for declared in (item.get("dbContract") or {}).get("tables") or []:
+                store_names.add(str(declared.get("name") or declared.get("table") or "") if isinstance(declared, dict) else str(declared))
+        has_store = any(
+            table.get("name") in store_names and (
+                {"token_hash", "expires_at"} <= {column.get("name") for column in table.get("columns") or [] if isinstance(column, dict)}
+                or {"refresh_token", "expires_at"} <= {column.get("name") for column in table.get("columns") or [] if isinstance(column, dict)}
+            ) and any(
+                re.search(rf"\bREFERENCES\s+{re.escape(owner)}\s*\(", str(column.get("constraints") or ""), re.I)
+                for owner in owners for column in table.get("columns") or [] if isinstance(column, dict)
+            )
+            for table in tables
+        )
+        # Only the explicitly declared local refresh flow needs a token store.
+        # Do not create identity/password tables for unrelated or external auth.
+        if not has_store and len(owners) == 1:
+            owner = next(iter(owners))
+            store = next((table for table in tables if table.get("name") == "refresh_tokens"), None)
+            if store is None:
+                store = {"name": "refresh_tokens", "description": "선언된 세션 갱신의 만료·회수 토큰 저장", "columns": [], "indexes": []}
+                tables.append(store)
+            _ensure_column(store, "id", "BIGINT", "PRIMARY_KEY GENERATED_IDENTITY")
+            _ensure_reference_column(store, owner)
+            _ensure_column(store, "token_hash", "VARCHAR(255)", "NOT_NULL UNIQUE")
+            _ensure_column(store, "expires_at", "TIMESTAMPTZ", "NOT_NULL")
+            _ensure_column(store, "revoked_at", "TIMESTAMPTZ", "NULL")
+            _ensure_index(store, (_singular_table_name(owner) + "_id",))
+            _ensure_index(store, ("expires_at",))
     return tables
 
 
@@ -2185,6 +2222,7 @@ class DbaAgent:
                 state.feature_registry, state.feature_list, preserve_extra=True,
             )
             tables, relationships = normalize_table_contract_names(tables, relationships, registry)
+            tables = _ensure_contract_tables(tables, registry)
             tables = annotate_table_feature_ids(tables, registry)
             _ensure_fk_references(tables, registry)
             mappings = build_feature_mappings(tables, state.feature_specs or registry)
