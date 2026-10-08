@@ -1,5 +1,6 @@
 import logging
 
+from phase2.agent_contract import IssueSeverity, classify_issue
 from phase2.state import PipelineState
 from phase3.schema_validator import SchemaValidator
 
@@ -34,6 +35,7 @@ class ValidationService:
             api_spec=state.api_spec,
             prd_document=state.prd_document,
             feature_registry=state.feature_registry,
+            feature_specs=state.feature_specs,
         )
 
         normalized = state.copy(
@@ -44,12 +46,24 @@ class ValidationService:
             validation_repair_targets=result.repair_targets,
         )
 
-        qa_errors = (
-            list(state.qa_db_blockers or state.qa_db_issues)
-            + list(state.qa_api_blockers or state.qa_api_issues)
-            + list(state.qa_prd_blockers or state.qa_prd_issues)
-        )
-        current_blockers = self._canonical_blockers(qa_errors + list(result.errors))
+        blocking_details = [
+            item for item in state.qa_issue_details
+            if isinstance(item, dict) and str(item.get("severity", "")).upper() in {"ERROR", "BLOCKER"}
+        ]
+        detail_errors = [
+            f"QA {str(item['severity']).upper()}: {item.get('reason', '')}"
+            for item in blocking_details
+        ]
+        domain_errors = {}
+        for domain in ("db", "api", "prd"):
+            blockers = getattr(state, f"qa_{domain}_blockers")
+            warnings = set(getattr(state, f"qa_{domain}_warnings"))
+            domain_errors[domain] = list(blockers) or [
+                issue for issue in getattr(state, f"qa_{domain}_issues")
+                if issue not in warnings and classify_issue(issue) != IssueSeverity.WARNING
+            ]
+        qa_errors = [issue for issues in domain_errors.values() for issue in issues]
+        current_blockers = self._canonical_blockers(qa_errors + detail_errors + list(result.errors))
         previous_blockers = self._canonical_blockers(
             state.validation_unresolved_blockers or state.validation_blockers
         )
@@ -63,15 +77,16 @@ class ValidationService:
             validation_resolved_blockers=resolved_blockers,
         )
 
-        if state.qa_approved is False:
+        if state.qa_approved is False or blocking_details:
             qa_text = "\n".join(f"QA: {item}" for item in current_blockers)
             qa_targets = set(result.repair_targets)
-            if state.qa_db_blockers or state.qa_db_issues:
-                qa_targets.add("db")
-            if state.qa_api_blockers or state.qa_api_issues:
-                qa_targets.add("api")
-            if state.qa_prd_blockers or state.qa_prd_issues:
-                qa_targets.add("prd")
+            domain_by_agent = {"DBA": "db", "API": "api", "PRD": "prd"}
+            qa_targets.update(
+                domain_by_agent[str(item.get("agent", "")).upper()]
+                for item in blocking_details
+                if str(item.get("agent", "")).upper() in domain_by_agent
+            )
+            qa_targets.update(domain for domain, issues in domain_errors.items() if issues)
             logger.warning("Phase 2 QA hard gate 실패 — Phase 3 통과를 허용하지 않습니다")
             return normalized.copy(
                 validated=False,

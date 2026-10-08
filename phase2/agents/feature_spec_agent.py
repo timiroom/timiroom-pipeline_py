@@ -9,6 +9,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from phase2.feature_registry import normalize_feature_registry
+from phase2.agent_contract import normalize_api_path, normalize_feature_contract, requires_auth
 from phase2.json_utils import try_parse_json
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
@@ -23,9 +24,7 @@ def _normalize_contracts(item: dict) -> dict:
             continue
         value = dict(contract)
         value["method"] = str(value.get("method") or "GET").upper()
-        path = str(value.get("path") or "").strip()
-        if path and not path.startswith("/api/v1/"):
-            path = "/api/v1/" + path.lstrip("/")
+        path = normalize_api_path(value.get("path")) if value.get("path") else ""
         value["path"] = path
         value["featureId"] = str(value.get("featureId") or item.get("featureId") or "").strip()
         value["action"] = str(value.get("action") or "manage").strip()
@@ -445,6 +444,18 @@ class FeatureSpecAgent:
                 "releaseGate": source.get("releaseGate", False),
             }
             normalized.append(_ensure_required_contracts(_normalize_contracts(source_item)))
+        # The final Feature Spec registry owns the semantic and physical
+        # contracts consumed by DBA, API and validation.
+        core_by_name = {
+            str(item.get("name") or ""): item for item in prd.get("coreFeatures") or []
+            if isinstance(item, dict)
+        }
+        auth_required = requires_auth(prd, state.feature_list, state.user_query)
+        normalized = [normalize_feature_contract({
+            **core_by_name.get(str(item.get("name") or ""), {}),
+            **source_by_name.get(str(item.get("name") or ""), {}),
+            **item,
+        }, auth_required) for item in normalized]
         document = json.dumps({"features": normalized}, ensure_ascii=False)
         missing_contracts = [
             str(item.get("featureId") or item.get("name") or "unknown")
@@ -461,6 +472,7 @@ class FeatureSpecAgent:
             )
         return state.copy(
             feature_registry=normalized,
+            feature_specs=normalized,
             feature_spec_document=document,
             generation_blockers=list(dict.fromkeys(blockers)),
             qa_prd_blockers=(

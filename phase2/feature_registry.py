@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from phase2.agent_contract import normalize_api_path
+
 
 _ACTION_TERMS = (
     ("생성", "create"), ("등록", "create"), ("조회", "read"), ("검색", "read"),
@@ -41,10 +43,7 @@ def _normalize_api_contracts(value: Any, feature_id: str) -> list[dict[str, Any]
         if not isinstance(raw, dict):
             continue
         method = str(raw.get("method") or "GET").strip().upper()
-        path = "/" + str(raw.get("path") or "").strip().lstrip("/")
-        path = re.sub(r"^/api/v1", "", path, flags=re.IGNORECASE)
-        path = "/api/v1" + (path if path.startswith("/") else "/" + path)
-        path = re.sub(r"/{2,}", "/", path).rstrip("/") or "/api/v1"
+        path = normalize_api_path(raw.get("path"))
         if not path or path == "/api/v1":
             continue
         key = (method, path)

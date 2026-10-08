@@ -21,50 +21,155 @@ from phase2.json_utils import try_parse_json
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
 
+from phase2.agents.dba_agent import _build_name_lookup
+from phase2.agents.api_agent import _endpoint_quality_issues, _feature_methods, _feature_resource_slug
+from phase2.agent_contract import IssueSeverity, classify_issue, feature_relation_kind, requires_auth
+from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts, scoped_unique_columns
+
 logger = logging.getLogger(__name__)
 
+def _english_stems(value: str) -> set[str]:
+    stems = set()
+    for token in re.findall(r"[a-z]+", str(value or "").lower().replace("-", "_")):
+        for suffix in ("ments", "ment", "ees", "ee", "ed", "ing", "ies", "s"):
+            if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                token = token[:-len(suffix)]
+                break
+        stems.add(token)
+    return stems
+
+def _request_field_names(value) -> set[str]:
+    if isinstance(value, dict):
+        return {str(name).lower() for name in value}
+    return {
+        match.lower()
+        for match in re.findall(
+            r"(?:^|[,;{]\s*)['\"]?([a-z][a-z0-9_]*)['\"]?\s*:",
+            str(value or ""), re.I,
+        )
+    }
+
+def _endpoint_table(endpoint: dict, tables: dict[str, dict]) -> tuple[str, dict] | tuple[None, None]:
+    path = str(endpoint.get("path") or "")
+    slug = path.removeprefix("/api/v1/").split("/", 1)[0].replace("-", "_")
+    if slug in tables:
+        return slug, tables[slug]
+    slug_stems = _english_stems(slug)
+    lexical = [
+        (len(slug_stems & _english_stems(name)), name, table)
+        for name, table in tables.items()
+    ]
+    lexical_best = max((score for score, _name, _table in lexical), default=0)
+    lexical_winners = [(name, table) for score, name, table in lexical if score == lexical_best and score > 0]
+    if len(lexical_winners) == 1:
+        return lexical_winners[0]
+    meaning = str(endpoint.get("featureName") or endpoint.get("description") or "")
+    scored = [
+        (max(
+            relevance_score(meaning, f"{name} {table.get('description', '')}"),
+            relevance_score(str(table.get("description") or ""), meaning),
+        ), name, table)
+        for name, table in tables.items()
+    ]
+    best = max((score for score, _name, _table in scored), default=0.0)
+    winners = [(name, table) for score, name, table in scored if score == best and score >= 0.25]
+    return winners[0] if len(winners) == 1 else (None, None)
+
+
+
+def _replace_named_items(base: list, patches: list, key_fn) -> list:
+    """식별 키가 같은 항목은 교체하고 새 항목은 추가한다. 원본 항목은 절대 삭제하지 않는다."""
+    result = [item for item in (base or []) if isinstance(item, dict)]
+    positions = {key_fn(item): i for i, item in enumerate(result) if key_fn(item)}
+    for patch in patches or []:
+        if not isinstance(patch, dict):
+            continue
+        key = key_fn(patch)
+        if not key:
+            continue
+        if key in positions:
+            result[positions[key]] = patch
+        else:
+            positions[key] = len(result)
+            result.append(patch)
+    return result
 
 def _apply_review_patches(domain: str, draft_data: dict, patches: dict) -> dict:
-    """Apply only named QA patches while preserving unrelated generated output."""
+    """QA reviewer의 부분 patch를 결정론적으로 병합한다."""
     if not isinstance(draft_data, dict) or not isinstance(patches, dict):
         return draft_data
     result = dict(draft_data)
+
     if domain == "db":
-        updates = patches.get("tables")
-        if isinstance(updates, dict):
-            updates = [dict(value, name=name) for name, value in updates.items() if isinstance(value, dict)]
-        if isinstance(updates, list):
-            current = {str(item.get("name")): item for item in result.get("tables") or [] if isinstance(item, dict)}
-            for item in updates:
-                if isinstance(item, dict) and item.get("name"):
-                    current[str(item["name"])] = item
-            result["tables"] = list(current.values())
-        if isinstance(patches.get("relationships"), list):
-            result["relationships"] = list(dict.fromkeys([*(result.get("relationships") or []), *patches["relationships"]]))
-    elif domain == "api" and isinstance(patches.get("endpoints"), list):
-        current = {(str(item.get("method") or "").upper(), str(item.get("path") or "")): item for item in result.get("endpoints") or [] if isinstance(item, dict)}
-        for item in patches["endpoints"]:
-            if isinstance(item, dict):
-                current[(str(item.get("method") or "").upper(), str(item.get("path") or ""))] = item
-        result["endpoints"] = list(current.values())
-    elif domain == "prd":
-        for key, value in patches.items():
-            if isinstance(value, list):
-                result[key] = value
-            elif key in {"projectOverview", "background", "authentication"}:
-                result[key] = value
+        table_patches = patches.get("tables")
+        if isinstance(table_patches, dict):
+            table_patches = [dict(value, name=name) for name, value in table_patches.items() if isinstance(value, dict)]
+        if isinstance(table_patches, list):
+            normalized = _to_array_schema({"tables": table_patches}).get("tables", [])
+            result["tables"] = _replace_named_items(
+                result.get("tables") or [], normalized, lambda item: str(item.get("name") or "").strip(),
+            )
+        relationships = patches.get("relationships")
+        if isinstance(relationships, list):
+            existing = list(result.get("relationships") or [])
+            for relationship in relationships:
+                if relationship not in existing:
+                    existing.append(relationship)
+            result["relationships"] = existing
+        return result
+
+    if domain == "api":
+        endpoint_patches = patches.get("endpoints")
+        if isinstance(endpoint_patches, list):
+            # Merge by the exact artifact identity. Canonicalizing only the
+            # patch path here can append a duplicate instead of replacing it;
+            # the owning API agent normalizes the completed document.
+            result["endpoints"] = _replace_named_items(
+                result.get("endpoints") or [], endpoint_patches,
+                lambda item: f"{str(item.get('method') or '').upper()} {str(item.get('path') or '').strip()}",
+            )
+        if patches.get("authentication"):
+            result["authentication"] = patches["authentication"]
+        return result
+
+    if domain == "prd":
+        list_fields = {"coreFeatures", "kpi", "userPersonas", "releaseSchedule", "goals"}
+        label_fields = {
+            "coreFeatures": "name", "kpi": "metric", "userPersonas": "name",
+            "releaseSchedule": "milestone",
+        }
+        for field, value in patches.items():
+            if field in list_fields and isinstance(value, list):
+                current = result.get(field) if isinstance(result.get(field), list) else []
+                if field == "goals":
+                    result[field] = current + [item for item in value if item not in current]
+                else:
+                    label = label_fields[field]
+                    result[field] = _replace_named_items(
+                        current, value, lambda item, label=label: str(item.get(label) or "").strip(),
+                    )
+            elif value is not None:
+                result[field] = value
+        return result
+
     return result
 
 
 def _derive_patches_from_full_output(domain: str, draft_data: dict, fixed: dict) -> dict:
+    """모델이 금지된 fixed 전체 문서를 반환해도 삭제 없는 최소 patch로 축약한다."""
     if not isinstance(fixed, dict):
         return {}
     if domain == "db":
-        return {key: fixed[key] for key in ("tables", "relationships") if isinstance(fixed.get(key), list)}
+        normalized = _to_array_schema(fixed)
+        return {key: normalized[key] for key in ("tables", "relationships") if isinstance(normalized.get(key), list)}
     if domain == "api":
         return {key: fixed[key] for key in ("endpoints", "authentication") if key in fixed}
     if domain == "prd":
-        return {key: fixed[key] for key in ("coreFeatures", "goals", "kpi", "userPersonas", "releaseSchedule", "mvpScope") if key in fixed}
+        patches = {}
+        for key, value in fixed.items():
+            if draft_data.get(key) != value:
+                patches[key] = value
+        return patches
     return {}
 
 
@@ -391,13 +496,20 @@ class QaAgent:
             try_parse_json(db_draft), state.feature_list, state.feature_registry,
         )
         deterministic_api = self._check_api_completeness(try_parse_json(api_draft), state.feature_list)
-        deterministic_prd = self._check_prd_completeness(try_parse_json(prd_draft), len(state.feature_list))
+        deterministic_prd = self._check_prd_completeness(try_parse_json(prd_draft), len(state.feature_list), state.market_research or "")
         db_issues += [i for i in deterministic_db if i not in db_issues]
         api_issues += [i for i in deterministic_api if i not in api_issues]
         prd_issues += [i for i in deterministic_prd if i not in prd_issues]
         cross_db, cross_api, cross_prd = self._check_cross_artifacts(
             try_parse_json(db_draft), try_parse_json(api_draft), try_parse_json(prd_draft),
         )
+        semantic_db, semantic_api, semantic_prd = self._check_cross_document_semantics(
+            try_parse_json(prd_draft), try_parse_json(db_draft), try_parse_json(api_draft),
+            state.feature_list, state.context_prompt or "",
+        )
+        cross_db.extend(semantic_db)
+        cross_api.extend(semantic_api)
+        cross_prd.extend(semantic_prd)
         db_issues.extend(x for x in cross_db if x not in db_issues)
         api_issues.extend(x for x in cross_api if x not in api_issues)
         prd_issues.extend(x for x in cross_prd if x not in prd_issues)
@@ -450,39 +562,21 @@ class QaAgent:
             qa_api_warnings=classified["api_warnings"],
             qa_prd_warnings=classified["prd_warnings"],
             qa_blocker_details=self._build_blocker_details(classified),
+            qa_issue_details=self._structured_issues(db_issues, api_issues, prd_issues),
+            qa_repair_issues=[
+                issue for issue in self._structured_issues(db_issues, api_issues, prd_issues)
+                if issue["severity"] in {IssueSeverity.ERROR.value, IssueSeverity.BLOCKER.value}
+            ],
             last_validation_error="",
             status_message=status,
         )
 
     def _execute_lightweight_gate(self, state: PipelineState) -> PipelineState:
         """Phase2 QA는 산출물 생성 완료 여부만 확인하고, 엄격한 판단은 Phase3로 넘긴다."""
-        db_draft = state.db_schema or "{}"
+        db_draft, api_draft, prd_draft = state.db_schema, state.api_spec, state.prd_document
         db_parsed = try_parse_json(db_draft)
-        if isinstance(db_parsed, dict) and isinstance(db_parsed.get("tables"), list):
-            db_parsed["tables"] = ensure_primary_keys(
-                dedupe_meta_tables(sanitize_tables(db_parsed["tables"]))
-            )
-            _normalize_special_references(db_parsed["tables"])
-            _ensure_fk_references(
-                db_parsed["tables"],
-                normalize_feature_registry(state.feature_registry, state.feature_list, preserve_extra=True),
-            )
-            db_parsed["tables"] = reconcile_fk_types(db_parsed["tables"])
-            db_draft = json.dumps(db_parsed, ensure_ascii=False)
-
-        api_draft = state.api_spec or "{}"
         api_parsed = try_parse_json(api_draft)
-        if isinstance(api_parsed, dict) and isinstance(api_parsed.get("endpoints"), list):
-            api_parsed["endpoints"] = _normalize_endpoints(api_parsed["endpoints"])
-            api_draft = json.dumps(api_parsed, ensure_ascii=False)
-
-        prd_draft = state.prd_document or "{}"
         prd_parsed = try_parse_json(prd_draft)
-        if isinstance(prd_parsed, dict) and isinstance(prd_parsed.get("coreFeatures"), list):
-            prd_parsed["coreFeatures"] = reconcile_core_features(
-                prd_parsed["coreFeatures"], prd_parsed.get("mvpScope"), state.feature_list,
-            )
-            prd_draft = json.dumps(prd_parsed, ensure_ascii=False)
 
         contract_db, contract_api, contract_prd = self._check_registry_contracts(
             normalize_feature_registry(
@@ -495,10 +589,17 @@ class QaAgent:
             try_parse_json(db_draft), state.feature_list, state.feature_registry,
         )
         api_issues = self._check_api_completeness(try_parse_json(api_draft), state.feature_list)
-        prd_issues = self._check_prd_completeness(try_parse_json(prd_draft), len(state.feature_list))
+        prd_issues = self._check_prd_completeness(try_parse_json(prd_draft), len(state.feature_list), state.market_research or "")
         cross_db, cross_api, cross_prd = self._check_cross_artifacts(
             try_parse_json(db_draft), try_parse_json(api_draft), try_parse_json(prd_draft),
         )
+        semantic_db, semantic_api, semantic_prd = self._check_cross_document_semantics(
+            try_parse_json(prd_draft), try_parse_json(db_draft), try_parse_json(api_draft),
+            state.feature_list, state.context_prompt or "",
+        )
+        cross_db.extend(semantic_db)
+        cross_api.extend(semantic_api)
+        cross_prd.extend(semantic_prd)
         db_issues.extend(x for x in cross_db if x not in db_issues)
         api_issues.extend(x for x in cross_api if x not in api_issues)
         prd_issues.extend(x for x in cross_prd if x not in prd_issues)
@@ -547,6 +648,11 @@ class QaAgent:
             qa_api_warnings=classified["api_warnings"],
             qa_prd_warnings=classified["prd_warnings"],
             qa_blocker_details=self._build_blocker_details(classified),
+            qa_issue_details=self._structured_issues(db_issues, api_issues, prd_issues),
+            qa_repair_issues=[
+                issue for issue in self._structured_issues(db_issues, api_issues, prd_issues)
+                if issue["severity"] in {IssueSeverity.ERROR.value, IssueSeverity.BLOCKER.value}
+            ],
             last_validation_error="",
             status_message="QA 경량 게이트 완료 — Phase 3 구조 검증으로 이관",
         )
@@ -604,7 +710,10 @@ class QaAgent:
                 text = str(item)
                 lower = text.lower()
                 if deterministic is not None and text in deterministic:
-                    blockers.append(text)
+                    if classify_issue(text) == IssueSeverity.WARNING:
+                        warnings.append(text)
+                    else:
+                        blockers.append(text)
                     continue
                 if any(token in lower for token in ("외부 id", "external id", "polymorphic", "다형성")):
                     warnings.append(text)
@@ -797,6 +906,408 @@ class QaAgent:
 
         return db_issues, api_issues, prd_issues
 
+    @staticmethod
+    def _structured_issues(db_issues: list[str], api_issues: list[str], prd_issues: list[str]) -> list[dict]:
+        """Convert QA findings into routing metadata without inventing a fix."""
+        result: list[dict] = []
+        patterns = {
+            "DBA": re.compile(r"(?:누락:|FK 인덱스 누락:|참조 대상 없는 FK 컬럼:)\s*([^\s,]+)"),
+            "API": re.compile(r"(?:누락:|API[^:]*:)\s*(?:(GET|POST|PUT|PATCH|DELETE)\s+)?([^\s,]+)"),
+            "PRD": re.compile(r"(?:이탈:|충돌:|미완결:)\s*(.+)$"),
+        }
+        for agent, issues in (("DBA", db_issues), ("API", api_issues), ("PRD", prd_issues)):
+            for message in issues:
+                match = patterns[agent].search(message)
+                target = "document"
+                if match:
+                    target = " ".join(part for part in match.groups() if part).strip() or "document"
+                result.append({
+                    "agent": agent,
+                    "target": target,
+                    "reason": message,
+                    "severity": classify_issue(message).value,
+                    "action": "patch",
+                })
+        return result
+
+    def _check_cross_document_semantics(
+        self, prd, db, api, feature_list: list[str], requirement_text: str = "",
+    ):
+        """Validate ownership, references and behavior across PRD, ERD and API."""
+        db_issues: list[str] = []
+        api_issues: list[str] = []
+        prd_issues: list[str] = []
+        if not isinstance(db, dict) or not isinstance(api, dict) or not isinstance(prd, dict):
+            return db_issues, api_issues, prd_issues
+
+        state_fields = {
+            "quantity", "amount", "balance", "status", "state", "unit", "expiry_date",
+            "scheduled_at", "progress", "stock", "remaining_count",
+        }
+        tables = {str(t.get("name") or ""): t for t in db.get("tables") or [] if isinstance(t, dict)}
+        columns = {
+            name: {str(c.get("name")) for c in table.get("columns") or [] if isinstance(c, dict)}
+            for name, table in tables.items()
+        }
+        # Goals/KPIs and excluded capabilities are not storage requirements.
+        # Inspect business requirements without allowing metadata from an
+        # unrelated domain to introduce state or notification tables.
+        scope = prd.get("mvpScope") if isinstance(prd.get("mvpScope"), dict) else {}
+        excluded = {str(item) for item in scope.get("excluded") or []}
+        core_features = [
+            feature for feature in prd.get("coreFeatures") or []
+            if isinstance(feature, dict) and str(feature.get("name") or "") not in excluded
+        ]
+        combined_prd = json.dumps({
+            "projectOverview": prd.get("projectOverview"),
+            "background": prd.get("background"),
+            "coreFeatures": core_features,
+        }, ensure_ascii=False).lower()
+        refs: dict[str, set[str]] = {}
+        for name, table in tables.items():
+            refs[name] = set()
+            for column in table.get("columns") or []:
+                if not isinstance(column, dict):
+                    continue
+                match = re.search(r"REFERENCES\s+([a-z][a-z0-9_]*)", str(column.get("constraints") or ""), re.I)
+                if match:
+                    refs[name].add(match.group(1).lower())
+
+        seen_cycles: set[frozenset[str]] = set()
+        for source, targets in refs.items():
+            for target in targets:
+                pair = frozenset((source, target))
+                if source != target and source in refs.get(target, set()) and pair not in seen_cycles:
+                    seen_cycles.add(pair)
+                    db_issues.append(f"상호 참조 순환 FK: {source} ↔ {target}")
+
+        # Declared ERD relationships are documentation of the physical FK graph,
+        # not an independent guess. Reject a direction or pair that no FK supports.
+        fk_edges = {(target, source) for source, targets in refs.items() for target in targets}
+        for relationship in db.get("relationships") or []:
+            match = re.match(
+                r"^\s*([a-z][a-z0-9_]*)\s*\([^)]*\)\s*([a-z][a-z0-9_]*)\s*$",
+                str(relationship), re.I,
+            )
+            if match and (match.group(1).lower(), match.group(2).lower()) not in fk_edges:
+                db_issues.append(f"FK와 역할·방향이 다른 relationship: {relationship}")
+
+        name_lookup = _build_name_lookup(list(tables.values()))
+        for table_name, table in tables.items():
+            column_names = [
+                str(column.get("name") or "")
+                for column in table.get("columns") or [] if isinstance(column, dict)
+            ]
+            duplicates = sorted({
+                name for name in column_names if name and column_names.count(name) > 1
+            })
+            if duplicates:
+                db_issues.append(f"테이블 내부 중복 컬럼: {table_name} {duplicates}")
+            invalid_names = sorted({
+                name for name in column_names
+                if name and not re.match(r'^[a-z][a-z0-9_]*$', name)
+            })
+            if invalid_names:
+                db_issues.append(f"PostgreSQL 비정상 컬럼명: {table_name} {invalid_names}")
+            for column in table.get("columns") or []:
+                if not isinstance(column, dict):
+                    continue
+                column_name = str(column.get("name") or "")
+                constraints = str(column.get("constraints") or "")
+                match = re.search(r"REFERENCES\s+([a-z][a-z0-9_]*)", constraints, re.I)
+                target = match.group(1).lower() if match else ""
+                column_type = str(column.get("type") or "").upper()
+                if target and target not in tables:
+                    db_issues.append(f"존재하지 않는 FK 대상: {table_name}.{column_name} → {target}")
+                actor_identifier = column_type.startswith(("BIGINT", "INTEGER", "UUID"))
+                if column_name.endswith("_by") and actor_identifier and not target:
+                    db_issues.append(f"행위자 역할 컬럼 FK 누락: {table_name}.{column_name}")
+                if not target or not column_name.endswith("_id"):
+                    continue
+                role = column_name[:-3]
+                exact_role_target = name_lookup.get(role)
+                if exact_role_target and exact_role_target != target:
+                    db_issues.append(
+                        f"FK 역할 불일치: {table_name}.{column_name} → {target} "
+                        f"(역할 대상은 {exact_role_target})"
+                    )
+        for feature in prd.get("coreFeatures") or []:
+            if not isinstance(feature, dict):
+                continue
+            feature_name = str(feature.get("name") or "")
+            content = f"{feature.get('description', '')} {' '.join(feature.get('requirements') or [])}"
+            concepts = required_field_concepts(content)
+            scored = [
+                (relevance_score(feature_name, f"{name} {tables[name].get('description', '')}"), name)
+                for name in tables
+                if not (columns.get(name, set()) & {"password_hash", "credential_hash", "login_id", "email"})
+            ]
+            best = max((score for score, _ in scored), default=0.0)
+            winners = [name for score, name in scored if score == best and score >= 0.2]
+            if len(winners) == 1:
+                table_name = winners[0]
+                for concept, aliases in concepts.items():
+                    represented = bool(columns.get(table_name, set()) & aliases)
+                    if not represented and concept in {"status", "state", "due_date", "priority"} and any(
+                        token in table_name for token in (
+                            "assigned", "assignment", "membership", "link", "mapping",
+                            "record", "history", "log", "event",
+                        )
+                    ):
+                        represented = any(
+                            bool(columns.get(parent, set()) & aliases)
+                            for parent in refs.get(table_name, set())
+                            if parent in tables
+                        )
+                    if not represented and concept in {"quantity", "amount", "balance", "unit"}:
+                        represented = any(
+                            table_name in refs.get(source, set()) and bool(columns.get(source, set()) & aliases)
+                            for source in tables
+                        )
+                    if not represented:
+                        db_issues.append(f"PRD 요구 필드 ERD 누락: {table_name}.{concept}")
+
+        def matched_table(feature_name: str) -> str | None:
+            scored = [
+                (relevance_score(feature_name, f"{name} {table.get('description', '')}"), name)
+                for name, table in tables.items()
+            ]
+            best = max((score for score, _name in scored), default=0.0)
+            winners = [name for score, name in scored if score == best and score >= 0.2]
+            return winners[0] if len(winners) == 1 else None
+
+        feature_tables = [
+            (feature, matched_table(str(feature))) for feature in feature_list or []
+        ]
+        root_table = next(
+            (table_name for feature, table_name in feature_tables
+             if table_name and feature_relation_kind(str(feature)) == "aggregate"),
+            None,
+        )
+        auth_contract = requires_auth(prd, feature_list, requirement_text)
+        credential_fields = {"password_hash", "credential_hash", "login_id", "email"}
+        principal_tables = {
+            name for name, names in columns.items() if names & credential_fields
+        }
+        if auth_contract and not principal_tables:
+            db_issues.append("PRD 로그인 요구가 있지만 인증 주체 저장 구조가 없음")
+        for feature, table_name in feature_tables:
+            if not table_name or not root_table or table_name == root_table:
+                continue
+            kind = feature_relation_kind(str(feature))
+            # Event/history resources may legitimately reference a state entity
+            # rather than the first aggregate feature's table. Only explicit
+            # association features require this topology check here.
+            if kind == "association" and root_table not in refs.get(table_name, set()):
+                db_issues.append(f"기능 관계 FK 누락: {table_name} → {root_table} ({feature})")
+            if kind == "association" and auth_contract and principal_tables:
+                if not (refs.get(table_name, set()) & principal_tables):
+                    db_issues.append(f"배정 주체 FK 누락: {table_name} ({feature})")
+
+        for table_name, table in tables.items():
+            required_keys = scoped_unique_columns(table, list(tables.values()), core_features)
+            if not required_keys:
+                continue
+            # The declared key must be covered by one composite unique index;
+            # separate ordinary indexes cannot complete an unrelated UNIQUE.
+            unique_keys = []
+            for index in table.get("indexes") or []:
+                match = re.search(r"\bUNIQUE\b[^()]*\(([^()]*)\)", str(index), re.IGNORECASE)
+                if match:
+                    unique_keys.append({part.strip().strip('"').lower() for part in match.group(1).split(",")})
+            if set(required_keys) not in unique_keys:
+                db_issues.append(f"중복 방지 UNIQUE 제약 누락: {table_name}")
+        occurrence_fields = {
+            "occurred_at", "recorded_at", "event_at", "completed_at", "processed_at",
+            "started_at", "ended_at", "effective_at",
+        }
+        event_tables = {
+            name for name, names in columns.items()
+            if refs.get(name) and bool(names & occurrence_fields)
+            and not any(token in name for token in ("assignment", "membership", "link", "mapping"))
+        }
+        aggregates = {
+            name for name, names in columns.items()
+            if names & state_fields and name not in event_tables
+        }
+        mutating_contract = any(token in combined_prd for token in (
+            "차감", "증가", "감소", "잔여", "수량을 갱신", "상태를 갱신", "balance", "quantity",
+        ))
+        if mutating_contract and not aggregates:
+            db_issues.append("PRD가 상태 변경을 요구하지만 ERD에 변경 대상 상태 컬럼이 없음")
+        for aggregate in aggregates:
+            for catalog in refs.get(aggregate, set()):
+                overlap = (columns.get(catalog, set()) & columns[aggregate] & (state_fields - {"status", "state"}))
+                if overlap:
+                    db_issues.append(f"기준 엔티티 {catalog}와 상태 엔티티 {aggregate}의 책임 중복: {sorted(overlap)}")
+
+        for name in event_tables:
+            aggregate_refs = refs.get(name, set()) & aggregates
+            catalog_refs = refs.get(name, set()) - aggregates
+            related_aggregate = {
+                aggregate for aggregate in aggregates if refs.get(aggregate, set()) & catalog_refs
+            }
+            if related_aggregate and not aggregate_refs:
+                db_issues.append(f"이력 엔티티 {name}가 실제 상태 엔티티를 참조하지 않음: {sorted(related_aggregate)}")
+
+        endpoint_list = [ep for ep in api.get("endpoints") or [] if isinstance(ep, dict)]
+        auth_required_by_prd = requires_auth(prd, feature_list, requirement_text)
+        if auth_required_by_prd:
+            for endpoint in endpoint_list:
+                if str(endpoint.get("path") or "").startswith("/api/v1/auth/"):
+                    continue
+                if not bool(endpoint.get("authRequired")):
+                    api_issues.append(f"PRD 인증 요구와 authRequired 불일치: {endpoint.get('method')} {endpoint.get('path')}")
+        auth_paths = " ".join(str(ep.get("path") or "") for ep in endpoint_list)
+        has_refresh_store = any(
+            ({"token_hash", "expires_at"} <= names or {"refresh_token", "expires_at"} <= names)
+            for names in columns.values()
+        )
+        if ("/auth/refresh" in auth_paths or "/auth/logout" in auth_paths) and not has_refresh_store:
+            db_issues.append("Refresh Token API가 있지만 만료·회수 가능한 토큰 저장 구조가 없음")
+        # Delivery infrastructure is deployment-specific. A product may use web
+        # push, e-mail, SMS, or an external provider without persisting a device
+        # token in this service, so QA must not force a push-device schema.
+        preference_required = any(token in combined_prd for token in ("notification setting", "alert setting", "알림 설정", "수신 설정"))
+        def _is_preference_column(name: str) -> bool:
+            return bool(re.search(
+                r"(?:^|_)(?:is_)?enabled?(?:_|$)|(?:^|_)opt(?:ed)?_(?:in|out)(?:_|$)"
+                r"|(?:^|_)(?:subscribed|channel)(?:_|$)",
+                name,
+            ))
+
+        has_preferences = any(
+            "user_id" in names and any(_is_preference_column(name) for name in names)
+            for names in columns.values()
+        )
+        if preference_required and not has_preferences:
+            db_issues.append("알림 설정 요구사항이 있지만 사용자별 수신 설정 구조가 없음")
+
+        for table_name, table in tables.items():
+            index_text = " ".join(str(value).replace(" ", "").lower() for value in table.get("indexes") or [])
+            for column in table.get("columns") or []:
+                if not isinstance(column, dict):
+                    continue
+                column_name = str(column.get("name") or "")
+                if re.search(r"REFERENCES\s+", str(column.get("constraints") or ""), re.I):
+                    if f"({column_name.lower()})" not in index_text:
+                        db_issues.append(f"FK 인덱스 누락: {table_name}.{column_name}")
+            if {"status", "scheduled_at"}.issubset(columns.get(table_name, set())):
+                if "(status,scheduled_at)" not in index_text:
+                    db_issues.append(f"스케줄러 인덱스 누락: {table_name}(status, scheduled_at)")
+
+        for endpoint in endpoint_list:
+            method = str(endpoint.get("method") or "").upper()
+            path = str(endpoint.get("path") or "")
+            if path.startswith("/api/v1/auth/"):
+                fields = _request_field_names(endpoint.get("requestBody"))
+                if path.endswith("/login") and not (
+                    fields & {"loginid", "login_id", "email", "username"}
+                    and fields & {"credential", "password", "secret"}
+                ):
+                    api_issues.append(f"로그인 API 식별자·자격증명 계약 누락: {path}")
+                continue
+            if method == "GET" and "{" not in path and not path.endswith("/me"):
+                if "404" in str(endpoint.get("errorCodes") or ""):
+                    api_issues.append(f"목록 API가 빈 결과에 404를 명시: {path}")
+                if "[]" not in str(endpoint.get("successResponse") or ""):
+                    api_issues.append(f"목록 API의 빈 배열 계약 누락: {path}")
+            slug = path.removeprefix("/api/v1/").split("/", 1)[0].replace("-", "_")
+            mapped_name, mapped_table = _endpoint_table(endpoint, tables)
+            if method not in {"GET", "DELETE"}:
+                request_body = endpoint.get("requestBody")
+                request_text = json.dumps(request_body, ensure_ascii=False) if isinstance(request_body, dict) else str(request_body or "")
+                if re.search(r"\bpayload\s*:\s*object\b|기능(?:별)?\s*입력", request_text, re.I):
+                    api_issues.append(f"API 요청 계약이 구체 필드 없이 payload로만 정의됨: {method} {path}")
+                if mapped_table:
+                    request_fields = _request_field_names(request_body)
+                    endpoint_feature = str(
+                        endpoint.get("featureName") or endpoint.get("description") or ""
+                    ).split(":", 1)[0]
+                    association_contract = feature_relation_kind(endpoint_feature) == "association"
+                    server_managed = {"id", "created_at", "updated_at"}
+                    if not association_contract:
+                        server_managed.add("user_id")
+                    db_fields = columns.get(mapped_name, set()) - server_managed
+                    unknown = request_fields - db_fields
+                    if unknown:
+                        api_issues.append(
+                            f"API 요청 필드가 ERD와 불일치: {method} {path} {sorted(unknown)}"
+                        )
+                    if method == "POST":
+                        required = {
+                            str(column.get("name"))
+                            for column in mapped_table.get("columns") or []
+                            if isinstance(column, dict)
+                            and str(column.get("name")) not in server_managed
+                            and "NOT_NULL" in str(column.get("constraints") or "").upper()
+                            and "DEFAULT" not in str(column.get("constraints") or "").upper()
+                        }
+                        missing = required - request_fields
+                        if missing:
+                            api_issues.append(
+                                f"API POST 필수 필드가 ERD보다 부족함: {path} {sorted(missing)}"
+                            )
+            if method in {"POST", "PUT", "PATCH"} and slug in tables:
+                # A table referenced by a stateful table is not necessarily a
+                # read-only catalog. Schedules, orders and projects are valid
+                # aggregate roots even when child state tables reference them.
+                # Report a misplaced state mutation only when the request
+                # actually writes state fields that belong exclusively to the
+                # referencing aggregate.
+                aggregate_candidates = [
+                    aggregate for aggregate in aggregates if slug in refs.get(aggregate, set())
+                ]
+                request_body = endpoint.get("requestBody")
+                if isinstance(request_body, dict):
+                    request_fields = {str(name).lower() for name in request_body}
+                else:
+                    request_fields = {
+                        match.lower()
+                        for match in re.findall(
+                            r"(?:^|[,;{]\s*)['\"]?([a-z][a-z0-9_]*)['\"]?\s*:",
+                            str(request_body or ""),
+                            re.I,
+                        )
+                    }
+                misplaced_fields: set[str] = set()
+                for aggregate in aggregate_candidates:
+                    misplaced_fields.update(
+                        request_fields
+                        & state_fields
+                        & (columns.get(aggregate, set()) - columns.get(slug, set()))
+                    )
+                if misplaced_fields:
+                    api_issues.append(
+                        f"상태 변경 API가 {slug}에 없는 상태 필드를 직접 변경함: "
+                        f"{path} {sorted(misplaced_fields)}"
+                    )
+            if method in {"POST", "PATCH", "DELETE"} and slug in event_tables:
+                if refs.get(slug, set()) & aggregates and not endpoint.get("transactionRules"):
+                    api_issues.append(f"상태 이력 API의 원자적 보정 규칙 누락: {method} {path}")
+            if method in {"POST", "PATCH", "DELETE"} and slug in tables:
+                has_unique_contract = any(
+                    re.search(r"CREATE\s+UNIQUE\s+INDEX", str(index), re.I)
+                    for index in tables[slug].get("indexes") or []
+                )
+                has_state_parent = any(
+                    columns.get(target, set()) & state_fields
+                    for target in refs.get(slug, set())
+                )
+                if (has_unique_contract or has_state_parent) and not endpoint.get("transactionRules"):
+                    api_issues.append(f"중복·선행 업무 트랜잭션 규칙 누락: {method} {path}")
+
+        incomplete_tail = re.compile(
+            r"(?:하는|되는|위한|통한|해소하는|구현하는|제공하는|기반 마련|문제를 해결|"
+            r"태스크\s*관리|기능\s*구현|서비스\s*설계)\s*[.]?$"
+        )
+        for item in prd.get("releaseSchedule") or []:
+            if isinstance(item, dict):
+                description = str(item.get("description") or "").strip()
+                if incomplete_tail.search(description):
+                    prd_issues.append(f"일정 문장 잘림 또는 미완결: {description}")
+        return list(dict.fromkeys(db_issues)), list(dict.fromkeys(api_issues)), list(dict.fromkeys(prd_issues))
+
     def _make_reviewer_node(self, domain: str):
         async def reviewer(state: dict) -> dict:
             ctx = state["ctx"]
@@ -843,7 +1354,11 @@ class QaAgent:
             fixed = draft
             if data and isinstance(data, dict):
                 issues = [str(i) for i in data.get("issues", [])]
-                fixed_data = data.get("fixed")
+                draft_data = try_parse_json(draft) or {}
+                patches = data.get("patches")
+                if not isinstance(patches, dict):
+                    patches = _derive_patches_from_full_output(domain, draft_data, data.get("fixed"))
+                fixed_data = _apply_review_patches(domain, draft_data, patches)
                 if isinstance(fixed_data, dict):
                     if domain == "db":
                         fixed_data = _to_array_schema(fixed_data)
@@ -955,7 +1470,9 @@ class QaAgent:
         ("kpi", 7),
     )
 
-    def _check_prd_completeness(self, prd_doc, feature_count: int) -> list[str]:
+    def _check_prd_completeness(
+        self, prd_doc, feature_count: int, market_data: str = ""
+    ) -> list[str]:
         """PRD 필수 섹션의 최소 분량을 결정론적으로 검증 (LLM 판정에만 의존하지 않기 위한 보조 체크)."""
         if not isinstance(prd_doc, dict) or not prd_doc:
             return ["PRD 문서가 비어 있거나 파싱되지 않았습니다"]
@@ -975,7 +1492,59 @@ class QaAgent:
             if n < minimum:
                 issues.append(f"{field}가 {n}개뿐 — 최소 {minimum}개 필요")
 
-        return issues
+        if contamination_reasons(prd_doc):
+            issues.append(f"PRD 오염 문자열 감지: {contamination_reasons(prd_doc)}")
+        if has_placeholder(prd_doc):
+            issues.append("PRD에 placeholder·미정·수동 보완 값이 남아 있음")
+
+        goals = [str(x) for x in prd_doc.get("goals") or []]
+        if any(near_duplicate(goals[i], goals[j], 0.6) for i in range(len(goals)) for j in range(i)):
+            issues.append("goals에 의미상 중복 목표가 있음")
+        metrics = [str(x.get("metric") or "") for x in prd_doc.get("kpi") or [] if isinstance(x, dict)]
+        if any(near_duplicate(metrics[i], metrics[j], 0.6) for i in range(len(metrics)) for j in range(i)):
+            issues.append("KPI 지표가 의미상 중복됨")
+        for item in prd_doc.get("kpi") or []:
+            if isinstance(item, dict) and "→" not in str(item.get("target") or ""):
+                issues.append(f"KPI target 형식 오류: {item.get('metric')}")
+            elif isinstance(item, dict):
+                for reason in kpi_basis_issues(item, market_data):
+                    issues.append(f"KPI 근거 검증 실패: {item.get('metric')} — {reason}")
+
+        scope = prd_doc.get("mvpScope") if isinstance(prd_doc.get("mvpScope"), dict) else {}
+        excluded = set(scope.get("excluded") or [])
+        p0_excluded = [item.get("name") for item in prd_doc.get("coreFeatures") or []
+                       if isinstance(item, dict) and item.get("priority") == "P0" and item.get("name") in excluded]
+        if p0_excluded:
+            issues.append(f"P0 기능이 MVP excluded와 충돌: {p0_excluded}")
+        for item in prd_doc.get("coreFeatures") or []:
+            if not isinstance(item, dict):
+                continue
+            feature = str(item.get("name") or "")
+            content = f"{item.get('description', '')} {' '.join(item.get('requirements') or [])}"
+            if feature and relevance_score(feature, content) < 0.2:
+                issues.append(f"기능 설명·요구사항이 담당 기능에서 이탈: {feature}")
+            if str(item.get("origin") or "").upper() == "DERIVED":
+                if not str(item.get("parentFeature") or "").strip():
+                    issues.append(f"파생 기능의 상위 기능 누락: {feature}")
+                if not item.get("source") or len(str(item.get("rationale") or "").strip()) < 12:
+                    issues.append(f"파생 기능의 요구사항 근거 부족: {feature}")
+                if not item.get("acceptanceCriteria"):
+                    issues.append(f"파생 기능의 수용 기준 누락: {feature}")
+            if item.get("origin") and not item.get("actions"):
+                issues.append(f"상세 기능 행위 명세 누락: {feature}")
+            if item.get("origin") and not item.get("dataRequirements"):
+                issues.append(f"상세 기능 데이터 명세 누락: {feature}")
+
+        signatures = []
+        for item in prd_doc.get("userPersonas") or []:
+            if isinstance(item, dict):
+                sig = f"{item.get('age', '')} {item.get('job', '')}"
+                if any(near_duplicate(sig, prior, 0.75) for prior in signatures):
+                    issues.append("Persona 연령·직업 조합이 중복되어 세그먼트 구분이 약함")
+                    break
+                signatures.append(sig)
+
+        return list(dict.fromkeys(issues))
 
     def _check_api_completeness(self, api_spec, feature_list: list[str]) -> list[str]:
         """API 스펙의 엔드포인트 수/인증 정보/기능별 커버리지가 충분한지 결정론적으로 검증."""
@@ -996,7 +1565,7 @@ class QaAgent:
             endpoint_texts = [
                 " ".join(
                     str(ep.get(key, ""))
-                    for key in ("method", "path", "description", "featureId", "action")
+                    for key in ("method", "path", "description", "featureId", "featureName", "action")
                 )
                 for ep in endpoints if isinstance(ep, dict)
             ]
@@ -1011,7 +1580,46 @@ class QaAgent:
             if missing:
                 issues.append(f"다음 기능에 대응하는 엔드포인트가 없어 보임: {missing}")
 
-        return issues
+            seen = set()
+            for ep in endpoints:
+                if not isinstance(ep, dict):
+                    issues.append("endpoint가 객체 형식이 아님")
+                    continue
+                key = (str(ep.get("method") or "").upper(), str(ep.get("path") or ""))
+                if key in seen:
+                    issues.append(f"중복 endpoint: {key[0]} {key[1]}")
+                seen.add(key)
+                path = key[1]
+                if re.search(r"/(?:resource|qa-feature)-\d+", path) or "/domain-features-" in path:
+                    issues.append(f"의미 없는 리소스 경로: {path}")
+                for issue in _endpoint_quality_issues(ep, "SELF_CHECK: PASS", ep, require_self_check=False):
+                    issues.append(f"{key[0]} {path}: {issue}")
+
+            for index, feature in enumerate(feature_list):
+                slug = _feature_resource_slug(feature, index)
+                actual = {str(ep.get("method") or "").upper() for ep in endpoints
+                          if isinstance(ep, dict) and (
+                              f"/api/v1/{slug}" in str(ep.get("path") or "")
+                              or relevance_score(
+                                  feature,
+                                  f"{ep.get('featureName', '')} {ep.get('description', '')}",
+                              ) >= 0.2
+                          )}
+                mapping = next((
+                    item for item in api_spec.get("featureMappings") or []
+                    if isinstance(item, dict) and str(item.get("featureName") or "") == str(feature)
+                ), None)
+                if mapping:
+                    actual.update(
+                        str(operation.get("method") or "").upper()
+                        for operation in mapping.get("operations") or [] if isinstance(operation, dict)
+                    )
+                required = set(_feature_methods(feature))
+                missing_methods = required - actual
+                if missing_methods:
+                    issues.append(f"{feature} CRUD/행위 계약 누락: {sorted(missing_methods)}")
+
+        return list(dict.fromkeys(issues))
 
     def _api_completeness_hint(self, api_spec, feature_list: list[str]) -> str:
         """api_reviewer 컨텍스트에 주입할 결정론적 결함 힌트."""
@@ -1059,7 +1667,58 @@ class QaAgent:
         if missing:
             issues.append(f"다음 기능을 저장할 테이블이 없어 보임: {missing}")
 
-        return issues
+        db_contamination = [
+            reason for reason in contamination_reasons(db_schema)
+            if reason != "foreign-language sentence leak"
+        ]
+        if db_contamination:
+            issues.append(f"DB 스키마 오염 문자열 감지: {db_contamination}")
+        if has_placeholder(db_schema):
+            issues.append("DB 스키마에 placeholder가 남아 있음")
+
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            col_names = {str(c.get("name") or "") for c in table.get("columns") or [] if isinstance(c, dict)}
+            for col in table.get("columns") or []:
+                if not isinstance(col, dict):
+                    continue
+                name = str(col.get("name") or "")
+                col_type = str(col.get("type") or "").upper()
+                constraints = str(col.get("constraints") or "").upper()
+                if col_type == "DATETIME" or "AUTO_INCREMENT" in constraints or "ON UPDATE" in constraints:
+                    issues.append(f"PostgreSQL 비호환 정의: {table.get('name')}.{name}")
+                if col_type == "TIMESTAMPTZ" and "WITHOUT TIME ZONE" in constraints:
+                    issues.append(f"PostgreSQL 타입·제약 모순: {table.get('name')}.{name}")
+                if col_type == "TIMESTAMP" and "WITH TIME ZONE" in constraints:
+                    issues.append(f"PostgreSQL 타입 분리 오류: {table.get('name')}.{name}")
+                if re.search(r"GENERATED\s+(?:BY\s+DEFAULT|ALWAYS)(?!\s+AS\s+IDENTITY)", constraints):
+                    issues.append(f"PostgreSQL IDENTITY 제약 불완전: {table.get('name')}.{name}")
+                if col_type not in {
+                    "BIGINT", "INT", "INTEGER", "SMALLINT", "VARCHAR", "CHAR", "TEXT", "BOOLEAN", "DATE",
+                    "TIMESTAMP", "TIMESTAMPTZ", "REAL", "DOUBLE PRECISION", "JSONB", "UUID",
+                } and not re.match(r"^(?:VARCHAR|CHAR)\(\d+\)$|^(?:DECIMAL|NUMERIC)\(\d+,\d+\)$", col_type):
+                    issues.append(f"PostgreSQL 허용 타입 아님: {table.get('name')}.{name}={col_type}")
+                explicit_reference = re.search(
+                    r"REFERENCES\s+([a-z][a-z0-9_]*)", constraints, re.I
+                )
+                explicit_target = explicit_reference.group(1).lower() if explicit_reference else ""
+                has_valid_reference = explicit_target in {
+                    str(candidate.get("name") or "").lower()
+                    for candidate in tables if isinstance(candidate, dict)
+                }
+                # `_id`는 로그인 ID·외부 시스템 ID 같은 일반 식별자일 수도 있다.
+                # FK라고 명시한 컬럼만 실제 대상 테이블 존재 여부를 검사한다.
+                if explicit_reference and not has_valid_reference:
+                    issues.append(f"참조 대상 없는 FK 컬럼: {table.get('name')}.{name}")
+            for index_sql in table.get("indexes") or []:
+                match = re.search(r"\(([^)]*)\)", str(index_sql))
+                if match:
+                    unknown = [x.strip() for x in match.group(1).split(",") if x.strip() not in col_names]
+                    if unknown:
+                        issues.append(f"없는 컬럼을 참조하는 인덱스: {table.get('name')} {unknown}")
+
+        return list(dict.fromkeys(issues))
 
     def _db_completeness_hint(self, db_schema, feature_list: list[str], feature_registry=None) -> str:
         """db_reviewer 컨텍스트에 주입할 결정론적 결함 힌트."""

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import uuid
 from collections import defaultdict
+from dataclasses import replace
 
 import numpy as np
 import psycopg2
@@ -19,9 +20,12 @@ logger = logging.getLogger(__name__)
 RRF_K = 60
 SESSION_BOOST = 1.5
 
-# Phase1 검색 대상 타입 — ERD·API는 JSON 구조라 의미 벡터 품질이 낮고 노이즈가 됨 (rag-pipeline과 동일)
-_SEARCH_TYPES = ("prd", "market_research", "features")
-_SEARCH_TYPE_SQL = "AND metadata->>'type' IN ('prd', 'market_research', 'features')"
+# 이전 프로젝트의 생성 산출물이 새 프로젝트의 전역 근거로 섞이지 않게 한다.
+_SEARCH_TYPES = ("source", "prd", "market_research", "features")
+_SEARCH_TYPE_SQL = (
+    "AND metadata->>'type' IN ('source', 'prd', 'market_research', 'features') "
+    "AND COALESCE(metadata->>'pipeline_id', '') = ''"
+)
 
 _SEARCH_TAGS = {"NNG", "NNP", "NNB", "SL", "SH"}
 _kiwi = Kiwi()
@@ -67,7 +71,16 @@ class HybridSearchService:
         vector_results, keyword_results = await asyncio.gather(
             self._vector_search(query, threshold),
             self._run_db(self._keyword_search, query),
+            return_exceptions=True,
         )
+        if isinstance(vector_results, BaseException) and isinstance(keyword_results, BaseException):
+            raise RuntimeError("벡터·키워드 검색 모두 실패") from vector_results
+        if isinstance(vector_results, BaseException):
+            logger.warning("벡터 검색 실패, 키워드 검색 결과만 사용")
+            vector_results = []
+        if isinstance(keyword_results, BaseException):
+            logger.warning("키워드 검색 실패, 벡터 검색 결과만 사용")
+            keyword_results = []
         rrf_results = self._rrf(vector_results, keyword_results, top_k)
         logger.info(
             "[HybridSearch] query=%r | vector=%d | keyword=%d | rrf=%d",
@@ -92,7 +105,7 @@ class HybridSearchService:
                 chunks.setdefault(key, chunk)
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        result = [chunks[k] for k, _ in ranked]
+        result = [replace(chunks[k], relevance_score=score) for k, score in ranked]
         logger.info("[MultiQuery] 쿼리 %d개 병렬 실행 → RRF 합산 %d건", len(queries), len(result))
         return result
 
@@ -148,7 +161,7 @@ class HybridSearchService:
             return chunks
         except Exception as e:
             logger.warning("벡터 검색 실패: %s", e)
-            return []
+            raise
 
     async def _run_db(self, func, *args):
         async with self._db_semaphore:
@@ -242,7 +255,7 @@ class HybridSearchService:
             return chunks
         except Exception as e:
             logger.warning("키워드 검색 실패: %s", e)
-            return []
+            raise
 
     async def _session_similarity_search(
         self,
