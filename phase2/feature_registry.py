@@ -217,7 +217,7 @@ def missing_api_contract_features(
     """Return feature IDs whose declared API contracts are absent from the final spec."""
     endpoint_keys = {
         (
-            str(endpoint.get("method") or "GET").strip().upper(),
+            canonical_api_method(endpoint.get("method"), endpoint.get("path")),
             _normalize_api_path(endpoint.get("path")),
         )
         for endpoint in endpoints or []
@@ -235,7 +235,7 @@ def missing_api_contract_features(
             if not isinstance(contract, dict):
                 continue
             key = (
-                str(contract.get("method") or "GET").strip().upper(),
+                canonical_api_method(contract.get("method"), contract.get("path")),
                 _normalize_api_path(contract.get("path")),
             )
             if key[1] and key not in endpoint_keys and feature_id not in missing:

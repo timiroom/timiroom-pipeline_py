@@ -698,3 +698,51 @@ def test_parent_state_entity_with_completion_time_is_not_a_history_table():
     )
 
     assert not [issue for issue in db_issues if "이력 엔티티 tasks" in issue]
+
+
+def test_put_contract_is_matched_by_every_gate_after_canonicalization():
+    # 운영 재현: Registry를 거치지 않은 feature_specs의 PUT 계약이 최종 게이트에서 다시 누락으로 판정됐다.
+    from phase2.feature_registry import missing_api_contract_features
+
+    contract = {"method": "PUT", "path": "/api/v1/tasks/{taskid}/assignees"}
+    endpoint = {
+        "method": "PATCH", "path": "/api/v1/tasks/{taskid}/assignees", "authRequired": True,
+        "requestBody": "user_id: integer", "successResponse": "success: boolean",
+        "errorCodes": "400 — 입력 오류", "transactionRules": "한 트랜잭션으로 처리한다.",
+    }
+    spec = {
+        "name": "담당자 배정", "featureId": "feature_002", "id": "feature_002",
+        "transactionRules": ["한 트랜잭션으로 처리한다"], "apiContract": [contract],
+    }
+    assert missing_api_contract_features([spec], [endpoint]) == []
+
+    db = json.dumps({"tables": _contract_tables("users"), "featureMappings": [
+        {"featureName": "담당자 배정", "featureId": "feature_002", "table": "users"},
+    ]}, ensure_ascii=False)
+    api = json.dumps({"endpoints": [endpoint], "featureMappings": [
+        {"featureName": "담당자 배정", "operations": [{"method": "PATCH", "path": endpoint["path"]}]},
+    ]}, ensure_ascii=False)
+    errors = SchemaValidator()._check_feature_contracts([spec], db, api)
+    assert not [error for error in errors if "엔드포인트 누락" in error]
+
+    _db_issues, api_issues, _prd_issues = QaAgent._check_cross_artifacts(
+        {"tables": _contract_tables("users")}, {"endpoints": [endpoint]},
+        {"coreFeatures": [spec]},
+    )
+    assert not [issue for issue in api_issues if "apiContract" in issue]
+
+
+def test_self_reference_with_a_singular_table_name_resolves_its_target():
+    # 운영 재현: auth_sessions.replaced_by_auth_session_id가 복수형 테이블명과 맞지 않아 FK 대상 없음으로 차단됐다.
+    db = {"tables": [
+        {"name": "users", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
+        {"name": "auth_sessions", "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "user_id", "type": "BIGINT", "constraints": "NOT_NULL FOREIGN_KEY REFERENCES users(id)"},
+            {"name": "replaced_by_auth_session_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
+            {"name": "approved_by_manager_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
+        ]},
+    ]}
+    db_issues, _api_issues, _prd_issues = QaAgent._check_cross_artifacts(db, {"endpoints": []}, {})
+    fk_issues = [issue for issue in db_issues if "FK 참조 대상" in issue]
+    assert fk_issues == ["auth_sessions.approved_by_manager_id의 FK 참조 대상을 찾을 수 없습니다"]

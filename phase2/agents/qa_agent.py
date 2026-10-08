@@ -23,7 +23,7 @@ from phase2.state import PipelineState
 
 from phase2.agents.dba_agent import _build_name_lookup
 from phase2.agents.api_agent import _endpoint_quality_issues, _feature_methods, _feature_resource_slug
-from phase2.agent_contract import IssueSeverity, classify_issue, feature_relation_kind, requires_auth
+from phase2.agent_contract import IssueSeverity, canonical_api_method, classify_issue, feature_relation_kind, requires_auth
 from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts, scoped_unique_columns
 
 logger = logging.getLogger(__name__)
@@ -776,7 +776,7 @@ class QaAgent:
         db_issues, api_issues, prd_issues = [], [], []
         endpoints = [e for e in (api or {}).get("endpoints", []) if isinstance(e, dict)]
         endpoint_keys = {
-            (str(e.get("method", "GET")).upper(), _canonical_api_path(e.get("path")))
+            (canonical_api_method(e.get("method"), e.get("path")), _canonical_api_path(e.get("path")))
             for e in endpoints
         }
         registry_ids = {str(item.get("featureId") or item.get("id") or "").strip() for item in registry or []}
@@ -800,7 +800,7 @@ class QaAgent:
             for contract in item.get("apiContract") or []:
                 if isinstance(contract, dict):
                     key = (
-                        str(contract.get("method", "GET")).upper(),
+                        canonical_api_method(contract.get("method"), contract.get("path")),
                         _canonical_api_path(contract.get("path")),
                     )
                     if key[1] and key not in endpoint_keys:
@@ -897,6 +897,8 @@ class QaAgent:
                             stem.endswith("_" + table_name)
                             or stem.endswith("_" + table_tail)
                             or stem in table_variants
+                            # replaced_by_auth_session_id -> auth_sessions (singular alias of the full name)
+                            or any(stem.endswith("_" + variant) for variant in _table_name_variants(table_name))
                         ):
                             candidates.add(table_name)
                     if not candidates & table_names:
