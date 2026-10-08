@@ -2184,11 +2184,17 @@ class DbaAgent:
             registry = normalize_feature_registry(
                 state.feature_registry, state.feature_list, preserve_extra=True,
             )
+            tables, relationships = normalize_table_contract_names(tables, relationships, registry)
+            tables = annotate_table_feature_ids(tables, registry)
             _ensure_fk_references(tables, registry)
+            mappings = build_feature_mappings(tables, state.feature_specs or registry)
             tables = reconcile_fk_types(tables)
             tables = _stable_schema_order(tables)
             relationships = _normalize_relationships(relationships, tables)
-            repaired = json.dumps({"tables": tables, "relationships": relationships}, ensure_ascii=False)
+            repaired = json.dumps({
+                **current, "tables": tables, "relationships": relationships,
+                "featureMappings": mappings,
+            }, ensure_ascii=False)
             logger.info("DBA targeted repair — %d개 테이블/관계 변경만 적용", applied)
             return state.copy(
                 db_schema=repaired,
