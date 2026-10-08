@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 
@@ -8,6 +9,8 @@ from phase2.json_utils import try_parse_json, has_suspicious_script
 from phase2.feature_registry import build_feature_registry, normalize_feature_registry
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
+from phase2.agent_contract import normalize_feature_contract
+from phase2.quality_rules import contamination_reasons, dedupe_labels, self_check_passed
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +116,20 @@ def _split_detail(value: str) -> list[str]:
 
 
 def _parse_feature_detail(raw: str) -> dict[str, list[str]]:
-    result = {key: [] for key in ("actions", "dataRequirements", "permissionRules", "errorCases", "acceptanceCriteria", "ownership", "states", "stateTransitions", "transactionRules")}
-    labels = {"ACTIONS": "actions", "DATA": "dataRequirements", "RULES": "permissionRules", "ERRORS": "errorCases", "ACCEPTANCE": "acceptanceCriteria", "OWNERSHIP": "ownership", "STATES": "states", "TRANSITIONS": "stateTransitions", "TRANSACTIONS": "transactionRules"}
-    for line in (raw or "").replace("\r", "").splitlines():
+    result = {
+        "actions": [], "dataRequirements": [], "permissionRules": [],
+        "errorCases": [], "acceptanceCriteria": [], "ownership": [],
+        "states": [], "stateTransitions": [], "transactionRules": [],
+    }
+    labels = {
+        "ACTIONS": "actions", "DATA": "dataRequirements",
+        "RULES": "permissionRules", "ERRORS": "errorCases",
+        "ACCEPTANCE": "acceptanceCriteria",
+        "OWNERSHIP": "ownership", "STATES": "states",
+        "TRANSITIONS": "stateTransitions", "TRANSACTIONS": "transactionRules",
+    }
+    for raw_line in (raw or "").replace("\r", "").splitlines():
+        line = raw_line.strip().strip("`*- ")
         if ":" not in line:
             continue
         label, value = line.split(":", 1)
@@ -126,33 +140,58 @@ def _parse_feature_detail(raw: str) -> dict[str, list[str]]:
 
 
 def _parse_plain_pm(raw: str, form_features: list[str]) -> dict:
-    features, specs = [], []
-    current = None
-    dba_instruction = api_instruction = ""
-    fields = {"PARENT": "parentFeature", "ORIGIN": "origin", "SOURCE": "source", "RATIONALE": "rationale", "PRIORITY": "priority", "ACTIONS": "actions", "DATA": "dataRequirements", "RULES": "permissionRules", "ERRORS": "errorCases", "ACCEPTANCE": "acceptanceCriteria"}
-    for line in (raw or "").replace("\r", "").splitlines():
-        line = line.strip().strip("`*- ")
+    features: list[str] = []
+    feature_specs: list[dict] = []
+    current: dict | None = None
+    dba_instruction = ""
+    api_instruction = ""
+    for raw_line in (raw or "").replace("\r", "").splitlines():
+        line = raw_line.strip().strip("`*- ")
         upper = line.upper()
         if upper.startswith("FEATURE:"):
             if current:
-                specs.append(current)
+                feature_specs.append(current)
             value = line.split(":", 1)[1].strip()
             if value:
                 features.append(value)
                 current = {"name": value}
+        elif any(upper.startswith(label + ":") for label in _FEATURE_FIELDS):
+            label, value = line.split(":", 1)
+            key = _FEATURE_FIELDS[label.strip().upper()]
+            if current is not None:
+                value = value.strip()
+                current[key] = (
+                    _split_detail(value)
+                    if key in {
+                        "source", "actions", "dataRequirements", "permissionRules", "errorCases",
+                        "acceptanceCriteria", "ownership", "states", "stateTransitions", "transactionRules",
+                    }
+                    else value
+                )
         elif upper.startswith("DBA_INSTRUCTION:"):
             dba_instruction = line.split(":", 1)[1].strip()
         elif upper.startswith("API_INSTRUCTION:"):
             api_instruction = line.split(":", 1)[1].strip()
-        elif current and ":" in line:
-            label, value = line.split(":", 1)
-            key = fields.get(label.strip().upper())
-            if key:
-                current[key] = _split_detail(value) if key in {"source", "actions", "dataRequirements", "permissionRules", "errorCases", "acceptanceCriteria"} else value.strip()
     if current:
-        specs.append(current)
-    names = ", ".join(form_features or features) or "승인된 기능"
-    return {"featureList": features, "featureSpecs": specs, "dbaInstruction": dba_instruction or f"{names}에 필요한 테이블과 외래키를 설계합니다.", "apiInstruction": api_instruction or f"{names}의 REST API 계약을 설계합니다.", "selfCheck": "PASS"}
+        feature_specs.append(current)
+    feature_summary = ", ".join(form_features or features) or "승인된 기능"
+    if len(dba_instruction) < 30:
+        dba_instruction = (
+            f"{feature_summary} 구현에 필요한 사용자 소유 데이터 테이블과 기능별 테이블을 설계합니다. "
+            "모든 외래키, 유일성 제약조건, 생성·수정 시각과 조회 인덱스를 명시합니다."
+        )
+    if len(api_instruction) < 30:
+        api_instruction = (
+            f"{feature_summary} 기능별 REST API를 제공합니다. 인증은 사용자 요구사항에 명시된 경우에만 적용하고, "
+            "요청·응답 필드는 최종 ERD와 일치시키고 표준 4xx·5xx 오류 계약을 명시합니다."
+        )
+    return {
+        "featureList": features,
+        "featureSpecs": feature_specs,
+        "dbaInstruction": dba_instruction,
+        "apiInstruction": api_instruction,
+        "selfCheck": "PASS" if self_check_passed(raw) else "FAIL",
+    }
 
 # 생성 샘플링 파라미터
 _TEMPERATURE = 1.0
@@ -373,3 +412,162 @@ class PmAgent:
                 data.get("featureRegistry", []),
             )
         return ([], "", "", [])
+
+    @staticmethod
+    def _quality_issues(data, raw: str, form_features: list[str]) -> list[str]:
+        if not isinstance(data, dict) or not isinstance(data.get("featureList"), list):
+            return ["FEATURE 라벨 파싱 실패"]
+        issues = contamination_reasons(data)
+        features = [str(x).strip() for x in data.get("featureList") or [] if str(x).strip()]
+        if len(dedupe_labels(features)) != len(features):
+            issues.append("의미상 중복 기능 존재")
+        invalid = [f for f in features if not _is_plausible_feature(f)]
+        if invalid:
+            issues.append(f"오염되거나 비정상적인 기능명: {invalid}")
+        specs = [x for x in data.get("featureSpecs") or [] if isinstance(x, dict)]
+        by_name = {str(x.get("name") or ""): x for x in specs}
+        missing_originals = [name for name in form_features if name not in features]
+        if missing_originals:
+            issues.append(f"사용자 원본 기능 누락: {missing_originals}")
+        if len(form_features) >= 3 and len(features) < len(dedupe_labels(form_features)) + 3:
+            issues.append("문제·흐름·권한·예외에서 도출한 기능이 최소 3개보다 적음")
+        valid_parents = set(features) | {"공통", "ROOT", "root"}
+        for feature in features:
+            spec = by_name.get(feature) or {}
+            if feature not in form_features:
+                if str(spec.get("origin") or "").upper() != "DERIVED":
+                    issues.append(f"파생 기능 origin 누락: {feature}")
+                if not str(spec.get("parentFeature") or "").strip():
+                    issues.append(f"파생 기능 parentFeature 누락: {feature}")
+                elif str(spec.get("parentFeature")) not in valid_parents:
+                    issues.append(f"파생 기능 parentFeature 불일치: {feature}")
+                if len(str(spec.get("rationale") or "").strip()) < 12:
+                    issues.append(f"파생 기능 근거 부족: {feature}")
+            if not (spec.get("actions") or spec.get("acceptanceCriteria")):
+                issues.append(f"기능 행위·수용 기준 부족: {feature}")
+        if len(str(data.get("dbaInstruction") or "")) < 30:
+            issues.append("DBA_INSTRUCTION 내용 부족")
+        if len(str(data.get("apiInstruction") or "")) < 30:
+            issues.append("API_INSTRUCTION 내용 부족")
+        return issues
+
+    @staticmethod
+    def _merge_feature_specs(prd_document: str, specs: list[dict], original_features: list[str]) -> str:
+        prd = try_parse_json(prd_document or "{}") or {}
+        if not isinstance(prd, dict):
+            prd = {}
+        existing = {
+            str(item.get("name") or ""): dict(item)
+            for item in prd.get("coreFeatures") or []
+            if isinstance(item, dict) and item.get("name")
+        }
+        original_set = set(original_features or [])
+        merged = []
+        for spec in specs:
+            if not isinstance(spec, dict) or not spec.get("name"):
+                continue
+            name = str(spec["name"])
+            item = existing.get(name, {})
+            origin = "USER" if name in original_set else str(spec.get("origin") or "DERIVED").upper()
+            priority = str(spec.get("priority") or ("P0" if origin == "USER" else "P1")).upper()
+            actions = [str(x) for x in spec.get("actions") or [] if str(x).strip()]
+            rules = [str(x) for x in spec.get("permissionRules") or [] if str(x).strip()]
+            errors = [str(x) for x in spec.get("errorCases") or [] if str(x).strip()]
+            acceptance = [str(x) for x in spec.get("acceptanceCriteria") or [] if str(x).strip()]
+            requirements = list(dict.fromkeys([
+                *[str(x) for x in item.get("requirements") or [] if str(x).strip()],
+                *actions, *rules, *errors,
+            ]))
+            item.update({
+                "name": name,
+                "description": str(
+                    item.get("description")
+                    or f"{name}: {spec.get('rationale') or '요구사항 흐름을 완성하기 위해 필요한 기능'}"
+                ),
+                "priority": priority if priority in {"P0", "P1", "P2"} else "P1",
+                "requirements": requirements,
+                "parentFeature": str(spec.get("parentFeature") or ""),
+                "origin": origin,
+                "source": [str(x) for x in spec.get("source") or []],
+                "rationale": str(spec.get("rationale") or ""),
+                "actions": actions,
+                "dataRequirements": [str(x) for x in spec.get("dataRequirements") or []],
+                "permissionRules": rules,
+                "ownership": spec.get("ownership") or {},
+                "states": [str(x) for x in spec.get("states") or []],
+                "stateTransitions": [str(x) for x in spec.get("stateTransitions") or []],
+                "transactionRules": [str(x) for x in spec.get("transactionRules") or []],
+                "errorCases": errors,
+                "acceptanceCriteria": acceptance,
+            })
+            merged.append(item)
+        prd["coreFeatures"] = merged
+        scope = prd.get("mvpScope") if isinstance(prd.get("mvpScope"), dict) else {}
+        scope["included"] = [item["name"] for item in merged if item.get("priority") == "P0"]
+        scope["excluded"] = [item["name"] for item in merged if item.get("priority") in {"P1", "P2"}]
+        scope["rationale"] = (
+            "사용자 원본 기능과 출시 필수 의존 기능은 P0에 포함하고, "
+            "근거가 있으나 후속 검증 가능한 기능은 P1/P2로 분리합니다."
+        )
+        prd["mvpScope"] = scope
+        return json.dumps(prd, ensure_ascii=False)
+
+    @staticmethod
+    def _normalize_contract(spec: dict, auth_required: bool) -> dict:
+        return normalize_feature_contract(spec, auth_required)
+
+    @staticmethod
+    def _fallback_detail(name: str, requirements: list[str]) -> dict[str, list[str]]:
+        return {
+            "actions": requirements[:4] or [f"{name} 요청을 처리하고 처리 결과를 조회한다"],
+            "dataRequirements": [f"{name} 처리 입력값", "처리 상태", "생성·수정 시각"],
+            "permissionRules": ["제품 요구에 명시된 공개·보호 범위와 업무 규칙을 적용한다"],
+            "errorCases": ["필수 입력값 누락", "허용 범위 위반", "대상 데이터 없음 또는 상태 충돌"],
+            "acceptanceCriteria": [
+                f"유효한 입력으로 {name} 처리가 완료되고 결과를 조회할 수 있다",
+                "잘못된 입력이나 권한 없는 요청은 데이터 변경 없이 명시적 오류로 종료된다",
+            ],
+            "ownership": [], "states": [], "stateTransitions": [],
+            "transactionRules": [f"{name}의 연관 변경은 한 트랜잭션으로 처리하고 실패 시 롤백한다"],
+        }
+
+    @staticmethod
+    def _valid_derived_spec(candidate: dict, originals: list[str]) -> dict | None:
+        if not isinstance(candidate, dict):
+            return None
+        name = repair_feature_name(candidate.get("name"))
+        parent = str(candidate.get("parentFeature") or "").strip()
+        rationale = str(candidate.get("rationale") or "").strip()
+        source = [str(value).strip().lower() for value in candidate.get("source") or [] if str(value).strip()]
+        allowed_sources = {"problem", "persona", "workflow", "data", "permission", "exception"}
+        raw_origin = str(candidate.get("origin") or "").strip()
+        # 발굴 프롬프트는 파생 기능만 요청한다. 모델이 SOURCE 값을 ORIGIN 줄에
+        # 잘못 배치한 경우 허용된 열거값에 한해 출처로 복구한다.
+        if raw_origin.lower() in allowed_sources:
+            source = dedupe_labels([*source, raw_origin.lower()])
+            origin = "DERIVED"
+        else:
+            origin = raw_origin.upper()
+        if (
+            not name or name in originals
+            or origin != "DERIVED"
+            or parent not in set(originals) | {"공통", "ROOT", "root"}
+            or len(rationale) < 12
+            or not set(source) & allowed_sources
+        ):
+            return None
+        priority = str(candidate.get("priority") or "P1").upper()
+        return {
+            "name": name, "parentFeature": parent, "origin": "DERIVED",
+            "source": source, "rationale": rationale,
+            "priority": priority if priority in {"P0", "P1", "P2"} else "P1",
+        }
+
+
+_FEATURE_FIELDS = {
+    "PARENT": "parentFeature", "ORIGIN": "origin", "SOURCE": "source",
+    "RATIONALE": "rationale", "PRIORITY": "priority", "ACTIONS": "actions",
+    "DATA": "dataRequirements", "RULES": "permissionRules", "ERRORS": "errorCases",
+    "ACCEPTANCE": "acceptanceCriteria", "OWNERSHIP": "ownership",
+    "STATES": "states", "TRANSITIONS": "stateTransitions", "TRANSACTIONS": "transactionRules",
+}

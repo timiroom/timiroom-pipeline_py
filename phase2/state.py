@@ -28,6 +28,7 @@ class PipelineState:
 
     # PM 에이전트 결과
     feature_list: list[str] = field(default_factory=list)
+    feature_specs: list[dict[str, Any]] = field(default_factory=list)
     feature_registry: list[dict[str, Any]] = field(default_factory=list)
     project_plan: dict[str, Any] = field(default_factory=dict)
     feature_spec_document: str = ""
@@ -56,6 +57,8 @@ class PipelineState:
     qa_db_warnings: list[str] = field(default_factory=list)
     qa_api_warnings: list[str] = field(default_factory=list)
     qa_prd_warnings: list[str] = field(default_factory=list)
+    qa_issue_details: list[dict[str, Any]] = field(default_factory=list)
+    qa_repair_issues: list[dict[str, Any]] = field(default_factory=list)
     qa_blocker_details: list[dict[str, Any]] = field(default_factory=list)
     # Upstream/LLM 생성 실패를 품질 결함과 분리해 Phase3까지 보존한다.
     generation_blockers: list[str] = field(default_factory=list)

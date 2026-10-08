@@ -3,6 +3,7 @@ import sys
 import uuid
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from common.document_chunk import DocumentChunk
@@ -61,10 +62,10 @@ def test_source_documents_are_included_in_global_search_contract():
     assert "'source'" in _SEARCH_TYPE_SQL
 
 
-def test_content_hash_keeps_document_types_separate_without_pipeline_id():
+def test_source_key_keeps_document_types_separate_without_pipeline_id():
     text = "같은 본문"
-    source_hash = DocumentIngestionService._content_hash(text, {"type": "source"})
-    feature_hash = DocumentIngestionService._content_hash(text, {"type": "features"})
+    source_hash = DocumentIngestionService._source_key(text, {"type": "source"})
+    feature_hash = DocumentIngestionService._source_key(text, {"type": "features"})
 
     assert source_hash != feature_hash
 
@@ -194,22 +195,28 @@ def test_multiquery_exposes_accumulated_rrf_score(monkeypatch):
     result = asyncio.run(service.search_multiple(["one", "two"], top_k=5))
 
     assert result[0].relevance_score == pytest.approx(2 / (RRF_K + 1))
+    assert shared.relevance_score == 999.0
 
 
 def test_reranker_reports_whether_cross_encoder_scores_were_applied():
     candidates = [make_chunk("candidate", 0.2)]
-    service = RerankerService(enabled=True, ko_reranker_model="")
+    # The active runtime uses Cohere HTTP and RerankResult, not the retired local model.
+    async def check():
+        def respond(request):
+            assert request.url.path == "/v2/rerank"
+            return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.9}]})
 
-    unchanged, applied = asyncio.run(service.rerank_with_status("query", candidates))
-    assert unchanged == candidates
-    assert not applied
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond), base_url="https://reranker.test") as client:
+            service = RerankerService(enabled=True, client=client)
+            unchanged = await service.rerank("query", candidates)
+            assert unchanged.chunks == candidates
+            assert not unchanged.applied
+            service._api_key = "test-placeholder"
+            reranked = await service.rerank("query", candidates)
+            assert reranked.applied
+            assert reranked.chunks[0].relevance_score == pytest.approx(0.9)
 
-    service._local_reranker = SimpleNamespace(
-        predict=lambda *_args, **_kwargs: [0.9]
-    )
-    reranked, applied = asyncio.run(service.rerank_with_status("query", candidates))
-    assert applied
-    assert reranked[0].relevance_score == pytest.approx(0.9)
+    asyncio.run(check())
 
 
 def test_recommendation_router_serializes_aliases_for_frontend(monkeypatch):

@@ -270,3 +270,55 @@ def classify_issue(message: str) -> IssueSeverity:
     if any(token in lowered for token in warning_tokens):
         return IssueSeverity.WARNING
     return IssueSeverity.ERROR
+
+
+def normalize_feature_contract(spec: dict, auth_required: bool) -> dict:
+    normalized = dict(spec)
+    raw_ownership = normalized.get("ownership")
+    if isinstance(raw_ownership, dict):
+        scope = str(raw_ownership.get("scope") or "").upper()
+    else:
+        ownership_values = [raw_ownership] if isinstance(raw_ownership, str) else (raw_ownership or [])
+        ownership_text = " ".join(str(value) for value in ownership_values).upper()
+        scope = next((value for value in ("USER", "SHARED", "PUBLIC") if value in ownership_text), "")
+    if feature_requires_user_scope(normalized):
+        scope = "USER"
+    if scope not in {"USER", "SHARED", "PUBLIC", "SYSTEM"}:
+        scope = "USER" if auth_required or feature_requires_user_scope(normalized) else "PUBLIC"
+    normalized["ownership"] = {
+        "scope": scope,
+        "ownerEntity": "users" if scope in {"USER", "SHARED"} else "",
+        "ownerKey": "user_id" if scope in {"USER", "SHARED"} else "",
+        "access": (
+            "인증 주체의 소유권 또는 명시된 역할을 검증"
+            if scope in {"USER", "SHARED"} else "인증 없이 허용된 공개 범위"
+        ),
+    }
+    if isinstance(raw_ownership, dict) and scope in {"USER", "SHARED"}:
+        for key in ("ownerEntity", "ownerKey", "access"):
+            if raw_ownership.get(key):
+                normalized["ownership"][key] = raw_ownership[key]
+    for key in ("states", "stateTransitions", "transactionRules"):
+        values = [
+            str(value).strip() for value in normalized.get(key) or []
+            if str(value).strip() and str(value).strip().upper() != "NONE"
+        ]
+        normalized[key] = list(dict.fromkeys(values))
+    if normalized["states"] and not normalized["stateTransitions"]:
+        normalized["stateTransitions"] = [
+            "현재 상태 → 요청 상태: 기능별 선행 조건과 권한 검증 성공"
+        ]
+    if not normalized["transactionRules"]:
+        normalized["transactionRules"] = [
+            f"{normalized.get('name', '기능')}의 연관 데이터 변경은 한 트랜잭션으로 처리하고 실패 시 롤백한다"
+        ]
+    return normalized
+
+
+def normalize_api_path(path: str) -> str:
+    """Canonical public path shared by registry, generation and repair."""
+    value = "/" + str(path or "").strip().lstrip("/")
+    value = re.sub(r"/{2,}", "/", value)
+    while re.match(r"^/(?:api(?:/v\d+)?|v\d+)(?=/|$)", value, re.I):
+        value = re.sub(r"^/(?:api(?:/v\d+)?|v\d+)(?=/|$)", "", value, count=1, flags=re.I)
+    return ("/api/v1/" + value.lstrip("/")).rstrip("/")

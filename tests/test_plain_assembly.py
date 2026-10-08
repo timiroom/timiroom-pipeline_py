@@ -64,7 +64,7 @@ def test_chat_endpoint_returns_contextual_question_and_complete_platform_enum_ch
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw))])
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
-    monkeypatch.setattr(main, "exaone_client", fake_client)
+    monkeypatch.setattr(main, "openai_client", fake_client)
     response = asyncio.run(message(ChatRequest(messages=[
         ChatMessageDto(role="assistant", content="어떤 서비스를 만들고 싶으신가요?"),
         ChatMessageDto(role="user", content="팀 할 일이 메신저에 흩어지는 문제를 해결하고 싶어요"),

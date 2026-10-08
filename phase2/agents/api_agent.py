@@ -9,7 +9,8 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
-from phase2.agent_contract import feature_methods, requires_auth
+from phase2.agent_contract import feature_methods, feature_relation_kind, normalize_api_path, requires_auth
+from phase2.quality_rules import contamination_reasons, has_placeholder, relevance_score
 from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note, strictly_uncovered_features
 from phase2.feature_scope import backend_features
 from phase2.feature_registry import normalize_feature_registry, registry_text
@@ -146,38 +147,49 @@ def _existing_paths_note(paths: list[str] | None) -> str:
 
 
 def _parse_endpoint_text(raw: str, skeleton: dict) -> dict | None:
-    """Parse the bounded plain-text worker format without changing its identity fields."""
-    labels = {
+    fields = {
         "METHOD": "method", "PATH": "path", "DESCRIPTION": "description",
         "AUTH_REQUIRED": "authRequired", "REQUEST_BODY": "requestBody",
         "SUCCESS_RESPONSE": "successResponse", "ERROR_CODES": "errorCodes",
     }
-    values: dict[str, str] = {}
+    data = {}
     current = None
-    for raw_line in (raw or "").replace("\r", "").splitlines():
-        line = raw_line.strip().strip("`*- ")
-        if not line or line.upper().startswith("SELF_CHECK:"):
+    clean_raw = re.sub(r"^\s*SELF_CHECK\s*:\s*PASS\s*$", "", raw or "", flags=re.I | re.M)
+    for line in clean_raw.replace("\r", "").splitlines():
+        line = line.strip().strip("`*- ")
+        if not line:
             continue
-        match = re.match(r"^([A-Z_]+)\s*:\s*(.*)$", line, re.I)
-        if match and match.group(1).upper() in labels:
-            current = labels[match.group(1).upper()]
-            values[current] = match.group(2).strip()
-        elif current:
-            values[current] = f"{values[current]} {line}".strip()
-    if not values:
+        matched = False
+        upper = line.upper()
+        for marker, field in fields.items():
+            marker_match = upper.startswith(marker + ":")
+            if marker == "REQUEST_BODY":
+                marker_match = marker_match or (":" in line and upper.startswith("REQUEST_BODY"))
+            elif marker == "ERROR_CODES":
+                marker_match = marker_match or (":" in line and upper.startswith("ERROR_C"))
+            if marker_match:
+                data[field] = line.split(":", 1)[1].strip()
+                current = field
+                matched = True
+                break
+        if not matched and current:
+            data[current] = f"{data[current]} {line}".strip()
+    if not data:
         return None
-    result = dict(skeleton)
-    result.update(values)
-    result["method"] = str(skeleton.get("method") or result.get("method") or "GET").upper()
-    result["path"] = str(skeleton.get("path") or result.get("path") or "/api/v1/unknown")
-    result["description"] = str(result.get("description") or skeleton.get("description") or "").strip()
-    if not result["description"]:
+    data["method"] = str(skeleton.get("method") or data.get("method") or "GET").upper()
+    data["path"] = str(skeleton.get("path") or data.get("path") or "/api/v1/unknown")
+    data["description"] = data.get("description") or skeleton.get("description") or ""
+    auth = str(data.get("authRequired", skeleton.get("authRequired", True))).lower()
+    data["authRequired"] = auth in {"true", "1", "yes", "필요"}
+    if not data.get("description"):
         return None
-    result["authRequired"] = str(result.get("authRequired", True)).lower() in {"true", "1", "yes", "필요"}
-    result["requestBody"] = result.get("requestBody") or ("없음" if result["method"] in {"GET", "DELETE"} else "요청 데이터")
-    result["successResponse"] = result.get("successResponse") or "성공 응답"
-    result["errorCodes"] = result.get("errorCodes") or "400 - 잘못된 요청, 500 - 서버 오류"
-    return result
+    data["requestBody"] = data.get("requestBody") or ("없음" if data["method"] == "GET" else "요청 데이터")
+    data["successResponse"] = data.get("successResponse") or "성공 응답"
+    data["errorCodes"] = data.get("errorCodes") or "400 - 잘못된 요청, 500 - 서버 오류"
+    for field in ("featureId", "action", "featureName"):
+        if field in skeleton:
+            data[field] = skeleton[field]
+    return data
 
 
 def _feature_resource_slug(feature: str, index: int) -> str:
@@ -191,23 +203,26 @@ def _feature_methods(feature: str) -> tuple[str, ...]:
 
 def _api_feature_mappings(endpoints: list[dict], db_schema: str, feature_list: list[str]) -> list[dict]:
     db = try_parse_json(db_schema or "{}") or {}
-    table_by_feature = {
-        str(item.get("featureName")): str(item.get("table") or "")
+    db_map = {
+        str(item.get("featureName") or ""): str(item.get("table") or "")
         for item in db.get("featureMappings") or [] if isinstance(item, dict)
     }
     result = []
     for feature in feature_list or []:
-        selected = [ep for ep in endpoints or [] if str(ep.get("featureName") or "") == str(feature)]
-        table = table_by_feature.get(str(feature), "")
-        if not selected and table:
-            prefix = f"/api/v1/{table.replace('_', '-')}"
-            selected = [ep for ep in endpoints or [] if str(ep.get("path") or "").startswith(prefix)]
-        if feature == "사용자별 데이터 접근 제어":
-            selected = [ep for ep in endpoints or [] if ep.get("authRequired") and not str(ep.get("path") or "").startswith("/api/v1/auth/")]
+        if str(feature) == "사용자별 데이터 접근 제어":
+            selected = [ep for ep in endpoints if ep.get("authRequired") and not str(ep.get("path") or "").startswith("/api/v1/auth/")]
+        else:
+            selected = [ep for ep in endpoints if str(ep.get("featureName") or "") == str(feature)]
+            table_name = db_map.get(str(feature), "")
+            if not selected and table_name:
+                prefix = f"/api/v1/{table_name.replace('_', '-')}"
+                selected = [ep for ep in endpoints if str(ep.get("path") or "").startswith(prefix)]
         result.append({
-            "featureName": str(feature),
-            "table": table,
-            "operations": [{"method": str(ep.get("method") or ""), "path": str(ep.get("path") or "")} for ep in selected],
+            "featureName": str(feature), "table": db_map.get(str(feature), ""),
+            "operations": [
+                {"method": str(ep.get("method") or ""), "path": str(ep.get("path") or "")}
+                for ep in selected
+            ],
         })
     return result
 
@@ -225,43 +240,270 @@ def _api_type(db_type: str) -> str:
     return "string"
 
 
-def _align_endpoints_to_db(endpoints: list[dict], db_schema: str, prd_document: str = "", requirement_text: str = "") -> list[dict]:
-    """Make API contracts concrete from the finalized tables without asking the model again."""
+def _align_endpoints_to_db(
+    endpoints: list[dict], db_schema: str, prd_document: str = "", requirement_text: str = "",
+) -> list[dict]:
+    """API manager owns the final contract and derives field names from the finalized ERD."""
     db = try_parse_json(db_schema or "{}") or {}
-    tables = [table for table in db.get("tables") or [] if isinstance(table, dict)]
-    by_name = {str(table.get("name") or ""): table for table in tables}
-    aliases = {
-        "ingredients": "inventory_items", "expiry-notifications": "expiration_notifications",
-        "assignees": "assigned_staff", "users": "tasks",
-    }
+    auth_required_by_prd = requires_auth(prd_document, requirement_text=requirement_text)
+    tables = {str(t.get("name") or ""): t for t in db.get("tables") or [] if isinstance(t, dict)}
     aligned = []
-    for original in endpoints or []:
-        endpoint = dict(original)
-        method = str(endpoint.get("method") or "GET").upper()
-        path = str(endpoint.get("path") or "")
-        resource = path.removeprefix("/api/v1/").split("/")[0].replace("-", "_")
-        table_name = aliases.get(resource, resource)
-        description = str(endpoint.get("description") or "")
-        if resource == "users" and "할 일" not in description:
-            table_name = "users"
-        table = by_name.get(table_name)
-        if table is None:
-            table = next((item for name, item in by_name.items() if name.replace("_", "-") == resource), None)
-            table_name = str(table.get("name")) if table else table_name
-        if table:
-            path = f"/api/v1/{table_name.replace('_', '-')}" + ("/{id}" if "/{id}" in path else "")
-            endpoint["path"] = path
-            columns = [column for column in table.get("columns") or [] if isinstance(column, dict)]
-            writable = [column for column in columns if str(column.get("name")) not in {"id", "created_at", "updated_at"} and not str(column.get("name", "")).endswith("_id")]
-            if method in {"POST", "PUT", "PATCH"}:
-                endpoint["requestBody"] = ", ".join(f"{column.get('name')}: {_api_type(column.get('type'))}" for column in writable) or "payload: object"
-            elif method in {"GET", "DELETE"}:
-                endpoint["requestBody"] = "없음"
-            endpoint["successResponse"] = endpoint.get("successResponse") if "[]" in str(endpoint.get("successResponse") or "") else ("items: array" if method == "GET" and "/{id}" not in path else "id: integer")
-        endpoint["errorCodes"] = "400, 401, 404, 500" if endpoint.get("authRequired") else "400, 404, 500"
-        if method in {"POST", "PUT", "PATCH", "DELETE"}:
-            endpoint["transactionRules"] = "단일 DB 트랜잭션으로 검증과 변경을 처리하고 실패 시 롤백한다."
-        aligned.append(endpoint)
+    seen: set[tuple[str, str]] = set()
+    for endpoint in endpoints or []:
+        ep = dict(endpoint)
+        path = str(ep.get("path") or "")
+        if path.startswith("/api/v1/auth/"):
+            auth_ep = _deterministic_endpoint(ep)
+            if path.endswith("/refresh"):
+                auth_ep["transactionRules"] = "기존 Refresh Token의 해시·만료·회수 상태를 검증한 뒤 새 토큰으로 원자적으로 교체한다."
+            elif path.endswith("/logout"):
+                auth_ep["transactionRules"] = "전달된 Refresh Token 해시의 revoked_at을 기록하고 이후 재사용을 거부한다."
+            key = (auth_ep["method"], auth_ep["path"])
+            if key not in seen:
+                seen.add(key)
+                aligned.append(auth_ep)
+            continue
+        if path == "/api/v1/users/me":
+            own_ep = _deterministic_endpoint(ep)
+            own_ep["authRequired"] = True
+            key = (own_ep["method"], own_ep["path"])
+            if key not in seen:
+                seen.add(key)
+                aligned.append(own_ep)
+            continue
+        slug = path.removeprefix("/api/v1/").split("/", 1)[0]
+        table = tables.get(slug.replace("-", "_"))
+        feature_label = str(ep.get("featureName") or ep.get("description") or "").split(":", 1)[0].strip()
+        if table and (_column_names(table) & {"credential_hash", "password_hash", "login_id"}):
+            if not any(token in feature_label.lower() for token in ("로그인", "회원", "계정", "auth", "user account")):
+                table = None
+        if not table:
+            relation_kind = feature_relation_kind(feature_label)
+            role_candidates = []
+            for candidate in tables.values():
+                candidate_columns = _column_names(candidate)
+                candidate_refs = _referenced_tables(candidate)
+                if candidate_columns & {"credential_hash", "password_hash", "login_id"}:
+                    continue
+                if relation_kind == "association" and len(candidate_refs) < 2:
+                    continue
+                if relation_kind == "event" and not (
+                    candidate_refs and candidate_columns & {"status", "state", "recorded_at", "occurred_at", "event_at"}
+                ):
+                    continue
+                if relation_kind == "aggregate" and len(candidate_refs) >= 2:
+                    continue
+                score = max(
+                    relevance_score(feature_label, f"{candidate.get('name', '')} {candidate.get('description', '')}"),
+                    relevance_score(str(candidate.get("description") or ""), feature_label),
+                )
+                role_candidates.append((score, candidate))
+            role_best = max((score for score, _candidate in role_candidates), default=0.0)
+            role_winners = [candidate for score, candidate in role_candidates if score == role_best and score >= 0.2]
+            if len(role_winners) == 1:
+                table = role_winners[0]
+            feature_matches = [
+                candidate for candidate in tables.values()
+                if feature_label and feature_label in str(candidate.get("description") or "")
+            ]
+            if not table and len(feature_matches) == 1:
+                table = feature_matches[0]
+            slug_stems = _english_resource_stems(slug)
+            lexical = [
+                (len(slug_stems & _english_resource_stems(name)), candidate)
+                for name, candidate in tables.items()
+            ]
+            lexical_best = max((score for score, _candidate in lexical), default=0)
+            lexical_winners = [candidate for score, candidate in lexical if score == lexical_best and score > 0]
+            if not table and len(lexical_winners) == 1:
+                table = lexical_winners[0]
+            # PRD/API/DBA run independently, so two accurate English translations
+            # can still differ (expiry vs expiration). Match through the original
+            # Korean feature text retained in both descriptions, then normalize the
+            # API path to the ERD table identifier.
+            if not table:
+                scored = [
+                    (max(
+                        relevance_score(str(candidate.get("description") or ""), str(ep.get("description") or "")),
+                        relevance_score(str(ep.get("description") or ""), str(candidate.get("description") or "")),
+                    ), candidate)
+                    for candidate in tables.values()
+                ]
+                best_score = max((score for score, _candidate in scored), default=0.0)
+                winners = [candidate for score, candidate in scored if score == best_score and score >= 0.25]
+                if len(winners) == 1:
+                    table = winners[0]
+            if table:
+                normalized_slug = str(table.get("name") or "").replace("_", "-")
+                path = path.replace(f"/api/v1/{slug}", f"/api/v1/{normalized_slug}", 1)
+                ep["path"] = path
+                slug = normalized_slug
+        # A catalog endpoint must not accidentally own user-specific mutable state.
+        # If one unambiguous stateful aggregate references that catalog, make it the API resource.
+        table_columns = _column_names(table) if table else set()
+        is_stateful_resource = bool(table and "user_id" in table_columns and table_columns & _STATE_FIELD_NAMES)
+        if table and not is_stateful_resource and "user_id" not in table_columns:
+            aggregate = _stateful_aggregate_for_catalog(str(table.get("name") or ""), tables)
+            endpoint_meaning = str(ep.get("featureName") or ep.get("description") or "")
+            catalog_score = max(
+                relevance_score(str(table.get("description") or ""), endpoint_meaning),
+                relevance_score(endpoint_meaning, str(table.get("description") or "")),
+            )
+            aggregate_score = max(
+                relevance_score(str(aggregate.get("description") or ""), endpoint_meaning),
+                relevance_score(endpoint_meaning, str(aggregate.get("description") or "")),
+            ) if aggregate else 0.0
+            if aggregate:
+                old_slug = slug
+                table = aggregate
+                slug = str(table["name"]).replace("_", "-")
+                path = path.replace(f"/api/v1/{old_slug}", f"/api/v1/{slug}", 1)
+                ep["path"] = path
+        if not table:
+            fallback_ep = _deterministic_endpoint(ep)
+            if auth_required_by_prd:
+                fallback_ep["authRequired"] = True
+            if str(fallback_ep.get("method") or "").upper() == "GET" and "{" not in str(fallback_ep.get("path") or ""):
+                fallback_ep["successResponse"] = "items: array<object> — 조회 결과가 없으면 [], total: integer — 전체 개수"
+                fallback_ep["errorCodes"] = _error_contract(bool(fallback_ep.get("authRequired")))
+            if str(fallback_ep.get("method") or "").upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+                fallback_ep.setdefault(
+                    "transactionRules",
+                    "대상 존재·권한·업무 상태를 검증하고 변경을 단일 트랜잭션으로 처리하며 실패 시 롤백한다.",
+                )
+            aligned.append(fallback_ep)
+            continue
+        if auth_required_by_prd:
+            ep["authRequired"] = True
+        columns = [c for c in table.get("columns") or [] if isinstance(c, dict) and c.get("name")]
+        business = [c for c in columns if c["name"] not in {"id", "created_at", "updated_at"}]
+        # Actor identity is derived from the configured authentication context,
+        # never invented from a technology suggestion in the PRD.
+        endpoint_feature = str(ep.get("featureName") or ep.get("description") or "").split(":", 1)[0]
+        association_contract = feature_relation_kind(endpoint_feature) == "association"
+        writable = [
+            c for c in business
+            if c["name"] != "user_id" or association_contract
+        ]
+        method = str(ep.get("method") or "GET").upper()
+        if method in {"PATCH", "PUT", "DELETE"} and "{" not in path:
+            path = path.rstrip("/") + "/{id}"
+            ep["path"] = path
+        if method in _BODYLESS_METHODS:
+            ep["requestBody"] = "없음"
+        else:
+            selected = writable
+            ep["requestBody"] = ", ".join(
+                f"{c['name']}: {_api_type(c.get('type'))} — {table['name']} 필드" for c in selected
+            ) or "payload: object — 기능 입력"
+        if method == "GET":
+            is_collection = "{" not in path
+            if is_collection:
+                ep["successResponse"] = f"items: array<{table['name']}> — 조회 결과가 없으면 [], total: integer — 전체 개수"
+            else:
+                ep["successResponse"] = f"item: {table['name']} — 단일 조회 결과"
+        elif method == "DELETE":
+            ep["successResponse"] = "success: boolean — 삭제 성공 여부, deletedId: integer — 삭제된 ID"
+        elif method == "PATCH":
+            ep["successResponse"] = "id: integer — 수정된 ID, updated_at: string — 수정 시각"
+        else:
+            ep["successResponse"] = "id: integer — 생성된 ID, created_at: string — 생성 시각"
+        collection_get = method == "GET" and "{" not in path
+        ep["errorCodes"] = _error_contract(
+            bool(ep.get("authRequired")), target_required="{" in path,
+        )
+        if method == "POST":
+            ep.setdefault(
+                "transactionRules",
+                f"{table['name']} 입력 검증과 생성을 단일 DB 트랜잭션으로 처리하고 실패 시 전체를 롤백한다.",
+            )
+        elif method == "PATCH":
+            ep.setdefault(
+                "transactionRules",
+                f"{table['name']} 대상 존재와 현재 상태를 확인한 뒤 변경을 단일 DB 트랜잭션으로 처리한다.",
+            )
+        elif method == "DELETE":
+            ep.setdefault(
+                "transactionRules",
+                f"{table['name']} 대상 존재와 참조 무결성을 확인한 뒤 삭제를 단일 DB 트랜잭션으로 처리한다.",
+            )
+
+        table_name = str(table.get("name") or "")
+        table_columns_set = _column_names(table)
+        occurrence_fields = {
+            "occurred_at", "recorded_at", "event_at", "completed_at", "processed_at",
+            "started_at", "ended_at", "effective_at",
+        }
+        event_like = bool(_referenced_tables(table)) and (
+            bool(table_columns_set & occurrence_fields)
+            or any(re.search(r"(?:^delta_|_delta$|_change$|_used$|^previous_|^new_)", name)
+                   for name in table_columns_set)
+            or (
+                len(_referenced_tables(table)) >= 2
+                and bool(table_columns_set & {"status", "state"})
+                and any(
+                    _column_names(tables[target]) & {"status", "state"}
+                    for target in _referenced_tables(table) if target in tables
+                )
+            )
+        )
+        if event_like:
+            aggregate_targets = [
+                target for target in _referenced_tables(table)
+                if (target in tables
+                    and (_column_names(tables[target]) & _STATE_FIELD_NAMES))
+            ]
+            # An event can reference both a root aggregate and a stateful child
+            # assignment. Prefer the ancestor referenced by another candidate.
+            if len(aggregate_targets) > 1:
+                root_targets = [
+                    candidate for candidate in aggregate_targets
+                    if any(
+                        candidate in _referenced_tables(tables[other])
+                        for other in aggregate_targets
+                        if other != candidate
+                    )
+                ]
+                if len(root_targets) == 1:
+                    aggregate_targets = root_targets
+            if len(aggregate_targets) == 1 and method in {"POST", "PATCH", "DELETE"}:
+                aggregate_name = aggregate_targets[0]
+                if method == "POST":
+                    rule = f"{table_name} 생성과 {aggregate_name} 상태 반영을 단일 DB 트랜잭션으로 처리하고 허용되지 않은 상태는 409로 거부한다."
+                elif method == "PATCH":
+                    rule = f"기존 기록의 {aggregate_name} 반영분을 먼저 되돌린 뒤 변경값을 다시 반영하며 전체를 단일 트랜잭션으로 처리한다."
+                else:
+                    rule = f"삭제 전 기록이 반영한 {aggregate_name} 상태를 역보정한 뒤 기록을 삭제하며 전체를 단일 트랜잭션으로 처리한다."
+                ep["transactionRules"] = rule
+                ep["errorCodes"] = ep["errorCodes"].replace("500 —", "409 — 상태 또는 선행 업무 충돌, 500 —")
+        unique_indexes = [str(index) for index in table.get("indexes") or [] if re.search(r"CREATE\s+UNIQUE\s+INDEX", str(index), re.I)]
+        stateful_targets = [
+            target for target in _referenced_tables(table)
+            if target in tables and (_column_names(tables[target]) & _STATE_FIELD_NAMES)
+        ]
+        if method in {"POST", "PATCH", "DELETE"} and (unique_indexes or stateful_targets):
+            rules = []
+            if unique_indexes:
+                rules.append("동일한 주체와 대상의 중복 요청을 UNIQUE 제약으로 차단하고 충돌 시 409를 반환한다")
+            if stateful_targets:
+                rules.append(f"참조 엔티티 {stateful_targets[0]}의 존재와 현재 상태를 확인한 뒤 단일 트랜잭션으로 처리한다")
+            existing_rule = str(ep.get("transactionRules") or "").strip()
+            existing_sentences = {
+                sentence.strip().rstrip(".") for sentence in re.split(r"[.;]", existing_rule) if sentence.strip()
+            }
+            new_rules = [rule.rstrip(".") for rule in rules if rule.rstrip(".") not in existing_sentences]
+            supplemental = "; ".join(new_rules)
+            existing_part = f"{existing_rule.rstrip('.')}." if existing_rule else ""
+            ep["transactionRules"] = " ".join(
+                part for part in (existing_part, f"{supplemental}." if supplemental else "") if part
+            ).strip()
+            if "409" not in ep["errorCodes"]:
+                ep["errorCodes"] = ep["errorCodes"].replace("500 —", "409 — 업무 상태 또는 중복 충돌, 500 —")
+        _normalize_parameters(ep)
+        key = (method, str(ep.get("path") or ""))
+        if key not in seen:
+            seen.add(key)
+            aligned.append(ep)
     return aligned
 
 
@@ -269,39 +511,222 @@ def _ensure_auth_endpoints(endpoints: list[dict], auth_required: bool) -> list[d
     if not auth_required:
         return endpoints
     required = [
-        ("POST", "/api/v1/auth/signup", "회원 가입 및 로그인"),
-        ("POST", "/api/v1/auth/login", "회원 가입 및 로그인"),
-        ("POST", "/api/v1/auth/refresh", "인증 세션 관리"),
-        ("POST", "/api/v1/auth/logout", "인증 세션 관리"),
-        ("GET", "/api/v1/users/me", "내 정보 및 계정 관리"),
-        ("PATCH", "/api/v1/users/me", "내 정보 및 계정 관리"),
-        ("DELETE", "/api/v1/users/me", "내 정보 및 계정 관리"),
+        {
+            "method": "POST", "path": "/api/v1/auth/signup", "featureName": "회원 가입 및 로그인",
+            "description": "회원 가입 및 로그인: 신규 계정 생성", "authRequired": False,
+            "requestBody": "email: string — 로그인 식별자, password: string — 평문 전송 후 서버에서 해시",
+            "successResponse": "id: integer — 사용자 ID, status: string — 계정 상태, created_at: string — 가입 시각",
+            "errorCodes": "400 — 입력 검증 실패, 409 — 로그인 식별자 중복, 500 — 서버 오류",
+            "transactionRules": "사용자와 자격 증명을 한 DB 트랜잭션으로 생성하고 실패 시 전체를 롤백한다.",
+        },
+        {
+            "method": "POST", "path": "/api/v1/auth/login", "featureName": "회원 가입 및 로그인",
+            "description": "회원 가입 및 로그인: 자격 증명 검증 및 토큰 발급", "authRequired": False,
+            "requestBody": "email: string — 로그인 식별자, password: string — 자격 증명",
+            "successResponse": "accessToken: string — 접근 토큰, refreshToken: string — 갱신 토큰, expiresIn: integer — 만료 초",
+            "errorCodes": "400 — 입력 검증 실패, 401 — 자격 증명 불일치, 403 — 비활성 계정, 500 — 서버 오류",
+            "transactionRules": "자격 증명 검증 후 Refresh Token 해시 저장과 토큰 발급을 일관되게 처리한다.",
+        },
+        {
+            "method": "POST", "path": "/api/v1/auth/refresh", "featureName": "인증 세션 관리",
+            "description": "인증 세션 관리: 접근 토큰 갱신", "authRequired": False,
+            "requestBody": "refreshToken: string — 기존 갱신 토큰",
+            "successResponse": "accessToken: string — 새 접근 토큰, refreshToken: string — 교체된 갱신 토큰, expiresIn: integer — 만료 초",
+            "errorCodes": "400 — 입력 검증 실패, 401 — 만료·회수·재사용 토큰, 500 — 서버 오류",
+            "transactionRules": "기존 Refresh Token을 회수하고 새 토큰 해시를 한 트랜잭션으로 저장한다.",
+        },
+        {
+            "method": "POST", "path": "/api/v1/auth/logout", "featureName": "인증 세션 관리",
+            "description": "인증 세션 관리: 현재 갱신 토큰 회수", "authRequired": True,
+            "requestBody": "refreshToken: string — 회수할 갱신 토큰",
+            "successResponse": "success: boolean — 로그아웃 성공 여부",
+            "errorCodes": "400 — 입력 검증 실패, 401 — 인증 실패, 403 — 세션 소유자 불일치, 500 — 서버 오류",
+            "transactionRules": "토큰 해시의 revoked_at을 원자적으로 기록하고 이후 재사용을 거부한다.",
+        },
+        {
+            "method": "GET", "path": "/api/v1/users/me", "featureName": "내 정보 및 계정 관리",
+            "description": "내 정보 및 계정 관리: 인증된 본인 정보 조회", "authRequired": True,
+            "requestBody": "없음", "successResponse": "item: users — 인증된 사용자 정보",
+            "errorCodes": "401 — 인증 실패, 404 — 사용자 없음, 500 — 서버 오류",
+        },
+        {
+            "method": "PATCH", "path": "/api/v1/users/me", "featureName": "내 정보 및 계정 관리",
+            "description": "내 정보 및 계정 관리: 본인 정보 수정", "authRequired": True,
+            "requestBody": "email: string — 변경할 로그인 식별자", "successResponse": "id: integer — 사용자 ID, updated_at: string — 수정 시각",
+            "errorCodes": "400 — 입력 검증 실패, 401 — 인증 실패, 409 — 로그인 식별자 중복, 500 — 서버 오류",
+            "transactionRules": "인증 주체와 대상 사용자가 같은지 확인한 뒤 한 트랜잭션으로 수정한다.",
+        },
+        {
+            "method": "DELETE", "path": "/api/v1/users/me", "featureName": "내 정보 및 계정 관리",
+            "description": "내 정보 및 계정 관리: 회원 탈퇴와 세션 회수", "authRequired": True,
+            "requestBody": "없음", "successResponse": "success: boolean — 탈퇴 완료 여부, deletedId: integer — 사용자 ID",
+            "errorCodes": "401 — 인증 실패, 409 — 이미 탈퇴한 계정, 500 — 서버 오류",
+            "transactionRules": "계정 상태를 WITHDRAWN으로 전환하고 모든 활성 세션을 같은 트랜잭션에서 회수한다.",
+        },
     ]
-    existing = {(str(ep.get("method") or "").upper(), str(ep.get("path") or "")) for ep in endpoints or []}
-    result = [ep for ep in endpoints or [] if str(ep.get("path") or "") not in {"/api/v1/users/profile", "/api/v1/users/register"}]
-    for method, path, feature in required:
-        if (method, path) not in existing:
-            result.append({"method": method, "path": path, "featureName": feature, "description": f"{feature}: 계약 처리", "authRequired": not path.endswith(("signup", "login", "refresh")), "requestBody": "없음" if method in {"GET", "DELETE"} else "payload: object", "successResponse": "id: integer", "errorCodes": "400, 401, 404, 500"})
+    canonical = {(ep["method"], ep["path"]): ep for ep in required}
+    identity_features = {
+        "회원 가입 및 로그인", "인증 세션 관리", "내 정보 및 계정 관리", "사용자별 데이터 접근 제어",
+    }
+    noncanonical_identity_slugs = (
+        "/user-authentication", "/authentication-sessions", "/user-management",
+        "/user-data-access-control", "/user-profiles",
+    )
+    result = []
+    seen = set()
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        key = (str(endpoint.get("method") or "").upper(), str(endpoint.get("path") or ""))
+        if key not in canonical and (
+            str(endpoint.get("featureName") or "") in identity_features
+            or any(slug in key[1] for slug in noncanonical_identity_slugs)
+            or bool(re.match(r"^/api/v\d+/auth/", key[1]))
+            or bool(re.match(r"^/api/v1/users/(?:register|login|logout|refresh-token)$", key[1]))
+            or key[1] in {"/api/v1/users/me", "/api/v1/users/profile"}
+        ):
+            continue
+        result.append({**endpoint, **canonical.get(key, {})})
+        seen.add(key)
+    result.extend(ep for key, ep in canonical.items() if key not in seen)
     return result
 
 
 def _ensure_feature_endpoint_groups(
     endpoints: list[dict], db_schema: str, feature_list: list[str], prd_document: str = "",
+    requirement_text: str = "",
 ) -> list[dict]:
-    result = _align_endpoints_to_db(list(endpoints or []), db_schema, prd_document)
+    """Add only missing minimal endpoint groups from the finalized ERD.
+
+    Parallel API generation can omit an entire feature batch. A selective repair
+    cannot align endpoints that do not exist, so reconstruct GET/POST/PATCH
+    skeletons for the uniquely matching ERD resource and let the normal contract
+    aligner fill concrete fields. No domain-specific table name is assumed.
+    """
+    db = try_parse_json(db_schema or "{}") or {}
+    prd = try_parse_json(prd_document or "{}") or {}
+    feature_specs = {
+        str(item.get("name") or ""): item
+        for item in (prd.get("coreFeatures") or [])
+        if isinstance(item, dict) and item.get("name")
+    } if isinstance(prd, dict) else {}
+    tables = [table for table in db.get("tables") or [] if isinstance(table, dict) and table.get("name")]
+    mapped_tables = {
+        str(item.get("featureName") or ""): str(item.get("table") or "")
+        for item in db.get("featureMappings") or [] if isinstance(item, dict) and item.get("table")
+    }
+    result = [dict(endpoint) for endpoint in (endpoints or []) if isinstance(endpoint, dict)]
     for feature in feature_list or []:
-        related = [ep for ep in result if str(ep.get("featureName") or "") == str(feature)]
-        table = str(feature).lower().replace(" ", "-")
-        if not related:
-            path = f"/api/v1/{table}"
-            for method in _feature_methods(str(feature)):
-                result.append(_align_endpoints_to_db([{
-                    "method": method,
-                    "path": path if method in {"GET", "POST"} else f"{path}/{{id}}",
-                    "featureName": feature,
-                    "description": f"{feature}: 계약 처리",
-                    "authRequired": requires_auth(prd_document, [str(feature)]),
-                }], db_schema, prd_document)[0])
+        if str(feature) in {
+            "회원 가입 및 로그인", "인증 세션 관리", "내 정보 및 계정 관리", "사용자별 데이터 접근 제어",
+        }:
+            continue
+        spec = feature_specs.get(str(feature), {})
+        feature_context = " ".join([
+            str(feature), str(spec.get("parentFeature") or ""),
+            str(spec.get("rationale") or ""),
+            " ".join(str(value) for value in spec.get("actions") or []),
+            " ".join(str(value) for value in spec.get("dataRequirements") or []),
+        ])
+        identity_scope = any(token in feature_context.lower() for token in (
+            "회원", "계정", "로그인", "인증", "사용자 관리",
+            "member", "account", "login", "authentication", "user management",
+        ))
+        kind = feature_relation_kind(str(feature))
+        explicitly_mapped = next(
+            (table for table in tables if str(table.get("name") or "") == mapped_tables.get(str(feature))),
+            None,
+        )
+        scored = []
+        for table in tables:
+            table_name = str(table.get("name") or "")
+            singular_name = table_name.rstrip("s")
+            if not identity_scope and singular_name in {"user", "member", "account", "customer", "principal"}:
+                continue
+            table_text = f"{table.get('name', '')} {table.get('description', '')}"
+            referenced_tables = _referenced_tables(table)
+            column_names = _column_names(table)
+            score = max(
+                relevance_score(feature_context, table_text),
+                relevance_score(table_text, feature_context),
+            )
+            if str(feature) and str(feature) in str(table.get("description") or ""):
+                score = max(score, 1.0)
+            if kind == "association":
+                # Association resources are identified primarily by topology, not
+                # by a scenario-specific English table name. Naming is only a
+                # tie-breaker when the ERD contains multiple two-sided resources.
+                if len(referenced_tables) >= 2:
+                    score += 1.0
+                if any(token in table_name for token in (
+                    "assign", "member", "link", "mapping", "join", "relation",
+                )):
+                    score += 0.75
+                if any(token in table_name for token in ("record", "history", "log", "event")):
+                    score -= 0.5
+            if kind == "event" and any(
+                token in table_name for token in ("record", "history", "log", "event")
+            ):
+                score += 1.0
+            if kind == "event" and referenced_tables and column_names & {
+                "status", "state", "recorded_at", "occurred_at", "event_at",
+            }:
+                score += 0.5
+            scored.append((score, table))
+        best = max((score for score, _table in scored), default=0.0)
+        winners = [explicitly_mapped] if explicitly_mapped else [table for score, table in scored if score == best and score >= 0.25]
+        if len(winners) != 1:
+            continue
+        table = winners[0]
+        slug = str(table["name"]).replace("_", "-")
+        collection_path = f"/api/v1/{slug}"
+        normalized_feature = " ".join(str(feature).lower().split())
+        related = []
+        for endpoint in result:
+            endpoint_path = str(endpoint.get("path") or "")
+            explicit_feature = " ".join(
+                str(endpoint.get("featureName") or "").lower().split()
+            )
+            if (
+                explicit_feature == normalized_feature
+                or (not explicit_feature and endpoint_path.startswith(collection_path))
+            ):
+                related.append(endpoint)
+        existing_methods = {str(endpoint.get("method") or "").upper() for endpoint in related}
+        for method in _feature_methods(str(feature)):
+            if method in existing_methods:
+                matching = [
+                    endpoint for endpoint in related
+                    if str(endpoint.get("method") or "").upper() == method
+                ]
+                if method in {"GET", "POST"}:
+                    preferred = [
+                        endpoint for endpoint in matching
+                        if str(endpoint.get("path") or "").rstrip("/") == collection_path
+                    ]
+                else:
+                    preferred = [
+                        endpoint for endpoint in matching
+                        if str(endpoint.get("path") or "").startswith(collection_path + "/")
+                        and "{" in str(endpoint.get("path") or "")
+                    ]
+                owner = preferred[0] if len(preferred) == 1 else (
+                    matching[0] if len(matching) == 1 else None
+                )
+                if owner is not None and not str(owner.get("featureName") or "").strip():
+                    owner["featureName"] = str(feature)
+                    if str(feature) not in str(owner.get("description") or ""):
+                        owner["description"] = f"{feature}: {owner.get('description', '')}".strip()
+                continue
+            path = collection_path if method in {"GET", "POST"} else f"{collection_path}/{{id}}"
+            result.append(_deterministic_endpoint({
+                "method": method,
+                "path": path,
+                "description": f"{feature}: {'목록 조회' if method == 'GET' else '생성 또는 실행' if method == 'POST' else '부분 수정'}",
+                "featureName": str(feature),
+                "authRequired": requires_auth(prd_document, [str(feature)], requirement_text),
+            }))
+            logger.warning("API 누락 기능 계약 결정적 보강 — %s %s (%s)", method, path, feature)
     return result
 
 ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
@@ -386,6 +811,63 @@ PRD 자체에 문제가 없으면 prdIssues는 빈 문자열로 두세요.
 """
 
 
+def finalize_api_contracts(
+    endpoints: list[dict], db_schema: str, prd_document: str = "",
+    feature_list: list[str] | None = None, registry: list[dict] | None = None,
+    requirement_text: str = "",
+) -> list[dict]:
+    """Align completed drafts to the ERD while retaining explicit registry routes.
+
+    DBA and API workers can finish concurrently. This deterministic pass is also
+    called after their results are joined, when the final schema is available.
+    """
+    registry = registry or []
+    prepared = _normalize_endpoints([dict(endpoint) for endpoint in endpoints if isinstance(endpoint, dict)])
+    if registry:
+        prepared = _annotate_feature_ids(_ensure_contract_endpoints(prepared, registry), registry)
+    schema = try_parse_json(db_schema or "{}")
+    if not isinstance(schema, dict) or not schema.get("tables"):
+        return prepared
+    table_names = {str(table.get("name") or "") for table in schema["tables"] if isinstance(table, dict)}
+    by_id = {str(item.get("featureId") or item.get("id") or ""): item for item in registry}
+    aligned = []
+    for endpoint in prepared:
+        original_path = _output_api_path(endpoint.get("path"))
+        original_method = str(endpoint.get("method") or "GET").upper()
+        spec = by_id.get(str(endpoint.get("featureId") or ""), {})
+        explicit_route = any(
+            str(contract.get("method") or "GET").upper() == original_method
+            and _route_shape(contract.get("path")) == _route_shape(original_path)
+            for contract in spec.get("apiContract") or [] if isinstance(contract, dict)
+        )
+        declared = (spec.get("dbContract") or {}).get("tables", [])
+        declared_names = [
+            str(table.get("name") or table.get("table") or "") if isinstance(table, dict) else str(table)
+            for table in declared
+        ]
+        candidates = [name for name in declared_names if name in table_names]
+        draft = dict(endpoint)
+        if spec.get("name"):
+            draft["featureName"] = spec["name"]
+        # Route vocabulary and physical table names may legitimately differ.
+        # Use an unambiguous declared table for fields, then restore the route.
+        if explicit_route and len(candidates) == 1 and not (
+            original_path.startswith("/api/v1/auth/") or original_path == "/api/v1/users/me"
+        ):
+            resource, _, suffix = original_path.removeprefix("/api/v1/").partition("/")
+            draft["path"] = f"/api/v1/{candidates[0].replace('_', '-')}" + (f"/{suffix}" if suffix else "")
+        contracts = _align_endpoints_to_db([draft], db_schema, prd_document, requirement_text)
+        for contract in contracts:
+            if explicit_route:
+                contract["path"] = original_path
+                contract["method"] = original_method
+            for key in ("featureId", "action"):
+                if key in endpoint:
+                    contract[key] = endpoint[key]
+            aligned.append(contract)
+    return _normalize_endpoints(aligned)
+
+
 class _ApiGraphState(TypedDict):
     plan: list
     authentication: str
@@ -446,6 +928,7 @@ class ApiAgent:
                 "feature_list": scoped_features,
                 "feature_registry": registry_text(registry),
                 "prd_document": state.prd_document or "{}",
+                "db_schema": state.db_schema or "{}",
                 "max_endpoints": _endpoint_soft_cap(len(scoped_features), include_auth=True),
                 "dump": dump,
             },
@@ -486,11 +969,15 @@ class ApiAgent:
         # 단일 기준이 되도록 보정하고, 계약 밖 orphan endpoint는 남기지 않는다.
         parsed_spec = try_parse_json(api_spec)
         if isinstance(parsed_spec, dict) and isinstance(parsed_spec.get("endpoints"), list):
-            endpoints = _normalize_endpoints(parsed_spec["endpoints"])
+            endpoints = finalize_api_contracts(
+                parsed_spec["endpoints"], state.db_schema, state.prd_document,
+                scoped_features, registry, state.user_query or state.context_prompt,
+            )
             endpoints = _ensure_contract_endpoints(endpoints, registry)
             endpoints = _annotate_feature_ids(endpoints, registry)
             endpoints = [ep for ep in endpoints if isinstance(ep, dict) and str(ep.get("featureId") or "").strip()]
             parsed_spec["endpoints"] = _normalize_endpoints(endpoints)
+            parsed_spec["featureMappings"] = _api_feature_mappings(endpoints, state.db_schema, scoped_features)
             api_spec = json.dumps(parsed_spec, ensure_ascii=False)
 
         logger.info("API 에이전트 완료")
@@ -809,6 +1296,10 @@ class ApiAgent:
             ),
             registry_items,
         )
+        endpoints = finalize_api_contracts(
+            endpoints, ctx.get("db_schema", "{}"), ctx.get("prd_document", ""),
+            ctx.get("feature_list", []), registry_items, ctx.get("context", ""),
+        )
         return {
             "api_spec": json.dumps(
                 {"endpoints": endpoints, "authentication": authentication},
@@ -816,85 +1307,6 @@ class ApiAgent:
             ),
             "prd_issues": "",
         }
-
-        missing = uncovered_features(ctx["feature_list"], [ep.get("description", "") for ep in endpoints if isinstance(ep, dict)])
-        if missing:
-            logger.warning("API manager_review — 커버리지 부족 감지: %s", missing)
-
-        prompt = MANAGER_REVIEW_PROMPT.format(
-            endpoints_json=json.dumps(endpoints, ensure_ascii=False),
-            feature_str=ctx["feature_str"],
-            context=ctx["context"],
-            missing_note=missing_features_note(missing, "API 스펙"),
-            feature_registry=ctx.get("feature_registry", "[]"),
-        )
-
-        try:
-            review = None
-            for parse_attempt in range(2):
-                raw = await self._call(prompt, max_tokens=16384, system=MANAGER_SYSTEM)
-                if dump:
-                    dump.log_raw("API_MANAGER_REVIEW", parse_attempt + 1, raw)
-                review = try_parse_json(raw)
-                if review and isinstance(review, dict):
-                    break
-                logger.warning("API manager 리뷰 파싱 실패 (시도 %d) — 재시도", parse_attempt + 1)
-            if review is None or not isinstance(review, dict):
-                logger.warning("API manager 리뷰 파싱 최종 실패 — 원본 엔드포인트 유지")
-            else:
-                prd_issues = str(review.get("prdIssues", "") or "").strip()
-                patches = review.get("patches")
-                if isinstance(patches, dict) and patches:
-                    valid_patches = {k: v for k, v in patches.items() if isinstance(v, dict)}
-                    dropped = set(patches) - set(valid_patches)
-                    if dropped:
-                        logger.warning("API manager 리뷰 — 패치 값이 dict가 아니어서 무시: %s", list(dropped))
-                    if valid_patches:
-                        logger.info("API manager 리뷰 — %d개 엔드포인트 패치: %s", len(valid_patches), list(valid_patches.keys()))
-                        by_key = {
-                            (str(ep.get("method", "GET")).upper(), _canonical_api_path(ep.get("path"))): ep
-                            for ep in endpoints if isinstance(ep, dict)
-                        }
-                        for patch_key, patch in valid_patches.items():
-                            method, _, raw_path = str(patch_key).partition(" ")
-                            method = str(patch.get("method") or method or "GET").upper()
-                            path = _output_api_path(patch.get("path") or raw_path)
-                            key = (method, _canonical_api_path(path))
-                            existing = by_key.get(key, {})
-                            by_key[key] = {**existing, **patch, "method": method, "path": path}
-                        endpoints = list(by_key.values())
-                else:
-                    logger.info("API manager 리뷰 — 패치 없음, 원본 유지")
-        except Exception as e:
-            logger.warning("API manager 리뷰 실패 — 원본 엔드포인트 유지: %s", e)
-
-        bad_paths = _invalid_paths(endpoints)
-        if bad_paths:
-            logger.warning("API manager_review — 패치로 유입된 잘못된 경로 살균: %s", bad_paths)
-            endpoints = _sanitize_plan_paths(endpoints)
-
-        # 패치로 유입된 불완전 엔드포인트(method/path만 있는 경우 등)에 필수 필드 기본값 보강
-        endpoints = _annotate_feature_ids(endpoints, _registry_items(ctx.get("feature_registry", "[]")))
-        endpoints = _normalize_endpoints(endpoints)
-        endpoints = _prune_plan(
-            endpoints,
-            ctx["feature_list"],
-            int(ctx.get("max_endpoints") or _endpoint_soft_cap(len(ctx["feature_list"]), include_auth=True)),
-        )
-        # Registry 계약 endpoint는 soft cap 이후에도 보존한다. cap은 파생 endpoint를
-        # 줄이기 위한 것이며 PM이 명시한 최소 계약을 삭제하는 용도가 아니다.
-        endpoints = _ensure_contract_endpoints(
-            endpoints, _registry_items(ctx.get("feature_registry", "[]"))
-        )
-        # 계약 endpoint를 cap/patch 뒤에 다시 매핑한다. 새로 주입된 endpoint와
-        # manager patch가 featureId를 잃어 QA에서 추적 불가능해지는 것을 방지한다.
-        endpoints = _annotate_feature_ids(
-            endpoints, _registry_items(ctx.get("feature_registry", "[]"))
-        )
-        endpoints = _normalize_endpoints(endpoints)
-
-        api_spec = json.dumps({"endpoints": endpoints, "authentication": authentication}, ensure_ascii=False)
-        return {"api_spec": api_spec, "prd_issues": prd_issues}
 
     async def _call(self, user_prompt: str, max_tokens: int, system: str, temperature: float = _TEMPERATURE) -> str:
         for attempt in range(1):
@@ -989,25 +1401,21 @@ def _invalid_paths(plan: list) -> list[str]:
     bad = []
     for ep in plan:
         path = ep.get("path") if isinstance(ep, dict) else None
-        if not isinstance(path, str) or not path or not _VALID_PATH_RE.match(path):
+        if (
+            not isinstance(path, str) or not path or not _VALID_PATH_RE.match(path)
+            or not path.startswith("/api/v1/")
+        ):
             bad.append(path)
     return bad
 
 
 def _canonical_api_path(path: str) -> str:
-    """Registry 계약(/tools)과 실제 API 경로(/api/v1/tools)를 같은 키로 비교한다."""
-    value = "/" + str(path or "").strip().lstrip("/")
-    value = re.sub(r"^/api/v1", "", value, flags=re.IGNORECASE) or "/"
-    return value.rstrip("/") or "/"
+    """Compare registry and public paths using the same canonical resource key."""
+    return _output_api_path(path).removeprefix("/api/v1") or "/"
 
 
 def _output_api_path(path: str) -> str:
-    """Return the single public path form used by generated API specs."""
-    value = "/" + str(path or "").strip().lstrip("/")
-    value = re.sub(r"^/api/v1/api(?:/|$)", "/api/v1/", value, flags=re.IGNORECASE)
-    if not re.match(r"^/api/v1(?:/|$)", value, flags=re.IGNORECASE):
-        value = "/api/v1/" + value.lstrip("/")
-    return re.sub(r"/{2,}", "/", value).rstrip("/") or "/api/v1"
+    return normalize_api_path(path)
 
 
 def _route_shape(path: str) -> str:
@@ -1073,8 +1481,11 @@ def _annotate_feature_ids(plan: list, registry: list[dict] | None) -> list:
 def _registry_items(raw: str | list[dict] | None) -> list[dict]:
     if isinstance(raw, list):
         return [item for item in raw if isinstance(item, dict)]
-    parsed = try_parse_json(raw or "[]")
-    return parsed if isinstance(parsed, list) else []
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        parsed = try_parse_json(raw or "[]")
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
 
 
 def _registry_fallback_plan(registry: list[dict] | None) -> list[dict]:
@@ -1156,10 +1567,7 @@ def _sanitize_plan_paths(plan: list) -> list:
     for i, ep in enumerate(plan):
         if not isinstance(ep, dict):
             continue
-        path = str(ep.get("path") or "").strip()
-        path = re.sub(r"^/api/v1/api(?:/|$)", "/api/v1/", path, flags=re.I)
-        if re.match(r"^/api/(?!v1/)", path, flags=re.I):
-            path = "/api/v1/" + path[5:]
+        path = _output_api_path(ep.get("path"))
         if not path.lower().startswith("/api/v1/") or not _VALID_PATH_RE.match(path):
             rest = path[len("/api/v1/"):] if path.lower().startswith("/api/v1/") else path.lstrip("/")
             slug = _PATH_STRIP_RE.sub("-", rest)
@@ -1328,6 +1736,10 @@ def _normalize_endpoints(endpoints: list) -> list:
             continue
         ep.setdefault("method", "GET")
         ep.setdefault("path", "/api/v1/unknown")
+        ep["path"] = _output_api_path(ep["path"])
+        ep["method"] = str(ep["method"]).upper()
+        if ep["method"] == "PUT" and "{" in ep["path"]:
+            ep["method"] = "PATCH"
         ep.setdefault("authRequired", True)
         if not str(ep.get("description") or "").strip():
             ep["description"] = f"{ep.get('method')} {ep.get('path')}"
@@ -1434,3 +1846,140 @@ def _dedupe_semantic_endpoints(endpoints: list[dict]) -> list[dict]:
             seen_semantic.add(semantic)
         out.append(ep)
     return out
+
+
+def _error_contract(auth_required: bool, target_required: bool = False) -> str:
+    errors = ["400 — 요청 값 검증 실패"]
+    if auth_required:
+        errors.append("401 — 인증 실패")
+    if target_required:
+        errors.append("404 — 대상 없음")
+    errors.append("500 — 서버 내부 오류")
+    return ", ".join(errors)
+
+
+def _endpoint_quality_issues(data: dict | None, raw: str, skeleton: dict, require_self_check: bool = True) -> list[str]:
+    if not isinstance(data, dict):
+        return ["필수 라벨 파싱 실패"]
+    issues = [reason for reason in contamination_reasons(data) if reason != "mixed-language splice"]
+    if has_placeholder(data):
+        issues.append("placeholder 계약 값 포함")
+    if str(data.get("method") or "").upper() != str(skeleton.get("method") or "").upper():
+        issues.append("담당 method 변경")
+    if str(data.get("path") or "") != str(skeleton.get("path") or ""):
+        issues.append("담당 path 변경")
+    feature = str(skeleton.get("featureName") or "")
+    if feature and relevance_score(feature, str(data.get("description") or "")) < 0.2:
+        issues.append("담당 기능과 description 불일치")
+    method = str(data.get("method") or "GET").upper()
+    body = str(data.get("requestBody") or "")
+    if method in _BODYLESS_METHODS and body != "없음":
+        issues.append("본문 없는 method에 requestBody 존재")
+    if method in {"POST", "PUT", "PATCH"} and ":" not in body:
+        issues.append("requestBody에 필드명: 타입 계약 없음")
+    if ":" not in str(data.get("successResponse") or ""):
+        issues.append("successResponse에 필드명: 타입 계약 없음")
+    if len(set(_ERROR_CODE_RE.findall(str(data.get("errorCodes") or "")))) < 2:
+        issues.append("표준 4xx/5xx 오류 코드가 2개 미만")
+    return list(dict.fromkeys(issues))
+
+
+def _deterministic_endpoint(skeleton: dict) -> dict:
+    method = str(skeleton.get("method") or "GET").upper()
+    path = str(skeleton.get("path") or "/api/v1/unknown")
+    auth = bool(skeleton.get("authRequired", True))
+    if path == "/api/v1/auth/signup":
+        body, success = "email: string — 이메일, password: string — 비밀번호", "id: integer — 사용자 ID, email: string — 이메일"
+    elif path == "/api/v1/auth/login":
+        body, success = "loginId: string — 로그인 식별자, credential: string — 인증 자격 증명", "accessToken: string — 서버가 발급한 접근 토큰"
+    elif path == "/api/v1/auth/refresh":
+        body, success = "refreshToken: string — 갱신 토큰", "accessToken: string — 새 접근 토큰"
+    elif path == "/api/v1/auth/logout":
+        body, success = "refreshToken: string — 폐기할 갱신 토큰", "success: boolean — 로그아웃 성공 여부"
+    elif method in _BODYLESS_METHODS:
+        body, success = "없음", "items: array — 조회 결과, total: integer — 전체 개수"
+    else:
+        body, success = "payload: object — 기능별 입력 필드", "id: integer — 처리 대상 ID, success: boolean — 처리 성공 여부"
+    result = {
+        "method": method, "path": path, "description": str(skeleton.get("description") or f"{method} {path}"),
+        "featureName": str(skeleton.get("featureName") or ""),
+        "authRequired": auth, "requestBody": body, "successResponse": success,
+        "errorCodes": _error_contract(auth, "{" in path),
+    }
+    for field in ("featureId", "action"):
+        if field in skeleton:
+            result[field] = skeleton[field]
+    # Deterministic canonical contracts (auth/me and already ERD-aligned repairs)
+    # must survive normalization instead of falling back to payload: object.
+    for field in ("requestBody", "successResponse", "errorCodes", "transactionRules"):
+        if str(skeleton.get(field) or "").strip():
+            result[field] = skeleton[field]
+    if "{id}" in path:
+        result["parameters"] = [{"in": "path", "name": "id", "type": "integer", "required": True, "description": "대상 ID"}]
+    elif method == "GET":
+        result["parameters"] = [
+            {"in": "query", "name": "page", "type": "integer", "required": False, "description": "페이지 번호"},
+            {"in": "query", "name": "size", "type": "integer", "required": False, "description": "페이지 크기"},
+        ]
+    return result
+
+
+def _column_names(table: dict) -> set[str]:
+    return {str(column.get("name")) for column in table.get("columns") or [] if isinstance(column, dict)}
+
+
+def _referenced_tables(table: dict) -> set[str]:
+    targets = set()
+    for column in table.get("columns") or []:
+        if not isinstance(column, dict):
+            continue
+        match = re.search(r"REFERENCES\s+([a-z][a-z0-9_]*)", str(column.get("constraints") or ""), re.I)
+        if match:
+            targets.add(match.group(1).lower())
+    return targets
+
+
+def _english_resource_stems(value: str) -> set[str]:
+    stems = set()
+    for token in re.findall(r"[a-z]+", str(value or "").lower().replace("-", "_")):
+        for suffix in ("ments", "ment", "ees", "ee", "ed", "ing", "ies", "s"):
+            if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                token = token[:-len(suffix)]
+                break
+        stems.add(token)
+    return stems
+
+
+def _stateful_aggregate_for_catalog(catalog: str, tables: dict[str, dict]) -> dict | None:
+    candidates = []
+    for table in tables.values():
+        table_name = str(table.get("name") or "")
+        if any(token in table_name for token in (
+            "reservation", "booking", "rental", "loan", "order", "application",
+            "request", "ticket", "record", "history", "log", "transaction",
+        )):
+            continue
+        columns = _column_names(table)
+        if "user_id" in columns and columns & _STATE_FIELD_NAMES and catalog in _referenced_tables(table):
+            candidates.append(table)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        ownership_fields = {
+            "quantity", "amount", "balance", "unit", "expiry_date", "stock", "remaining_count", "position", "progress",
+        }
+        scores = {str(table.get("name")): len(_column_names(table) & ownership_fields) for table in candidates}
+        best = max(scores.values(), default=0)
+        winners = [table for table in candidates if scores[str(table.get("name"))] == best]
+        if best and len(winners) == 1:
+            return winners[0]
+    return None
+
+
+_ERROR_CODE_RE = re.compile(r"\b[45]\d{2}\b")
+
+
+_STATE_FIELD_NAMES = {
+    "quantity", "amount", "balance", "status", "state", "unit", "expiry_date",
+    "expires_at", "scheduled_at", "position", "progress", "stock", "remaining_count",
+}
