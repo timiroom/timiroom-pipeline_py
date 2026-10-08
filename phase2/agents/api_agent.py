@@ -59,6 +59,7 @@ TARGETED_REPAIR_PROMPT = """현재 API 명세에서 검증 피드백이 지적�
 patches에는 수정된 엔드포인트 전체 객체를 넣고 method와 path를 식별자로 사용하세요.
 피드백에 [STRUCTURED_REPAIR_TARGETS]가 있으면 artifactKey와 featureId가 일치하는 항목만 패치하세요.
 각 patch는 기존 endpoint의 featureId와 action을 반드시 보존하거나 명시하세요.
+쓰기 작업의 transactionRules는 원자적 변경 범위와 실패 시 롤백 규칙을 보존하거나 보완하세요.
 새 엔드포인트가 정말 필요한 경우에만 추가하세요.
 JSON만 출력하세요.
 
@@ -763,6 +764,7 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
 - 경로에 {{id}} 같은 자리표시자가 있으면 parameters에 in="path"로 반드시 포함
 - successResponse는 DB 스키마의 실제 컬럼명과 어긋나지 않게 작성
 - errorCodes는 "코드 — 설명" 형식으로 2개 이상 작성
+- transactionRules에는 쓰기 작업의 원자적 변경 범위와 실패 시 롤백 규칙을 명시한다.
 - 위 지시문의 예시 문구("없으면 없음", "필드명" 등)를 값에 그대로 옮겨 쓰지 말 것 — 실제 내용만
 
 응답 형식 (JSON만, method/path/description/authRequired는 위 값 그대로 유지):
@@ -778,7 +780,8 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
   ],
   "requestBody": "본문이 없으면 없음",
   "successResponse": "반환 필드들",
-  "errorCodes": "401 — 인증 실패, 404 — 리소스 없음"
+  "errorCodes": "401 — 인증 실패, 404 — 리소스 없음",
+  "transactionRules": "이 작업의 원자적 변경 범위와 실패 처리"
 }}
 
 컨텍스트 (DB 스키마 포함):
@@ -1052,6 +1055,8 @@ class ApiAgent:
                     continue
                 patch["method"] = method
                 key = (method, path)
+                if key in by_key and not str(patch.get("transactionRules") or "").strip():
+                    patch.pop("transactionRules", None)
                 by_key[key] = {**by_key[key], **patch} if key in by_key else patch
                 applied += 1
 
@@ -1062,8 +1067,16 @@ class ApiAgent:
                 state.feature_registry, state.feature_list, preserve_extra=True,
             )
             endpoints = _normalize_endpoints(list(by_key.values()))
+            scoped_features = backend_features([item["name"] for item in registry] or state.feature_list)
+            endpoints = finalize_api_contracts(
+                endpoints, state.db_schema, state.prd_document, scoped_features, registry,
+                state.user_query or state.context_prompt,
+            )
             endpoints = _annotate_feature_ids(endpoints, registry)
-            repaired = {**current, "endpoints": _normalize_endpoints(endpoints)}
+            repaired = {
+                **current, "endpoints": _normalize_endpoints(endpoints),
+                "featureMappings": _api_feature_mappings(endpoints, state.db_schema, scoped_features),
+            }
             logger.info("API targeted repair — %d개 endpoint만 패치", applied)
             return state.copy(
                 api_spec=json.dumps(repaired, ensure_ascii=False),
@@ -1930,6 +1943,16 @@ def _deterministic_endpoint(skeleton: dict) -> dict:
     for field in ("requestBody", "successResponse", "errorCodes", "transactionRules"):
         if str(skeleton.get(field) or "").strip():
             result[field] = skeleton[field]
+    if not result.get("transactionRules"):
+        known_transactions = {
+            ("POST", "/api/v1/auth/signup"): "사용자와 자격 증명을 한 DB 트랜잭션으로 생성하고 실패 시 전체를 롤백한다.",
+            ("POST", "/api/v1/auth/login"): "자격 증명을 검증한 뒤 인증 상태 변경과 토큰 발급을 일관되게 처리하고 실패 시 변경을 롤백한다.",
+            ("PATCH", "/api/v1/users/me"): "인증 주체와 대상 사용자가 같은지 확인한 뒤 한 트랜잭션으로 수정한다.",
+            ("PUT", "/api/v1/users/me"): "인증 주체와 대상 사용자가 같은지 확인한 뒤 한 트랜잭션으로 수정한다.",
+            ("DELETE", "/api/v1/users/me"): "계정 삭제와 관련 인증 상태 정리를 원자적으로 처리하고 실패 시 롤백한다.",
+        }
+        if (method, path) in known_transactions:
+            result["transactionRules"] = known_transactions[(method, path)]
     if "{id}" in path:
         result["parameters"] = [{"in": "path", "name": "id", "type": "integer", "required": True, "description": "대상 ID"}]
     elif method == "GET":
