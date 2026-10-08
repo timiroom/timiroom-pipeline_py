@@ -315,6 +315,26 @@ def normalize_feature_contract(spec: dict, auth_required: bool) -> dict:
     return normalized
 
 
+_PRE_AUTH_ROUTE = re.compile(
+    r"^/api/v1/auth/(?:signup|register|registrations|login|refresh|token/refresh|password-reset[a-z-]*)(?:/|$)"
+)
+
+
+def is_pre_auth_route(path: Any) -> bool:
+    """Identity routes a caller must reach before holding a session."""
+    return bool(_PRE_AUTH_ROUTE.match(normalize_api_path(str(path or ""))))
+
+
+def canonical_api_method(method: Any, path: Any) -> str:
+    """Canonical HTTP method shared by registry contracts and the generated API spec.
+
+    Updates addressed through a path variable are published as PATCH, so a registry
+    contract declared as PUT must be compared in the same form.
+    """
+    value = str(method or "GET").strip().upper()
+    return "PATCH" if value == "PUT" and "{" in str(path or "") else value
+
+
 def normalize_api_path(path: str) -> str:
     """Canonical public path shared by registry, generation and repair."""
     value = "/" + str(path or "").strip().lstrip("/")

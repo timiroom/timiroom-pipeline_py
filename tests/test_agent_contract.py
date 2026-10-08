@@ -428,3 +428,216 @@ def test_phase3_blocks_error_and_blocker_qa_issues():
     result = service.validate(blocker_state)
     assert not result.validated
     assert "QA BLOCKER" in result.last_validation_error
+
+
+def _contract_tables(*names: str) -> list[dict]:
+    tables = [{
+        "name": name, "description": "",
+        "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}], "indexes": [],
+    } for name in names]
+    users = next(table for table in tables if table["name"] == "users")
+    users["columns"] += [
+        {"name": "email", "type": "VARCHAR(320)", "constraints": "NOT_NULL UNIQUE"},
+        {"name": "password_hash", "type": "VARCHAR(255)", "constraints": "NOT_NULL"},
+    ]
+    return tables
+
+
+def _mapped_table(mappings: list[dict], feature_id: str) -> str:
+    return next(item for item in mappings if item["featureId"] == feature_id)["table"]
+
+
+def test_feature_mapping_selects_the_resource_table_not_the_first_declared_owner():
+    # 운영 재현: dbContract.tables가 소유자·상위 테이블까지 모두 나열하면 스키마 순서상 첫 테이블(users)이
+    # 모든 기능의 대표 테이블이 되어 QA가 /tasks 요청 필드를 users 컬럼과 대조했다.
+    ownership = {"scope": "USER", "ownerEntity": "users", "ownerKey": "user_id"}
+    tables = _contract_tables(
+        "users", "teams", "team_members", "tasks", "task_assignees", "task_status_histories",
+    )
+    specs = [{
+        "name": "할 일 등록", "featureId": "feature_001", "ownership": ownership,
+        "apiContract": [{"method": "POST", "path": "/api/v1/tasks"}],
+        "dbContract": {"tables": ["users", "teams", "team_members", "tasks"], "foreignKeys": [
+            {"table": "tasks", "column": "created_by_user_id", "references": {"table": "users", "column": "id"}},
+            {"table": "tasks", "column": "team_id", "references": {"table": "teams", "column": "id"}},
+        ]},
+    }, {
+        "name": "담당자 배정", "featureId": "feature_002", "ownership": ownership,
+        "apiContract": [{"method": "PUT", "path": "/api/v1/tasks/{taskid}/assignees"}],
+        "dbContract": {"tables": ["users", "teams", "team_members", "tasks", "task_assignees"], "foreignKeys": []},
+    }, {
+        "name": "완료 상태 기록", "featureId": "feature_003", "ownership": ownership,
+        "apiContract": [{"method": "PATCH", "path": "/api/v1/tasks/{taskid}/status"}],
+        "dbContract": {"tables": ["users", "teams", "tasks", "task_status_histories"], "foreignKeys": []},
+    }, {
+        "name": "소규모 팀 멤버 관리", "featureId": "feature_002.team_members", "ownership": ownership,
+        "apiContract": [
+            {"method": "GET", "path": "/api/v1/teams/{teamid}/members"},
+            {"method": "POST", "path": "/api/v1/teams/{teamid}/members"},
+        ],
+        "dbContract": {"tables": ["users", "teams", "team_members"], "foreignKeys": []},
+    }, {
+        "name": "회원가입", "featureId": "auth.signup", "ownership": ownership,
+        "apiContract": [{"method": "POST", "path": "/api/v1/auth/signup"}],
+        "dbContract": {"tables": ["users"], "foreignKeys": []},
+    }]
+
+    mappings = build_feature_mappings(tables, specs)
+
+    assert _mapped_table(mappings, "feature_001") == "tasks"
+    assert _mapped_table(mappings, "feature_002") == "task_assignees"
+    assert _mapped_table(mappings, "feature_003") == "tasks"
+    assert _mapped_table(mappings, "feature_002.team_members") == "team_members"
+    assert _mapped_table(mappings, "auth.signup") == "users"
+    # 대표 테이블에 추가되는 소유자 FK는 QA의 FK 인덱스 규칙도 함께 만족해야 한다.
+    tasks = next(table for table in tables if table["name"] == "tasks")
+    assert any(column["name"] == "user_id" for column in tasks["columns"])
+    assert any("tasks(user_id)" in index.replace(" ", "") for index in tasks["indexes"])
+
+
+def test_feature_mapping_without_path_match_uses_the_dependent_contract_table():
+    ownership = {"scope": "USER", "ownerEntity": "users", "ownerKey": "user_id"}
+    tables = _contract_tables("users", "calendars", "user_calendar_preferences")
+    specs = [{
+        "name": "기본 캘린더 설정", "featureId": "profile.preferences", "ownership": ownership,
+        "apiContract": [{"method": "PATCH", "path": "/api/v1/profile"}],
+        "dbContract": {"tables": ["users", "calendars", "user_calendar_preferences"], "foreignKeys": [
+            {"table": "user_calendar_preferences", "column": "user_id", "references": {"table": "users", "column": "id"}},
+            {"table": "user_calendar_preferences", "column": "calendar_id", "references": {"table": "calendars", "column": "id"}},
+        ]},
+    }, {
+        "name": "회원정보 수정", "featureId": "profile.manage", "ownership": ownership,
+        "apiContract": [{"method": "PATCH", "path": "/api/v1/profile"}],
+        "dbContract": {"tables": ["users", "user_sessions_missing"], "foreignKeys": []},
+    }]
+
+    mappings = build_feature_mappings(tables, specs)
+
+    assert _mapped_table(mappings, "profile.preferences") == "user_calendar_preferences"
+    assert _mapped_table(mappings, "profile.manage") == "users"
+
+
+def test_registry_contract_and_api_output_use_the_same_update_method():
+    # 운영 재현: API 출력은 경로 변수가 있는 PUT을 PATCH로 바꾸는데 Registry 계약은 PUT으로 남아
+    # "apiContract PUT ... 누락"이 재생성으로도 해소되지 않았다.
+    from phase2.agents.api_agent import _normalize_endpoints
+    from phase2.feature_registry import (
+        missing_api_contract_features,
+        normalize_feature_registry,
+    )
+
+    registry = normalize_feature_registry([{
+        "id": "feature_002", "name": "담당자 배정",
+        "apiContract": [
+            {"method": "PUT", "path": "/tasks/{taskid}/assignees", "action": "assign"},
+            {"method": "PUT", "path": "/api/v1/settings", "action": "replace"},
+        ],
+    }], ["담당자 배정"])
+    contracts = [(item["method"], item["path"]) for item in registry[0]["apiContract"]]
+    endpoints = _normalize_endpoints([
+        {"method": "PUT", "path": "/api/v1/tasks/{taskid}/assignees", "description": "담당자 배정: 지정"},
+        {"method": "PUT", "path": "/api/v1/settings", "description": "설정 교체"},
+    ])
+
+    assert contracts == [("PATCH", "/api/v1/tasks/{taskid}/assignees"), ("PUT", "/api/v1/settings")]
+    assert [(item["method"], item["path"]) for item in endpoints] == contracts
+    assert missing_api_contract_features(registry, endpoints) == []
+
+
+def test_api_request_fields_follow_the_same_feature_table_as_qa():
+    # 운영 재현: 계약에 테이블이 여러 개면 API는 경로 첫 구간(tasks)의 컬럼으로 본문을 채우고
+    # QA는 기능 매핑(task_assignees)과 대조해 같은 엔드포인트를 서로 다른 테이블로 판정했다.
+    from phase2.agents.api_agent import finalize_api_contracts
+    from phase2.agents.qa_agent import _endpoint_table, _request_field_names
+
+    ownership = {"scope": "USER", "ownerEntity": "users", "ownerKey": "user_id"}
+    tables = _contract_tables("users", "tasks", "task_assignees")
+    next(table for table in tables if table["name"] == "tasks")["columns"] += [
+        {"name": "title", "type": "VARCHAR(200)", "constraints": "NOT_NULL"},
+    ]
+    next(table for table in tables if table["name"] == "task_assignees")["columns"] += [
+        {"name": "task_id", "type": "BIGINT", "constraints": "NOT_NULL FOREIGN_KEY REFERENCES tasks(id)"},
+        {"name": "assigned_at", "type": "TIMESTAMPTZ", "constraints": "NOT_NULL DEFAULT_NOW"},
+    ]
+    registry = [{
+        "name": "담당자 배정", "featureId": "feature_002", "id": "feature_002", "ownership": ownership,
+        "apiContract": [{"method": "PUT", "path": "/api/v1/tasks/{taskid}/assignees", "featureId": "feature_002"}],
+        "dbContract": {"tables": ["users", "tasks", "task_assignees"], "foreignKeys": []},
+    }]
+    mappings = build_feature_mappings(tables, registry)
+    schema = json.dumps({"tables": tables, "featureMappings": mappings}, ensure_ascii=False)
+
+    endpoints = finalize_api_contracts([{
+        "method": "PUT", "path": "/api/v1/tasks/{taskid}/assignees", "featureId": "feature_002",
+        "description": "담당자 배정: 지정", "requestBody": "title: string",
+    }], schema, registry=registry)
+
+    endpoint = next(item for item in endpoints if item["path"] == "/api/v1/tasks/{taskid}/assignees")
+    table_name, table = _endpoint_table(endpoint, {item["name"]: item for item in tables}, mappings)
+    assert table_name == "task_assignees"
+    fields = _request_field_names(endpoint["requestBody"])
+    assert "title" not in fields
+    assert fields <= {column["name"] for column in table["columns"]}
+    assert endpoint["method"] == "PATCH"
+
+
+def test_pre_authentication_routes_are_not_required_to_be_authenticated():
+    # 운영 재현: 회원가입(/auth/register)과 비밀번호 재설정은 로그인 전에 호출되는데
+    # 사용자 소유 기능이라는 이유로 authRequired를 요구해 재생성으로 해소할 수 없었다.
+    from phase3.schema_validator import SchemaValidator
+
+    ownership = {"scope": "USER", "ownerEntity": "users", "ownerKey": "user_id"}
+    public = [
+        ("POST", "/api/v1/auth/register"), ("POST", "/api/v1/auth/password-reset-requests"),
+        ("POST", "/api/v1/auth/password-resets"),
+    ]
+    protected = [("POST", "/api/v1/auth/logout"), ("PATCH", "/api/v1/profile")]
+    specs = [{
+        "name": "계정", "featureId": "auth.account", "ownership": ownership,
+        "transactionRules": ["한 트랜잭션으로 처리한다"],
+        "apiContract": [{"method": method, "path": path} for method, path in public + protected],
+    }]
+    endpoints = [{
+        "method": method, "path": path, "authRequired": False, "requestBody": "email: string",
+        "successResponse": "success: boolean", "errorCodes": "400 — 입력 오류",
+        "transactionRules": "한 트랜잭션으로 처리한다.",
+    } for method, path in public + protected]
+    db = json.dumps({"tables": _contract_tables("users"), "featureMappings": [
+        {"featureName": "계정", "featureId": "auth.account", "table": "users"},
+    ]}, ensure_ascii=False)
+    api = json.dumps({"endpoints": endpoints, "featureMappings": [{
+        "featureName": "계정", "operations": [{"method": method, "path": path} for method, path in public + protected],
+    }]}, ensure_ascii=False)
+
+    errors = SchemaValidator()._check_feature_contracts(specs, db, api)
+
+    auth_errors = sorted(error for error in errors if "인증 누락" in error)
+    assert auth_errors == [
+        "API 사용자 소유 기능 인증 누락: PATCH /api/v1/profile",
+        "API 사용자 소유 기능 인증 누락: POST /api/v1/auth/logout",
+    ]
+
+
+def test_contract_name_normalization_never_creates_duplicate_table_names():
+    # 운영 재현: 계약 이름(password_reset_tokens)이 이미 스키마에 있는데 끝 단어만 같은 다른 테이블을
+    # 같은 이름으로 바꿔 "중복 테이블명" 차단이 발생했다.
+    from phase2.agents.dba_agent import normalize_table_contract_names
+
+    registry = [{"featureId": "auth.password_reset", "dbContract": {"tables": ["users", "password_reset_tokens"]}}]
+    tables = [
+        {"name": name, "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}], "indexes": []}
+        for name in ("users", "password_reset_tokens", "email_verification_tokens", "invitation_tokens")
+    ]
+    renamed, _ = normalize_table_contract_names(tables, [], registry)
+    assert [table["name"] for table in renamed] == [
+        "users", "password_reset_tokens", "email_verification_tokens", "invitation_tokens",
+    ]
+
+    missing = [
+        {"name": name, "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}], "indexes": []}
+        for name in ("users", "reset_tokens", "invitation_tokens")
+    ]
+    renamed, _ = normalize_table_contract_names(missing, [], registry)
+    names = [table["name"] for table in renamed]
+    assert len(names) == len(set(names))
+    assert names.count("password_reset_tokens") == 1

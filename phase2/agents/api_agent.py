@@ -9,7 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
-from phase2.agent_contract import feature_methods, feature_relation_kind, normalize_api_path, requires_auth
+from phase2.agent_contract import canonical_api_method, feature_methods, feature_relation_kind, normalize_api_path, requires_auth
 from phase2.quality_rules import contamination_reasons, has_placeholder, relevance_score
 from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note, strictly_uncovered_features
 from phase2.feature_scope import backend_features
@@ -846,13 +846,18 @@ def finalize_api_contracts(
         return prepared
     table_names = {str(table.get("name") or "") for table in schema["tables"] if isinstance(table, dict)}
     by_id = {str(item.get("featureId") or item.get("id") or ""): item for item in registry}
+    # QA validates each endpoint against its feature's mapped table, so fields must come from the same table.
+    mapped_tables = {
+        str(item.get("featureId") or ""): str(item.get("table") or "")
+        for item in schema.get("featureMappings") or [] if isinstance(item, dict) and item.get("featureId")
+    }
     aligned = []
     for endpoint in prepared:
         original_path = _output_api_path(endpoint.get("path"))
-        original_method = str(endpoint.get("method") or "GET").upper()
+        original_method = canonical_api_method(endpoint.get("method"), original_path)
         spec = by_id.get(str(endpoint.get("featureId") or ""), {})
         explicit_route = any(
-            str(contract.get("method") or "GET").upper() == original_method
+            canonical_api_method(contract.get("method"), contract.get("path")) == original_method
             and _route_shape(contract.get("path")) == _route_shape(original_path)
             for contract in spec.get("apiContract") or [] if isinstance(contract, dict)
         )
@@ -867,14 +872,20 @@ def finalize_api_contracts(
             draft["featureName"] = spec["name"]
         # Route vocabulary and physical table names may legitimately differ.
         # Use an unambiguous declared table for fields, then restore the route.
-        if explicit_route and len(candidates) == 1 and not (
-            original_path.startswith("/api/v1/auth/") or original_path == "/api/v1/users/me"
-        ):
+        identity_route = original_path.startswith("/api/v1/auth/") or original_path == "/api/v1/users/me"
+        feature_table = mapped_tables.get(str(endpoint.get("featureId") or ""), "")
+        if feature_table in table_names and not identity_route:
+            declared_table = feature_table
+        elif explicit_route and len(candidates) == 1:
+            declared_table = candidates[0]
+        else:
+            declared_table = None
+        if explicit_route and declared_table and not identity_route:
             resource, _, suffix = original_path.removeprefix("/api/v1/").partition("/")
-            draft["path"] = f"/api/v1/{candidates[0].replace('_', '-')}" + (f"/{suffix}" if suffix else "")
+            draft["path"] = f"/api/v1/{declared_table.replace('_', '-')}" + (f"/{suffix}" if suffix else "")
         contracts = _align_endpoints_to_db(
             [draft], db_schema, prd_document, requirement_text,
-            declared_table_name=candidates[0] if explicit_route and len(candidates) == 1 else None,
+            declared_table_name=declared_table,
         )
         for contract in contracts:
             if explicit_route:
@@ -1766,9 +1777,7 @@ def _normalize_endpoints(endpoints: list) -> list:
         ep.setdefault("method", "GET")
         ep.setdefault("path", "/api/v1/unknown")
         ep["path"] = _output_api_path(ep["path"])
-        ep["method"] = str(ep["method"]).upper()
-        if ep["method"] == "PUT" and "{" in ep["path"]:
-            ep["method"] = "PATCH"
+        ep["method"] = canonical_api_method(ep["method"], ep["path"])
         ep.setdefault("authRequired", True)
         if not str(ep.get("description") or "").strip():
             ep["description"] = f"{ep.get('method')} {ep.get('path')}"

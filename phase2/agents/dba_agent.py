@@ -211,6 +211,7 @@ def normalize_table_contract_names(
     if not canonical:
         return tables, relationships or []
     canonical_set = set(canonical)
+    existing = {str(table.get("name") or "").strip() for table in tables if isinstance(table, dict)}
     aliases: dict[str, str] = {}
     for table in tables:
         if not isinstance(table, dict):
@@ -222,7 +223,8 @@ def normalize_table_contract_names(
         if len(candidates) != 1:
             tail = actual.split("_")[-1]
             candidates = [name for name in canonical if name.split("_")[-1] == tail]
-        if len(candidates) == 1:
+        # 계약 이름이 이미 스키마에 있거나 다른 테이블이 먼저 차지했다면 별칭이 아니라 별개 테이블이다.
+        if len(candidates) == 1 and candidates[0] not in existing and candidates[0] not in aliases.values():
             aliases[actual] = candidates[0]
 
     if not aliases:
@@ -920,6 +922,48 @@ def _ensure_auth_contract_tables(tables: list[dict]) -> list[dict]:
     return tables
 
 
+def _primary_contract_table(spec: dict, tables: list[dict], declared: list[str]) -> dict | None:
+    """Pick the table a feature's API operates on from every table its DB contract lists.
+
+    A contract lists owners and parents (users, teams) next to the resource itself, so
+    taking the first table in schema order maps unrelated features to the same owner table.
+    """
+    by_name = {str(item.get("name") or ""): item for item in tables if isinstance(item, dict)}
+    candidates = [name for name in dict.fromkeys(declared) if name in by_name]
+    if len(candidates) <= 1:
+        return by_name[candidates[0]] if candidates else None
+
+    # 1) The most specific resource segment of the API path, mutating operations first.
+    operations = sorted(
+        (item for item in spec.get("apiContract") or [] if isinstance(item, dict)),
+        key=lambda item: str(item.get("method") or "GET").upper() in {"GET", "DELETE"},
+    )
+    for operation in operations:
+        path = normalize_api_path(str(operation.get("path") or "")).removeprefix("/api/v1/")
+        segments = [part.replace("-", "_") for part in path.split("/") if part and not part.startswith("{")]
+        for segment in reversed(segments):
+            matched = [name for name in candidates if name == segment or name.endswith(f"_{segment}")]
+            if len(matched) == 1:
+                return by_name[matched[0]]
+
+    # 2) The dependent table of the contract: it references the others and nothing references it.
+    foreign_keys = [
+        item for item in (spec.get("dbContract") or {}).get("foreignKeys") or [] if isinstance(item, dict)
+    ]
+    sources = {str(item.get("table") or "") for item in foreign_keys}
+    targets = {
+        str((item.get("references") or {}).get("table") or "")
+        for item in foreign_keys if isinstance(item.get("references"), dict)
+    }
+    dependents = [name for name in candidates if name in sources and name not in targets]
+    if len(dependents) == 1:
+        return by_name[dependents[0]]
+
+    # 3) Keep schema order, but never prefer the identity principal over a business table.
+    ordered = [item for item in tables if isinstance(item, dict) and item.get("name") in candidates]
+    return next((item for item in ordered if not _is_principal_table(item)), ordered[0])
+
+
 def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None) -> list[dict]:
     """Resolve each normalized PM feature to one physical table deterministically."""
     mappings: list[dict] = []
@@ -933,7 +977,7 @@ def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None)
             table = next((item for item in tables if item.get("name") == "refresh_tokens"), None)
         elif (declared := (spec.get("dbContract") or {}).get("tables")):
             names = [str(item.get("name") or item.get("table") or "") if isinstance(item, dict) else str(item) for item in declared]
-            table = next((item for item in tables if item.get("name") in names), None)
+            table = _primary_contract_table(spec, tables, names)
         else:
             eligible = [item for item in tables if not _is_principal_table(item) and item.get("name") != "refresh_tokens"]
             exact = [item for item in eligible if name in str(item.get("description") or "")]
@@ -962,6 +1006,7 @@ def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None)
             owner_entity = str(ownership.get("ownerEntity") or "users")
             if any(item.get("name") == owner_entity for item in tables):
                 _ensure_reference_column(table, owner_entity)
+                _ensure_index(table, (f"{_singular_table_name(owner_entity)}_id",))
         mappings.append({
             "featureName": name,
             "featureId": str(spec.get("featureId") or spec.get("id") or ""),

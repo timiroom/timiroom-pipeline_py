@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from phase2.agent_contract import normalize_api_path
+from phase2.agent_contract import canonical_api_method, normalize_api_path
 
 
 _ACTION_TERMS = (
@@ -42,10 +42,10 @@ def _normalize_api_contracts(value: Any, feature_id: str) -> list[dict[str, Any]
     for raw in value:
         if not isinstance(raw, dict):
             continue
-        method = str(raw.get("method") or "GET").strip().upper()
         path = normalize_api_path(raw.get("path"))
         if not path or path == "/api/v1":
             continue
+        method = canonical_api_method(raw.get("method"), path)
         key = (method, path)
         if key in seen:
             continue
