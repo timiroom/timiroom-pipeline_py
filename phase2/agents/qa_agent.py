@@ -49,7 +49,18 @@ def _request_field_names(value) -> set[str]:
         )
     }
 
-def _endpoint_table(endpoint: dict, tables: dict[str, dict]) -> tuple[str, dict] | tuple[None, None]:
+def _endpoint_table(endpoint: dict, tables: dict[str, dict], mappings: list | None = None) -> tuple[str, dict] | tuple[None, None]:
+    feature_id = str(endpoint.get("featureId") or "")
+    feature_name = str(endpoint.get("featureName") or "")
+    declared = {
+        str(item.get("table") or "") for item in mappings or [] if isinstance(item, dict)
+        and ((feature_id and item.get("featureId") == feature_id)
+             or (not feature_id and feature_name and item.get("featureName") == feature_name))
+    }
+    if len(declared) == 1:
+        name = next(iter(declared))
+        if name in tables:
+            return name, tables[name]
     path = str(endpoint.get("path") or "")
     slug = path.removeprefix("/api/v1/").split("/", 1)[0].replace("-", "_")
     if slug in tables:
@@ -1213,7 +1224,8 @@ class QaAgent:
                 if "[]" not in str(endpoint.get("successResponse") or ""):
                     api_issues.append(f"목록 API의 빈 배열 계약 누락: {path}")
             slug = path.removeprefix("/api/v1/").split("/", 1)[0].replace("-", "_")
-            mapped_name, mapped_table = _endpoint_table(endpoint, tables)
+            mapped_name, mapped_table = _endpoint_table(endpoint, tables, db.get("featureMappings"))
+            slug = mapped_name or slug
             if method not in {"GET", "DELETE"}:
                 request_body = endpoint.get("requestBody")
                 request_text = json.dumps(request_body, ensure_ascii=False) if isinstance(request_body, dict) else str(request_body or "")
