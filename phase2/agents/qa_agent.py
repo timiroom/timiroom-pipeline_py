@@ -897,8 +897,11 @@ class QaAgent:
                             stem.endswith("_" + table_name)
                             or stem.endswith("_" + table_tail)
                             or stem in table_variants
-                            # replaced_by_auth_session_id -> auth_sessions (singular alias of the full name)
-                            or any(stem.endswith("_" + variant) for variant in _table_name_variants(table_name))
+                            # replaced_by_auth_session_id -> auth_sessions, replaced_by_token_id -> refresh_tokens
+                            or any(
+                                stem.endswith("_" + variant)
+                                for variant in _table_name_variants(table_name) | table_variants
+                            )
                         ):
                             candidates.add(table_name)
                     if not candidates & table_names:

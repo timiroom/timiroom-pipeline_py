@@ -743,6 +743,12 @@ def test_self_reference_with_a_singular_table_name_resolves_its_target():
             {"name": "approved_by_manager_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
         ]},
     ]}
+    # 운영 실패 원문: refresh_tokens.replaced_by_token_id (토큰 회전 자기참조)
+    db["tables"].append({"name": "refresh_tokens", "columns": [
+        {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+        {"name": "user_id", "type": "BIGINT", "constraints": "NOT_NULL FOREIGN_KEY REFERENCES users(id)"},
+        {"name": "replaced_by_token_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
+    ]})
     db_issues, _api_issues, _prd_issues = QaAgent._check_cross_artifacts(db, {"endpoints": []}, {})
     fk_issues = [issue for issue in db_issues if "FK 참조 대상" in issue]
     assert fk_issues == ["auth_sessions.approved_by_manager_id의 FK 참조 대상을 찾을 수 없습니다"]
