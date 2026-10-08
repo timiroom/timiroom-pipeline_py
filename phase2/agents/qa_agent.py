@@ -1132,10 +1132,14 @@ class QaAgent:
             "occurred_at", "recorded_at", "event_at", "completed_at", "processed_at",
             "started_at", "ended_at", "effective_at",
         }
+        # A table with its own lifecycle state that other tables reference is the parent
+        # entity (tasks.completed_at), not a history log of another aggregate.
+        referenced_tables = {target for targets in refs.values() for target in targets}
         event_tables = {
             name for name, names in columns.items()
             if refs.get(name) and bool(names & occurrence_fields)
             and not any(token in name for token in ("assignment", "membership", "link", "mapping"))
+            and not (names & {"status", "state"} and name in referenced_tables)
         }
         aggregates = {
             name for name, names in columns.items()

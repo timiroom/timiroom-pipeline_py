@@ -641,3 +641,60 @@ def test_contract_name_normalization_never_creates_duplicate_table_names():
     names = [table["name"] for table in renamed]
     assert len(names) == len(set(names))
     assert names.count("password_reset_tokens") == 1
+
+
+def test_prd_core_features_follow_required_features_confirmed_after_prd():
+    # 운영 재현: Feature Spec이 PRD 작성 뒤에 P0 기능을 확정하면 "PRD coreFeatures에 featureId/name 누락"이
+    # 발생했고, 이를 LLM 보정에 맡기자 기존 기능의 이름이 featureId 조각(manage)으로 바뀌었다.
+    from phase2.agents.prd_agent import sync_core_features_with_registry
+
+    original = {
+        "featureId": "feature_001", "name": "할 일 등록", "priority": "P0",
+        "description": "사용자가 새 할 일을 입력하면 시스템이 저장한다.", "requirements": ["제목은 필수다."],
+    }
+    state = PipelineState(
+        feature_list=["할 일 등록"],
+        prd_document=json.dumps({"coreFeatures": [original], "goals": ["목표"]}, ensure_ascii=False),
+        feature_registry=[
+            {"featureId": "feature_001", "name": "할 일 등록", "priority": "P0", "source": "prd_core"},
+            {"featureId": "profile.manage", "name": "회원정보 수정", "priority": "P0", "source": "prd_core",
+             "apiContract": [{"method": "PATCH", "path": "/api/v1/profile"}]},
+            {"featureId": "feature_001.validation", "name": "입력 검증", "priority": "P1", "source": "supporting"},
+        ],
+    )
+
+    synced = json.loads(sync_core_features_with_registry(state).prd_document)
+
+    assert synced["goals"] == ["목표"]
+    assert synced["coreFeatures"][0] == original
+    assert [(item["featureId"], item["name"]) for item in synced["coreFeatures"]] == [
+        ("feature_001", "할 일 등록"), ("profile.manage", "회원정보 수정"),
+    ]
+    assert sync_core_features_with_registry(state.copy(prd_document="")).prd_document == ""
+
+
+def test_parent_state_entity_with_completion_time_is_not_a_history_table():
+    # 운영 재현: status와 completed_at을 가진 tasks가 이력 테이블로 분류되어
+    # "이력 엔티티 tasks가 실제 상태 엔티티를 참조하지 않음"으로 차단됐다.
+    def table(name, *columns):
+        return {"name": name, "indexes": [], "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            *[{"name": column, "type": "BIGINT" if ref else "VARCHAR(40)",
+               "constraints": f"NOT_NULL FOREIGN_KEY REFERENCES {ref}(id)" if ref else "NOT_NULL"}
+              for column, ref in columns],
+        ]}
+
+    db = {"tables": [
+        table("users", ("email", None)),
+        table("workspaces", ("name", None)),
+        table("workspace_members", ("user_id", "users"), ("workspace_id", "workspaces"), ("status", None)),
+        table("tasks", ("user_id", "users"), ("workspace_id", "workspaces"), ("status", None), ("completed_at", None)),
+        table("task_status_histories", ("task_id", "tasks"), ("status", None), ("recorded_at", None)),
+    ]}
+    prd = {"coreFeatures": [{"name": "할 일 등록", "description": "할 일을 등록한다.", "requirements": []}]}
+
+    db_issues, _api_issues, _prd_issues = QaAgent(client=None)._check_cross_document_semantics(
+        prd, db, {"endpoints": []}, ["할 일 등록"],
+    )
+
+    assert not [issue for issue in db_issues if "이력 엔티티 tasks" in issue]
