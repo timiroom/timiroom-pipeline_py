@@ -315,6 +315,63 @@ def normalize_feature_contract(spec: dict, auth_required: bool) -> dict:
     return normalized
 
 
+_PRE_AUTH_ROUTE = re.compile(
+    r"^/api/v1/auth/(?:signup|sign-up|register|registrations|login|sign-in"
+    r"|refresh|refresh-tokens?|token-refresh|tokens?/refresh"
+    r"|password-reset[a-z-]*|forgot-password|verify-email|email-verifications?)(?:/|$)"
+)
+
+
+def is_pre_auth_route(path: Any) -> bool:
+    """Identity routes a caller must reach before holding a session."""
+    return bool(_PRE_AUTH_ROUTE.match(normalize_api_path(str(path or ""))))
+
+
+def canonical_api_method(method: Any, path: Any) -> str:
+    """Canonical HTTP method shared by registry contracts and the generated API spec.
+
+    Updates addressed through a path variable are published as PATCH, so a registry
+    contract declared as PUT must be compared in the same form.
+    """
+    value = str(method or "GET").strip().upper()
+    return "PATCH" if value == "PUT" and "{" in str(path or "") else value
+
+
+def route_contract_table(path: Any, candidates: list[str]) -> str | None:
+    """Table named by the most specific resource segment of a route, among a feature's contract tables.
+
+    ``/teams/{id}/members`` names ``team_members``; ``/tasks/{id}/status`` names no table of
+    its own and falls back to ``tasks``. An ambiguous segment is resolved by the parent
+    named earlier in the route, otherwise left undecided instead of guessing the parent.
+    """
+    route = normalize_api_path(str(path or "")).removeprefix("/api/v1/")
+    segments = [part.replace("-", "_") for part in route.split("/") if part and not part.startswith("{")]
+    for index in range(len(segments) - 1, -1, -1):
+        segment = segments[index]
+        matched = [name for name in candidates if name == segment or name.endswith(f"_{segment}")]
+        if len(matched) == 1:
+            return matched[0]
+        if matched:
+            parents = set()
+            for earlier in segments[:index]:
+                parents.add(earlier)
+                parents.add(earlier[:-3] + "y" if earlier.endswith("ies") else earlier.removesuffix("s"))
+            narrowed = [name for name in matched if any(name.startswith(f"{parent}_") for parent in parents)]
+            if len(narrowed) == 1:
+                return narrowed[0]
+            return segment if segment in matched else None
+    return None
+
+
+def endpoint_feature_table(path: Any, mapping: dict | None, table_names) -> str:
+    """Table an endpoint is checked against: the one its route names within the feature
+    contract, else the feature's primary table. Shared by API finalization and QA."""
+    if not isinstance(mapping, dict):
+        return ""
+    declared = [str(name) for name in mapping.get("tables") or [] if str(name) in table_names]
+    return route_contract_table(path, declared) or str(mapping.get("table") or "")
+
+
 def normalize_api_path(path: str) -> str:
     """Canonical public path shared by registry, generation and repair."""
     value = "/" + str(path or "").strip().lstrip("/")

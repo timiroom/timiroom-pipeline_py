@@ -9,7 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
-from phase2.agent_contract import feature_methods, feature_relation_kind, normalize_api_path, requires_auth
+from phase2.agent_contract import canonical_api_method, endpoint_feature_table, feature_methods, feature_relation_kind, normalize_api_path, requires_auth
 from phase2.quality_rules import contamination_reasons, has_placeholder, relevance_score
 from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note, strictly_uncovered_features
 from phase2.feature_scope import backend_features
@@ -395,9 +395,11 @@ def _align_endpoints_to_db(
         # never invented from a technology suggestion in the PRD.
         endpoint_feature = str(ep.get("featureName") or ep.get("description") or "").split(":", 1)[0]
         association_contract = feature_relation_kind(endpoint_feature) == "association"
+        # A stored credential hash is derived on the server; a client never submits it.
         writable = [
             c for c in business
-            if c["name"] != "user_id" or association_contract
+            if c["name"] not in {"password_hash", "credential_hash"}
+            and (c["name"] != "user_id" or association_contract)
         ]
         method = str(ep.get("method") or "GET").upper()
         if method in {"PATCH", "PUT", "DELETE"} and "{" not in path:
@@ -846,13 +848,18 @@ def finalize_api_contracts(
         return prepared
     table_names = {str(table.get("name") or "") for table in schema["tables"] if isinstance(table, dict)}
     by_id = {str(item.get("featureId") or item.get("id") or ""): item for item in registry}
+    # QA validates each endpoint against its feature's mapped table, so fields must come from the same table.
+    feature_mappings = {
+        str(item.get("featureId") or ""): item
+        for item in schema.get("featureMappings") or [] if isinstance(item, dict) and item.get("featureId")
+    }
     aligned = []
     for endpoint in prepared:
         original_path = _output_api_path(endpoint.get("path"))
-        original_method = str(endpoint.get("method") or "GET").upper()
+        original_method = canonical_api_method(endpoint.get("method"), original_path)
         spec = by_id.get(str(endpoint.get("featureId") or ""), {})
         explicit_route = any(
-            str(contract.get("method") or "GET").upper() == original_method
+            canonical_api_method(contract.get("method"), contract.get("path")) == original_method
             and _route_shape(contract.get("path")) == _route_shape(original_path)
             for contract in spec.get("apiContract") or [] if isinstance(contract, dict)
         )
@@ -867,14 +874,22 @@ def finalize_api_contracts(
             draft["featureName"] = spec["name"]
         # Route vocabulary and physical table names may legitimately differ.
         # Use an unambiguous declared table for fields, then restore the route.
-        if explicit_route and len(candidates) == 1 and not (
-            original_path.startswith("/api/v1/auth/") or original_path == "/api/v1/users/me"
-        ):
+        identity_route = original_path.startswith("/api/v1/auth/") or original_path == "/api/v1/users/me"
+        feature_table = endpoint_feature_table(
+            original_path, feature_mappings.get(str(endpoint.get("featureId") or "")), table_names,
+        )
+        if feature_table in table_names and not identity_route:
+            declared_table = feature_table
+        elif explicit_route and len(candidates) == 1:
+            declared_table = candidates[0]
+        else:
+            declared_table = None
+        if explicit_route and declared_table and not identity_route:
             resource, _, suffix = original_path.removeprefix("/api/v1/").partition("/")
-            draft["path"] = f"/api/v1/{candidates[0].replace('_', '-')}" + (f"/{suffix}" if suffix else "")
+            draft["path"] = f"/api/v1/{declared_table.replace('_', '-')}" + (f"/{suffix}" if suffix else "")
         contracts = _align_endpoints_to_db(
             [draft], db_schema, prd_document, requirement_text,
-            declared_table_name=candidates[0] if explicit_route and len(candidates) == 1 else None,
+            declared_table_name=declared_table,
         )
         for contract in contracts:
             if explicit_route:
@@ -1473,7 +1488,7 @@ def _annotate_feature_ids(plan: list, registry: list[dict] | None) -> list:
         for contract in item.get("apiContract") or item.get("api") or []:
             if not isinstance(contract, dict) or not feature_id:
                 continue
-            method = str(contract.get("method") or "GET").upper()
+            method = canonical_api_method(contract.get("method"), contract.get("path"))
             path = _canonical_api_path(contract.get("path"))
             if path:
                 contracts[(method, path)] = feature_id
@@ -1482,7 +1497,7 @@ def _annotate_feature_ids(plan: list, registry: list[dict] | None) -> list:
         if not isinstance(ep, dict):
             continue
         ep["path"] = _output_api_path(ep.get("path"))
-        key = (str(ep.get("method") or "GET").upper(), _canonical_api_path(ep.get("path")))
+        key = (canonical_api_method(ep.get("method"), ep.get("path")), _canonical_api_path(ep.get("path")))
         if key in contracts:
             ep["featureId"] = contracts[key]
             continue
@@ -1550,7 +1565,7 @@ def _registry_fallback_plan(registry: list[dict] | None) -> list[dict]:
 def _ensure_contract_endpoints(plan: list, registry: list[dict] | None) -> list:
     """PM이 명시한 endpoint는 LLM plan 누락 여부와 무관하게 최종 plan에 보존한다."""
     existing = {
-        (str(ep.get("method", "GET")).upper(), _canonical_api_path(ep.get("path"))): ep
+        (canonical_api_method(ep.get("method"), ep.get("path")), _canonical_api_path(ep.get("path"))): ep
         for ep in plan if isinstance(ep, dict)
     }
     existing_shapes = {
@@ -1562,11 +1577,11 @@ def _ensure_contract_endpoints(plan: list, registry: list[dict] | None) -> list:
         for contract in item.get("apiContract") or []:
             if not isinstance(contract, dict):
                 continue
-            method = str(contract.get("method", "GET")).upper()
             path = str(contract.get("path", "")).strip()
             if not path:
                 continue
             path = _output_api_path(path)
+            method = canonical_api_method(contract.get("method"), path)
             key = (method, _canonical_api_path(path))
             shape_key = (method, _route_shape(path))
             if key in existing:
@@ -1766,9 +1781,7 @@ def _normalize_endpoints(endpoints: list) -> list:
         ep.setdefault("method", "GET")
         ep.setdefault("path", "/api/v1/unknown")
         ep["path"] = _output_api_path(ep["path"])
-        ep["method"] = str(ep["method"]).upper()
-        if ep["method"] == "PUT" and "{" in ep["path"]:
-            ep["method"] = "PATCH"
+        ep["method"] = canonical_api_method(ep["method"], ep["path"])
         ep.setdefault("authRequired", True)
         if not str(ep.get("description") or "").strip():
             ep["description"] = f"{ep.get('method')} {ep.get('path')}"

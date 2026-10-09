@@ -3,6 +3,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from phase2.agent_contract import canonical_api_method, is_pre_auth_route
 from phase2.agents.api_agent import _invalid_paths
 from phase2.feature_coverage import strictly_uncovered_features, uncovered_features
 from phase2.feature_registry import missing_api_contract_features, missing_db_contract_features
@@ -421,7 +422,10 @@ class SchemaValidator:
             for operation in spec.get("apiContract") or []:
                 if not isinstance(operation, dict):
                     continue
-                key = (str(operation.get("method") or "GET").upper(), str(operation.get("path") or ""))
+                key = (
+                    canonical_api_method(operation.get("method"), operation.get("path")),
+                    str(operation.get("path") or ""),
+                )
                 if key[1] and key not in endpoints:
                     errors.append(f"API 기능 계약 엔드포인트 누락: {name} → {key[0]} {key[1]}")
             if not spec.get("transactionRules"):
@@ -457,7 +461,9 @@ class SchemaValidator:
                 if not endpoint:
                     errors.append(f"API 기능 매핑 대상 없음: {name} → {key[0]} {key[1]}")
                     continue
-                if scope in {"USER", "SHARED"} and not key[1].endswith(("/signup", "/login", "/refresh")):
+                if scope in {"USER", "SHARED"} and not (
+                    key[1].endswith(("/signup", "/login", "/refresh")) or is_pre_auth_route(key[1])
+                ):
                     if not endpoint.get("authRequired"):
                         errors.append(f"API 사용자 소유 기능 인증 누락: {key[0]} {key[1]}")
                 for field in ("requestBody", "successResponse", "errorCodes"):

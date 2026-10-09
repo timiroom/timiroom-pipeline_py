@@ -116,6 +116,24 @@ def ensure_registry_core_features(core_features, feature_hints, registry) -> lis
         existing_names.add(name.casefold())
     return items
 
+def sync_core_features_with_registry(state):
+    """Reflect required features confirmed after the PRD was written into coreFeatures.
+
+    Feature Spec can promote a feature to P0/core once the PRD exists. Restoring it
+    here is deterministic, so the omission never reaches the LLM repair as a blocker.
+    Existing features are left untouched.
+    """
+    prd = try_parse_json(state.prd_document)
+    if not isinstance(prd, dict) or not isinstance(prd.get("coreFeatures"), list):
+        return state
+    registry = normalize_feature_registry(state.feature_registry, state.feature_list, preserve_extra=True)
+    before = len(prd["coreFeatures"])
+    core = ensure_registry_core_features(list(prd["coreFeatures"]), [], registry)
+    if len(core) == before:
+        return state
+    return state.copy(prd_document=json.dumps({**prd, "coreFeatures": core}, ensure_ascii=False))
+
+
 logger = logging.getLogger(__name__)
 
 # 섹션별 최소 항목 수 — SECTION_PROMPTS가 스스로 요구하는 기준과 동일.

@@ -21,9 +21,9 @@ from phase2.json_utils import try_parse_json
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
 
-from phase2.agents.dba_agent import _build_name_lookup
+from phase2.agents.dba_agent import _build_name_lookup, _fk_target
 from phase2.agents.api_agent import _endpoint_quality_issues, _feature_methods, _feature_resource_slug
-from phase2.agent_contract import IssueSeverity, classify_issue, feature_relation_kind, requires_auth
+from phase2.agent_contract import IssueSeverity, canonical_api_method, classify_issue, endpoint_feature_table, feature_relation_kind, requires_auth
 from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts, scoped_unique_columns
 
 logger = logging.getLogger(__name__)
@@ -52,13 +52,13 @@ def _request_field_names(value) -> set[str]:
 def _endpoint_table(endpoint: dict, tables: dict[str, dict], mappings: list | None = None) -> tuple[str, dict] | tuple[None, None]:
     feature_id = str(endpoint.get("featureId") or "")
     feature_name = str(endpoint.get("featureName") or "")
-    declared = {
-        str(item.get("table") or "") for item in mappings or [] if isinstance(item, dict)
+    declared = [
+        item for item in mappings or [] if isinstance(item, dict)
         and ((feature_id and item.get("featureId") == feature_id)
              or (not feature_id and feature_name and item.get("featureName") == feature_name))
-    }
-    if len(declared) == 1:
-        name = next(iter(declared))
+    ]
+    if len({str(item.get("table") or "") for item in declared}) == 1:
+        name = endpoint_feature_table(endpoint.get("path"), declared[0], tables)
         if name in tables:
             return name, tables[name]
     path = str(endpoint.get("path") or "")
@@ -776,7 +776,7 @@ class QaAgent:
         db_issues, api_issues, prd_issues = [], [], []
         endpoints = [e for e in (api or {}).get("endpoints", []) if isinstance(e, dict)]
         endpoint_keys = {
-            (str(e.get("method", "GET")).upper(), _canonical_api_path(e.get("path")))
+            (canonical_api_method(e.get("method"), e.get("path")), _canonical_api_path(e.get("path")))
             for e in endpoints
         }
         registry_ids = {str(item.get("featureId") or item.get("id") or "").strip() for item in registry or []}
@@ -800,7 +800,7 @@ class QaAgent:
             for contract in item.get("apiContract") or []:
                 if isinstance(contract, dict):
                     key = (
-                        str(contract.get("method", "GET")).upper(),
+                        canonical_api_method(contract.get("method"), contract.get("path")),
                         _canonical_api_path(contract.get("path")),
                     )
                     if key[1] and key not in endpoint_keys:
@@ -897,6 +897,11 @@ class QaAgent:
                             stem.endswith("_" + table_name)
                             or stem.endswith("_" + table_tail)
                             or stem in table_variants
+                            # replaced_by_auth_session_id -> auth_sessions, replaced_by_token_id -> refresh_tokens
+                            or any(
+                                stem.endswith("_" + variant)
+                                for variant in _table_name_variants(table_name) | table_variants
+                            )
                         ):
                             candidates.add(table_name)
                     if not candidates & table_names:
@@ -904,6 +909,12 @@ class QaAgent:
                             table_tail = table_name.rsplit("_", 1)[-1]
                             if stem in _table_name_variants(table_tail):
                                 candidates.add(table_name)
+                if not candidates & table_names:
+                    # Same resolution the DBA applies when it materializes REFERENCES
+                    # (teacher_id, instructor_id -> users), so both stages agree.
+                    resolved = _fk_target(column_name, _build_name_lookup(tables))
+                    if resolved:
+                        candidates.add(resolved)
                 if not candidates & table_names:
                     db_issues.append(f"{table.get('name')}.{column['name']}의 FK 참조 대상을 찾을 수 없습니다")
 
@@ -1132,10 +1143,14 @@ class QaAgent:
             "occurred_at", "recorded_at", "event_at", "completed_at", "processed_at",
             "started_at", "ended_at", "effective_at",
         }
+        # A table with its own lifecycle state that other tables reference is the parent
+        # entity (tasks.completed_at), not a history log of another aggregate.
+        referenced_tables = {target for targets in refs.values() for target in targets}
         event_tables = {
             name for name, names in columns.items()
             if refs.get(name) and bool(names & occurrence_fields)
             and not any(token in name for token in ("assignment", "membership", "link", "mapping"))
+            and not (names & {"status", "state"} and name in referenced_tables)
         }
         aggregates = {
             name for name, names in columns.items()
@@ -1237,7 +1252,7 @@ class QaAgent:
                         endpoint.get("featureName") or endpoint.get("description") or ""
                     ).split(":", 1)[0]
                     association_contract = feature_relation_kind(endpoint_feature) == "association"
-                    server_managed = {"id", "created_at", "updated_at"}
+                    server_managed = {"id", "created_at", "updated_at", "password_hash", "credential_hash"}
                     if not association_contract:
                         server_managed.add("user_id")
                     db_fields = columns.get(mapped_name, set()) - server_managed

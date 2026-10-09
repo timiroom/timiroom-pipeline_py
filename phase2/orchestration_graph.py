@@ -5,7 +5,7 @@ import logging
 from phase2.agents.api_agent import ApiAgent, _api_feature_mappings, finalize_api_contracts
 from phase2.agents.dba_agent import DbaAgent
 from phase2.agents.pm_agent import PmAgent
-from phase2.agents.prd_agent import PrdAgent
+from phase2.agents.prd_agent import PrdAgent, sync_core_features_with_registry
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent
 from phase2.json_utils import try_parse_json
@@ -274,7 +274,7 @@ class OrchestrationGraph:
             after_prd = current if prd_ready and attempt == 0 else await self._prd.execute(current, dump)
             if self._feature_spec is not None:
                 self._progress.send(pipeline_id, "FEATURE_SPEC", "기능명세서 및 지원 기능 확정 중...", 55)
-                after_prd = await self._feature_spec.execute(after_prd, dump)
+                after_prd = sync_core_features_with_registry(await self._feature_spec.execute(after_prd, dump))
 
             # DBA·API는 rag-pipeline과 동일하게 독립적으로 병렬 실행 (교차 주입 없음)
             self._progress.send(pipeline_id, "DBA_API", "DB 스키마 · API 설계 중...", 60)
@@ -357,7 +357,9 @@ class OrchestrationGraph:
                             pipeline_id, "FEATURE_SPEC_RESYNC",
                             "수정된 PRD 기준 기능 계약 재동기화 중...", 70,
                         )
-                        resynced = await self._feature_spec.execute(resynced, dump)
+                        resynced = sync_core_features_with_registry(
+                            await self._feature_spec.execute(resynced, dump)
+                        )
 
                     if changed_ids and not repeated_repair:
                         repair_domains.update(self._changed_registry_domains(

@@ -10,7 +10,7 @@ import re
 from collections.abc import Iterable
 from urllib.parse import urlparse
 
-from phase2.agent_contract import semantic_relevance
+from phase2.agent_contract import route_contract_table, semantic_relevance
 
 
 _CONTAMINATION_PATTERNS = (
@@ -201,6 +201,32 @@ def matching_table_features(table: dict, tables: list[dict], features: list[dict
     return matched
 
 
+def _feature_routes_name_other_table(feature: dict, table: dict, tables: list[dict]) -> bool:
+    """True when the feature's own routes name different tables of its contract.
+
+    A contract also lists owners and parents; a duplicate rule written for the feature's
+    resource (rentals) is not a rule about every table listed beside it (tools).
+    """
+    contract = feature.get("dbContract") if isinstance(feature.get("dbContract"), dict) else {}
+    existing = {str(item.get("name") or "") for item in tables if isinstance(item, dict)}
+    declared = [
+        name for name in (
+            str(item.get("name") or item.get("table") or "") if isinstance(item, dict) else str(item)
+            for item in contract.get("tables") or []
+        ) if name in existing
+    ]
+    named = {
+        route_contract_table(operation.get("path"), declared)
+        for operation in feature.get("apiContract") or [] if isinstance(operation, dict)
+    } - {None}
+    return bool(named) and str(table.get("name") or "") not in named
+
+
+def _reference_target(column: dict) -> str:
+    match = re.search(r"\bREFERENCES\s+([A-Za-z_]\w*)", str(column.get("constraints") or ""), re.I)
+    return match.group(1).lower() if match else ""
+
+
 def scoped_unique_columns(table: dict, tables: list[dict], features: list[dict]) -> tuple[str, ...]:
     """Return the declared duplicate key only for this table's own feature.
 
@@ -209,12 +235,21 @@ def scoped_unique_columns(table: dict, tables: list[dict], features: list[dict])
     """
     columns = [str(column.get("name") or "") for column in table.get("columns") or [] if isinstance(column, dict)]
     keys = set()
+    targets = {
+        str(column.get("name") or ""): _reference_target(column)
+        for column in table.get("columns") or [] if isinstance(column, dict)
+    }
     for feature in matching_table_features(table, tables, features):
+        if _feature_routes_name_other_table(feature, table, tables):
+            continue
         prose = flatten_text([feature.get("description", ""), feature.get("requirements", [])])
         if not re.search(r"중복.{0,20}(?:방지|차단|금지)|동일.{0,20}(?:한\s*번|1회)|하나만|\b(?:prevent|reject|disallow)\s+duplicates?\b", prose, re.I):
             continue
         named = tuple(column for column in columns if re.search(rf"(?<!\w){re.escape(column)}(?!\w)", prose))
         identifiers = tuple(column for column in columns if column.endswith("_id"))
+        # Two references to the same entity (created_by_user_id, user_id) are not an association key.
+        if len(identifiers) == 2 and targets[identifiers[0]] and targets[identifiers[0]] == targets[identifiers[1]]:
+            identifiers = ()
         key = named if len(named) >= 2 else identifiers if len(identifiers) == 2 else ()
         if key:
             keys.add(key)
