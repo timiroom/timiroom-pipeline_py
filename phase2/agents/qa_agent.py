@@ -21,9 +21,9 @@ from phase2.json_utils import try_parse_json
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
 
-from phase2.agents.dba_agent import _build_name_lookup
+from phase2.agents.dba_agent import _build_name_lookup, _fk_target
 from phase2.agents.api_agent import _endpoint_quality_issues, _feature_methods, _feature_resource_slug
-from phase2.agent_contract import IssueSeverity, canonical_api_method, classify_issue, feature_relation_kind, requires_auth
+from phase2.agent_contract import IssueSeverity, canonical_api_method, classify_issue, endpoint_feature_table, feature_relation_kind, requires_auth
 from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts, scoped_unique_columns
 
 logger = logging.getLogger(__name__)
@@ -52,13 +52,13 @@ def _request_field_names(value) -> set[str]:
 def _endpoint_table(endpoint: dict, tables: dict[str, dict], mappings: list | None = None) -> tuple[str, dict] | tuple[None, None]:
     feature_id = str(endpoint.get("featureId") or "")
     feature_name = str(endpoint.get("featureName") or "")
-    declared = {
-        str(item.get("table") or "") for item in mappings or [] if isinstance(item, dict)
+    declared = [
+        item for item in mappings or [] if isinstance(item, dict)
         and ((feature_id and item.get("featureId") == feature_id)
              or (not feature_id and feature_name and item.get("featureName") == feature_name))
-    }
-    if len(declared) == 1:
-        name = next(iter(declared))
+    ]
+    if len({str(item.get("table") or "") for item in declared}) == 1:
+        name = endpoint_feature_table(endpoint.get("path"), declared[0], tables)
         if name in tables:
             return name, tables[name]
     path = str(endpoint.get("path") or "")
@@ -909,6 +909,12 @@ class QaAgent:
                             table_tail = table_name.rsplit("_", 1)[-1]
                             if stem in _table_name_variants(table_tail):
                                 candidates.add(table_name)
+                if not candidates & table_names:
+                    # Same resolution the DBA applies when it materializes REFERENCES
+                    # (teacher_id, instructor_id -> users), so both stages agree.
+                    resolved = _fk_target(column_name, _build_name_lookup(tables))
+                    if resolved:
+                        candidates.add(resolved)
                 if not candidates & table_names:
                     db_issues.append(f"{table.get('name')}.{column['name']}의 FK 참조 대상을 찾을 수 없습니다")
 

@@ -9,7 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
 
-from phase2.agent_contract import canonical_api_method, feature_methods, feature_relation_kind, normalize_api_path, requires_auth
+from phase2.agent_contract import canonical_api_method, endpoint_feature_table, feature_methods, feature_relation_kind, normalize_api_path, requires_auth
 from phase2.quality_rules import contamination_reasons, has_placeholder, relevance_score
 from phase2.feature_coverage import uncovered_features, undercovered_features, missing_features_note, strictly_uncovered_features
 from phase2.feature_scope import backend_features
@@ -847,8 +847,8 @@ def finalize_api_contracts(
     table_names = {str(table.get("name") or "") for table in schema["tables"] if isinstance(table, dict)}
     by_id = {str(item.get("featureId") or item.get("id") or ""): item for item in registry}
     # QA validates each endpoint against its feature's mapped table, so fields must come from the same table.
-    mapped_tables = {
-        str(item.get("featureId") or ""): str(item.get("table") or "")
+    feature_mappings = {
+        str(item.get("featureId") or ""): item
         for item in schema.get("featureMappings") or [] if isinstance(item, dict) and item.get("featureId")
     }
     aligned = []
@@ -873,7 +873,9 @@ def finalize_api_contracts(
         # Route vocabulary and physical table names may legitimately differ.
         # Use an unambiguous declared table for fields, then restore the route.
         identity_route = original_path.startswith("/api/v1/auth/") or original_path == "/api/v1/users/me"
-        feature_table = mapped_tables.get(str(endpoint.get("featureId") or ""), "")
+        feature_table = endpoint_feature_table(
+            original_path, feature_mappings.get(str(endpoint.get("featureId") or "")), table_names,
+        )
         if feature_table in table_names and not identity_route:
             declared_table = feature_table
         elif explicit_route and len(candidates) == 1:
@@ -1484,7 +1486,7 @@ def _annotate_feature_ids(plan: list, registry: list[dict] | None) -> list:
         for contract in item.get("apiContract") or item.get("api") or []:
             if not isinstance(contract, dict) or not feature_id:
                 continue
-            method = str(contract.get("method") or "GET").upper()
+            method = canonical_api_method(contract.get("method"), contract.get("path"))
             path = _canonical_api_path(contract.get("path"))
             if path:
                 contracts[(method, path)] = feature_id
@@ -1493,7 +1495,7 @@ def _annotate_feature_ids(plan: list, registry: list[dict] | None) -> list:
         if not isinstance(ep, dict):
             continue
         ep["path"] = _output_api_path(ep.get("path"))
-        key = (str(ep.get("method") or "GET").upper(), _canonical_api_path(ep.get("path")))
+        key = (canonical_api_method(ep.get("method"), ep.get("path")), _canonical_api_path(ep.get("path")))
         if key in contracts:
             ep["featureId"] = contracts[key]
             continue
@@ -1561,7 +1563,7 @@ def _registry_fallback_plan(registry: list[dict] | None) -> list[dict]:
 def _ensure_contract_endpoints(plan: list, registry: list[dict] | None) -> list:
     """PM이 명시한 endpoint는 LLM plan 누락 여부와 무관하게 최종 plan에 보존한다."""
     existing = {
-        (str(ep.get("method", "GET")).upper(), _canonical_api_path(ep.get("path"))): ep
+        (canonical_api_method(ep.get("method"), ep.get("path")), _canonical_api_path(ep.get("path"))): ep
         for ep in plan if isinstance(ep, dict)
     }
     existing_shapes = {
@@ -1573,11 +1575,11 @@ def _ensure_contract_endpoints(plan: list, registry: list[dict] | None) -> list:
         for contract in item.get("apiContract") or []:
             if not isinstance(contract, dict):
                 continue
-            method = str(contract.get("method", "GET")).upper()
             path = str(contract.get("path", "")).strip()
             if not path:
                 continue
             path = _output_api_path(path)
+            method = canonical_api_method(contract.get("method"), path)
             key = (method, _canonical_api_path(path))
             shape_key = (method, _route_shape(path))
             if key in existing:

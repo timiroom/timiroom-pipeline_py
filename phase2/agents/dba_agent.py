@@ -25,7 +25,7 @@ from phase2.quality_rules import (
     matching_table_features, relevance_score, required_field_concepts,
     scoped_unique_columns, self_check_passed,
 )
-from phase2.agent_contract import feature_relation_kind, requires_auth, normalize_api_path
+from phase2.agent_contract import feature_relation_kind, requires_auth, normalize_api_path, route_contract_table
 
 logger = logging.getLogger(__name__)
 
@@ -939,12 +939,9 @@ def _primary_contract_table(spec: dict, tables: list[dict], declared: list[str])
         key=lambda item: str(item.get("method") or "GET").upper() in {"GET", "DELETE"},
     )
     for operation in operations:
-        path = normalize_api_path(str(operation.get("path") or "")).removeprefix("/api/v1/")
-        segments = [part.replace("-", "_") for part in path.split("/") if part and not part.startswith("{")]
-        for segment in reversed(segments):
-            matched = [name for name in candidates if name == segment or name.endswith(f"_{segment}")]
-            if len(matched) == 1:
-                return by_name[matched[0]]
+        named = route_contract_table(operation.get("path"), candidates)
+        if named:
+            return by_name[named]
 
     # 2) The dependent table of the contract: it references the others and nothing references it.
     foreign_keys = [
@@ -971,12 +968,16 @@ def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None)
         if not isinstance(spec, dict) or not spec.get("name"):
             continue
         name = str(spec["name"])
+        declared = (spec.get("dbContract") or {}).get("tables") if isinstance(spec.get("dbContract"), dict) else None
+        names = [
+            str(item.get("name") or item.get("table") or "") if isinstance(item, dict) else str(item)
+            for item in declared or []
+        ]
         if name in {"회원 가입 및 로그인", "내 정보 및 계정 관리", "사용자별 데이터 접근 제어"}:
             table = next((item for item in tables if item.get("name") == "users"), None)
         elif name == "인증 세션 관리":
             table = next((item for item in tables if item.get("name") == "refresh_tokens"), None)
-        elif (declared := (spec.get("dbContract") or {}).get("tables")):
-            names = [str(item.get("name") or item.get("table") or "") if isinstance(item, dict) else str(item) for item in declared]
+        elif names:
             table = _primary_contract_table(spec, tables, names)
         else:
             eligible = [item for item in tables if not _is_principal_table(item) and item.get("name") != "refresh_tokens"]
@@ -1007,10 +1008,13 @@ def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None)
             if any(item.get("name") == owner_entity for item in tables):
                 _ensure_reference_column(table, owner_entity)
                 _ensure_index(table, (f"{_singular_table_name(owner_entity)}_id",))
+        table_names = {str(item.get("name") or "") for item in tables if isinstance(item, dict)}
         mappings.append({
             "featureName": name,
             "featureId": str(spec.get("featureId") or spec.get("id") or ""),
             "table": str(table.get("name") or "") if table else "",
+            # Every contract table, so a route of this feature can be checked against the one it names.
+            "tables": [item for item in dict.fromkeys(names) if item in table_names],
             "ownership": ownership,
             "states": list(spec.get("states") or []),
             "stateTransitions": list(spec.get("stateTransitions") or []),

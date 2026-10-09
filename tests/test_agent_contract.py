@@ -741,6 +741,8 @@ def test_self_reference_with_a_singular_table_name_resolves_its_target():
             {"name": "user_id", "type": "BIGINT", "constraints": "NOT_NULL FOREIGN_KEY REFERENCES users(id)"},
             {"name": "replaced_by_auth_session_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
             {"name": "approved_by_manager_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
+            # DBA는 teacher/instructor 같은 역할 FK를 users로 연결한다. QA도 같은 기준이어야 한다.
+            {"name": "teacher_id", "type": "BIGINT", "constraints": "NOT_NULL FOREIGN_KEY"},
         ]},
     ]}
     # 운영 실패 원문: refresh_tokens.replaced_by_token_id (토큰 회전 자기참조)
@@ -752,3 +754,119 @@ def test_self_reference_with_a_singular_table_name_resolves_its_target():
     db_issues, _api_issues, _prd_issues = QaAgent._check_cross_artifacts(db, {"endpoints": []}, {})
     fk_issues = [issue for issue in db_issues if "FK 참조 대상" in issue]
     assert fk_issues == ["auth_sessions.approved_by_manager_id의 FK 참조 대상을 찾을 수 없습니다"]
+
+
+def test_each_endpoint_of_a_feature_uses_the_table_its_own_route_names():
+    # 한 기능이 두 리소스(/invitations, /members/{id}/role)를 다루면 기능 대표 테이블 하나로는
+    # 한쪽 엔드포인트 본문이 다른 테이블 필드로 채워진다. API와 QA가 경로별로 같은 테이블을 골라야 한다.
+    from phase2.agents.api_agent import finalize_api_contracts
+    from phase2.agents.qa_agent import _endpoint_table, _request_field_names
+
+    ownership = {"scope": "USER", "ownerEntity": "users", "ownerKey": "user_id"}
+    tables = _contract_tables("users", "workspaces", "workspace_members", "workspace_invitations")
+    next(t for t in tables if t["name"] == "workspace_members")["columns"] += [
+        {"name": "role", "type": "VARCHAR(20)", "constraints": "NOT_NULL DEFAULT 'MEMBER'"},
+    ]
+    next(t for t in tables if t["name"] == "workspace_invitations")["columns"] += [
+        {"name": "invitee_email", "type": "VARCHAR(320)", "constraints": "NOT_NULL"},
+    ]
+    registry = [{
+        "name": "작업공간 역할 관리", "featureId": "feature_002.workspace_roles",
+        "id": "feature_002.workspace_roles", "ownership": ownership,
+        "apiContract": [
+            {"method": "POST", "path": "/api/v1/workspaces/{workspaceid}/invitations"},
+            {"method": "PATCH", "path": "/api/v1/workspaces/{workspaceid}/members/{memberid}/role"},
+        ],
+        "dbContract": {"tables": ["users", "workspaces", "workspace_members", "workspace_invitations"], "foreignKeys": []},
+    }]
+    mappings = build_feature_mappings(tables, registry)
+    assert mappings[0]["table"] == "workspace_invitations"
+    schema = json.dumps({"tables": tables, "featureMappings": mappings}, ensure_ascii=False)
+
+    endpoints = finalize_api_contracts([
+        {"method": "POST", "path": "/api/v1/workspaces/{workspaceid}/invitations",
+         "featureId": "feature_002.workspace_roles", "description": "초대"},
+        {"method": "PATCH", "path": "/api/v1/workspaces/{workspaceid}/members/{memberid}/role",
+         "featureId": "feature_002.workspace_roles", "description": "역할 변경"},
+    ], schema, registry=registry)
+
+    by_name = {item["name"]: item for item in tables}
+    resolved = {item["path"].rsplit("/", 1)[-1]: _endpoint_table(item, by_name, mappings)[0] for item in endpoints}
+    assert resolved == {"invitations": "workspace_invitations", "role": "workspace_members"}
+    role = next(item for item in endpoints if item["path"].endswith("/role"))
+    assert "role" in _request_field_names(role["requestBody"])
+    assert "invitee_email" not in _request_field_names(role["requestBody"])
+
+
+def test_route_segment_shared_by_two_contract_tables_prefers_the_parent_named_in_the_route():
+    ownership = {"scope": "USER", "ownerEntity": "users", "ownerKey": "user_id"}
+    tables = _contract_tables("users", "teams", "team_members", "workspace_members")
+    spec = {
+        "name": "팀 멤버 관리", "featureId": "team.members", "ownership": ownership,
+        "apiContract": [{"method": "POST", "path": "/api/v1/teams/{teamid}/members"}],
+        "dbContract": {"tables": ["users", "teams", "team_members", "workspace_members"], "foreignKeys": []},
+    }
+    assert _mapped_table(build_feature_mappings(tables, [spec]), "team.members") == "team_members"
+
+
+def test_put_contract_does_not_add_a_duplicate_of_the_published_patch_route():
+    from phase2.agents.api_agent import (
+        _annotate_feature_ids,
+        _ensure_contract_endpoints,
+    )
+
+    registry = [{"featureId": "feature_002", "name": "담당자 배정", "apiContract": [
+        {"method": "PUT", "path": "/api/v1/tasks/{taskid}/assignees", "action": "assign"},
+    ]}]
+    plan = [{"method": "PATCH", "path": "/api/v1/tasks/{taskid}/assignees", "description": "담당자 지정"}]
+
+    ensured = _annotate_feature_ids(_ensure_contract_endpoints(plan, registry), registry)
+
+    assert [(item["method"], item["path"], item.get("featureId")) for item in ensured] == [
+        ("PATCH", "/api/v1/tasks/{taskid}/assignees", "feature_002"),
+    ]
+
+
+def test_pre_auth_routes_cover_common_recovery_and_verification_names():
+    from phase2.agent_contract import is_pre_auth_route
+
+    for path in ("/api/v1/auth/forgot-password", "/auth/email-verifications", "/api/v1/auth/verify-email",
+                 "/api/v1/auth/password-reset-requests", "/api/v1/auth/register"):
+        assert is_pre_auth_route(path), path
+    for path in ("/api/v1/auth/logout", "/api/v1/auth/password-change", "/api/v1/profile", "/api/v1/auth/me"):
+        assert not is_pre_auth_route(path), path
+
+
+def test_duplicate_key_is_required_only_on_the_table_the_feature_route_names():
+    # 운영 재현: '중복 대여 차단' 기능이 dbContract에 함께 적은 상위 테이블(tools)과,
+    # 같은 대상을 가리키는 두 FK(created_by_user_id, user_id)에 UNIQUE가 요구되어 생성이 차단됐다.
+    from phase2.quality_rules import scoped_unique_columns
+
+    def table(name, *columns):
+        return {"name": name, "description": "", "indexes": [], "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            *[{"name": column, "type": "BIGINT", "constraints": f"NOT_NULL FOREIGN_KEY REFERENCES {ref}(id)"}
+              for column, ref in columns],
+        ]}
+
+    tools = table("tools", ("created_by_user_id", "users"), ("category_id", "categories"))
+    same_target = table("reservations", ("class_schedule_id", "class_schedules"), ("schedule_id", "class_schedules"))
+    rentals = table("rentals", ("tool_id", "tools"), ("member_id", "users"))
+    tables = [table("users"), table("categories"), table("class_schedules"), tools, same_target, rentals]
+    rental = {
+        "featureId": "feature_002", "name": "공구 대여",
+        "description": "회원이 공구를 대여하면 시스템은 중복 대여를 차단한다.", "requirements": [],
+        "apiContract": [{"method": "POST", "path": "/api/v1/rentals"}],
+        "dbContract": {"tables": ["users", "tools", "rentals"], "foreignKeys": []},
+    }
+    reservation = {
+        "featureId": "feature_003", "name": "수강 예약",
+        "description": "동일 일정에 중복 예약하지 못하도록 방지한다.", "requirements": [],
+        "apiContract": [{"method": "POST", "path": "/api/v1/reservations"}],
+        "dbContract": {"tables": ["reservations", "class_schedules"], "foreignKeys": []},
+    }
+    features = [rental, reservation]
+
+    assert scoped_unique_columns(rentals, tables, features) == ("tool_id", "member_id")
+    assert scoped_unique_columns(tools, tables, features) == ()
+    assert scoped_unique_columns(same_target, tables, features) == ()
