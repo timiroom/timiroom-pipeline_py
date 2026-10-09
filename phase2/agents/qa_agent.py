@@ -1252,7 +1252,7 @@ class QaAgent:
                         endpoint.get("featureName") or endpoint.get("description") or ""
                     ).split(":", 1)[0]
                     association_contract = feature_relation_kind(endpoint_feature) == "association"
-                    server_managed = {"id", "created_at", "updated_at"}
+                    server_managed = {"id", "created_at", "updated_at", "password_hash", "credential_hash"}
                     if not association_contract:
                         server_managed.add("user_id")
                     db_fields = columns.get(mapped_name, set()) - server_managed

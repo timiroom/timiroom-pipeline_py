@@ -311,6 +311,8 @@ def _fk_target(col_name, name_lookup: dict[str, str]) -> str | None:
         "user", "student", "member", "customer", "client", "operator",
         "teacher", "instructor", "participant", "applicant", "requester_user",
         "recipient", "recipient_user", "beneficiary", "subscriber",
+        "manager", "admin", "administrator", "staff", "coordinator", "organizer", "supervisor",
+        "approver", "volunteer", "host", "leader",
     }:
         if "users" in name_lookup:
             return name_lookup["users"]

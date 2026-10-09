@@ -395,9 +395,11 @@ def _align_endpoints_to_db(
         # never invented from a technology suggestion in the PRD.
         endpoint_feature = str(ep.get("featureName") or ep.get("description") or "").split(":", 1)[0]
         association_contract = feature_relation_kind(endpoint_feature) == "association"
+        # A stored credential hash is derived on the server; a client never submits it.
         writable = [
             c for c in business
-            if c["name"] != "user_id" or association_contract
+            if c["name"] not in {"password_hash", "credential_hash"}
+            and (c["name"] != "user_id" or association_contract)
         ]
         method = str(ep.get("method") or "GET").upper()
         if method in {"PATCH", "PUT", "DELETE"} and "{" not in path:

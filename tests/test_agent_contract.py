@@ -743,6 +743,9 @@ def test_self_reference_with_a_singular_table_name_resolves_its_target():
             {"name": "approved_by_manager_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
             # DBA는 teacher/instructor 같은 역할 FK를 users로 연결한다. QA도 같은 기준이어야 한다.
             {"name": "teacher_id", "type": "BIGINT", "constraints": "NOT_NULL FOREIGN_KEY"},
+            # 봉사활동 시나리오 재현: volunteer_activities.manager_id
+            {"name": "manager_id", "type": "BIGINT", "constraints": "NOT_NULL FOREIGN_KEY"},
+            {"name": "coordinator_id", "type": "BIGINT", "constraints": "NULL FOREIGN_KEY"},
         ]},
     ]}
     # 운영 실패 원문: refresh_tokens.replaced_by_token_id (토큰 회전 자기참조)
@@ -872,3 +875,34 @@ def test_duplicate_key_is_required_only_on_the_table_the_feature_route_names():
     assert scoped_unique_columns(rentals, tables, features) == ("tool_id", "member_id")
     assert scoped_unique_columns(tools, tables, features) == ()
     assert scoped_unique_columns(same_target, tables, features) == ()
+
+
+def test_credential_hash_is_never_a_request_field():
+    # 생성 문서 점검에서 발견: PATCH /profile 본문이 users 컬럼 전체로 채워져 password_hash를 입력으로 요구했다.
+    from phase2.agents.api_agent import finalize_api_contracts
+    from phase2.agents.qa_agent import _request_field_names
+
+    ownership = {"scope": "USER", "ownerEntity": "users", "ownerKey": "user_id"}
+    tables = _contract_tables("users")
+    tables[0]["columns"] += [{"name": "display_name", "type": "VARCHAR(80)", "constraints": "NOT_NULL"}]
+    registry = [{
+        "name": "회원정보 수정", "featureId": "profile.manage", "id": "profile.manage", "ownership": ownership,
+        "apiContract": [{"method": "PATCH", "path": "/api/v1/profile"}, {"method": "POST", "path": "/api/v1/members"}],
+        "dbContract": {"tables": ["users"], "foreignKeys": []},
+    }]
+    mappings = build_feature_mappings(tables, registry)
+    schema = {"tables": tables, "featureMappings": mappings}
+
+    endpoints = finalize_api_contracts([
+        {"method": "PATCH", "path": "/api/v1/profile", "featureId": "profile.manage", "description": "수정"},
+        {"method": "POST", "path": "/api/v1/members", "featureId": "profile.manage", "description": "구성원 등록"},
+    ], json.dumps(schema, ensure_ascii=False), registry=registry)
+
+    for endpoint in endpoints:
+        fields = _request_field_names(endpoint["requestBody"])
+        assert "display_name" in fields
+        assert "password_hash" not in fields
+    _db, api_issues, _prd = QaAgent(client=None)._check_cross_document_semantics(
+        {"coreFeatures": registry}, schema, {"endpoints": endpoints}, ["회원정보 수정"],
+    )
+    assert not [issue for issue in api_issues if "password_hash" in issue]
