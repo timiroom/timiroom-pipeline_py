@@ -316,7 +316,8 @@ def normalize_feature_contract(spec: dict, auth_required: bool) -> dict:
 
 
 _PRE_AUTH_ROUTE = re.compile(
-    r"^/api/v1/auth/(?:signup|register|registrations|login|refresh|token/refresh"
+    r"^/api/v1/auth/(?:signup|sign-up|register|registrations|login|sign-in"
+    r"|refresh|refresh-tokens?|token-refresh|tokens?/refresh"
     r"|password-reset[a-z-]*|forgot-password|verify-email|email-verifications?)(?:/|$)"
 )
 
