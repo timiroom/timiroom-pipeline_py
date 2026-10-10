@@ -52,9 +52,19 @@ class FormToQueryService:
 
     def extract_all_included_features(self, form: FormData) -> list[str]:
         fd = form.feature_definition
-        return (self._get_must(fd)
+        # commonFeatures는 핵심 여정이 아니라 Feature Spec의 supporting
+        # 후보로 전달한다. 핵심 PRD를 부풀리지 않으면서도 입력 기능을
+        # downstream에서 잃지 않게 한다.
+        return (self._get_by_priority(fd, MoSCoW.MUST)
                 + self._get_by_priority(fd, MoSCoW.SHOULD)
                 + self._get_by_priority(fd, MoSCoW.COULD))
+
+    def extract_supporting_features(self, form: FormData) -> list[str]:
+        return [
+            feature.feature_name
+            for feature in (form.feature_definition.common_features or [])
+            if feature.selected and feature.feature_name.strip()
+        ]
 
     def _get_must(self, fd) -> list[str]:
         result = []

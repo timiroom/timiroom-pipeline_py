@@ -9,6 +9,94 @@ from phase3.validation_service import ValidationService
 FEATURES = ["사용자 로그인"]
 
 
+def test_phase3_contract_graph_rejects_disconnected_api_and_db():
+    registry = [{
+        "featureId": "market.list",
+        "name": "물품 목록",
+        "apiContract": [{"method": "GET", "path": "/api/v1/items"}],
+        "dbContract": {"tables": ["items"], "foreignKeys": []},
+    }]
+    errors = []
+    SchemaValidator._check_contract_graph(
+        {
+            "tables": [{
+                "name": "items",
+                "featureIds": [],
+                "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
+            }],
+        },
+        {"endpoints": [{
+            "method": "GET",
+            "path": "/api/v1/other-items",
+            "featureId": "market.list",
+        }]},
+        registry,
+        lambda code, _target, message: errors.append((code, message)),
+    )
+    codes = {code for code, _message in errors}
+    assert "CONTRACT_GRAPH_API_DB_DISCONNECTED" in codes
+    assert "CONTRACT_GRAPH_DB_FEATURE_DISCONNECTED" in codes
+
+
+def test_phase3_contract_graph_accepts_connected_contracts():
+    registry = [{
+        "featureId": "market.list",
+        "name": "물품 목록",
+        "apiContract": [{"method": "GET", "path": "/api/v1/items"}],
+        "dbContract": {"tables": ["items"], "foreignKeys": []},
+    }]
+    errors = []
+    SchemaValidator._check_contract_graph(
+        {
+            "tables": [{
+                "name": "items",
+                "featureIds": ["market.list"],
+                "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
+            }],
+        },
+        {"endpoints": [{
+            "method": "GET",
+            "path": "/api/v1/items",
+            "featureId": "market.list",
+        }]},
+        registry,
+        lambda code, _target, message: errors.append((code, message)),
+    )
+    assert errors == []
+
+
+def test_phase3_contract_graph_requires_every_api_contract_endpoint():
+    registry = [{
+        "featureId": "market.list",
+        "name": "물품 목록",
+        "apiContract": [
+            {"method": "GET", "path": "/api/v1/items"},
+            {"method": "POST", "path": "/api/v1/items"},
+        ],
+        "dbContract": {"tables": ["items"], "foreignKeys": []},
+    }]
+    errors = []
+    SchemaValidator._check_contract_graph(
+        {
+            "tables": [{
+                "name": "items",
+                "featureIds": ["market.list"],
+                "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
+            }],
+        },
+        {"endpoints": [{
+            "method": "GET",
+            "path": "/api/v1/items",
+            "featureId": "market.list",
+        }]},
+        registry,
+        lambda code, _target, message: errors.append((code, message)),
+    )
+
+    assert any(code == "CONTRACT_GRAPH_API_DB_DISCONNECTED" for code, _ in errors)
+    assert any("POST /items" in message for _code, message in errors)
+
+
 def _db() -> dict:
     return {
         "tables": [
@@ -75,6 +163,32 @@ def test_empty_objects_are_rejected():
 
     assert result.success is False
     assert {"DB_TABLES_REQUIRED", "API_ENDPOINTS_REQUIRED", "PRD_FIELDS_REQUIRED"} <= set(result.error_codes)
+
+
+def test_phase3_fk_missing_target_is_structured_even_without_foreign_key_token():
+    db = {
+        "tables": [
+            {"name": "users", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
+            {"name": "messages", "columns": [
+                {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+                {"name": "sender_id", "type": "BIGINT", "constraints": "NOT_NULL"},
+                {"name": "mystery_id", "type": "BIGINT", "constraints": "NOT_NULL"},
+            ]},
+        ],
+        "relationships": ["users (1:N) messages"],
+    }
+    result = SchemaValidator().validate(
+        FEATURES,
+        json.dumps(db),
+        json.dumps(_api()),
+        json.dumps(_prd(), ensure_ascii=False),
+    )
+
+    assert "DB_FOREIGN_KEY_TARGET_MISSING" in result.error_codes
+    detail = next(item for item in result.blocker_details if item["code"] == "DB_FOREIGN_KEY_TARGET_MISSING")
+    assert detail["table"] == "messages"
+    assert detail["column"] == "mystery_id"
+    assert detail["repairScope"] == "table_column"
 
 
 def test_malformed_array_items_are_rejected_without_crashing():

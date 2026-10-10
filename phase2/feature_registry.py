@@ -166,6 +166,38 @@ def normalize_feature_registry(
             normalized.append(value)
             known_names.add(name)
             used_ids.add(value["id"])
+    # 하나의 REST route는 최종 API 산출물에서 하나의 featureId만 가질 수
+    # 있다. LLM/repair가 같은 auth 계약을 여러 supporting 기능에 복사하면
+    # 어느 기능에도 안정적으로 연결되지 않으므로 Registry에서 소유자를
+    # 결정론적으로 하나만 선택한다. 인증 route는 이름이 실제 인증 기능인
+    # 항목을 우선하고, 그 외 중복은 Registry 순서를 따른다.
+    auth_terms = ("login", "signin", "로그인", "register", "회원가입", "signup", "logout", "로그아웃")
+    contract_owner: dict[tuple[str, str], tuple[int, int]] = {}
+    for index, item in enumerate(normalized):
+        for contract in item.get("apiContract") or []:
+            if not isinstance(contract, dict):
+                continue
+            key = (
+                str(contract.get("method") or "GET").upper(),
+                _normalize_api_path(contract.get("path")),
+            )
+            score = 1 if any(term in str(item.get("name") or "").casefold() for term in auth_terms) else 0
+            previous = contract_owner.get(key)
+            if previous is None or (score, -index) > (previous[1], -previous[0]):
+                contract_owner[key] = (index, score)
+    for index, item in enumerate(normalized):
+        kept = []
+        for contract in item.get("apiContract") or []:
+            if not isinstance(contract, dict):
+                continue
+            key = (
+                str(contract.get("method") or "GET").upper(),
+                _normalize_api_path(contract.get("path")),
+            )
+            if contract_owner.get(key, (index, 0))[0] == index:
+                kept.append(contract)
+        item["apiContract"] = kept
+        item["api"] = kept
     return normalized
 
 

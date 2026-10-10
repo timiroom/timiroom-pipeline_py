@@ -44,6 +44,27 @@ class ValidationService:
             validation_repair_targets=result.repair_targets,
         )
 
+        # SchemaValidator가 만든 table/column/endpoint 단위 target을 QA가
+        # 만든 blocker detail과 합쳐 targeted repair 입력으로 보존한다.
+        blocker_details = [
+            detail for detail in (state.qa_blocker_details or [])
+            if isinstance(detail, dict)
+        ]
+        for detail in result.blocker_details:
+            if not isinstance(detail, dict):
+                continue
+            identity = (
+                detail.get("code"),
+                detail.get("artifactKey"),
+                detail.get("message"),
+            )
+            if not any(
+                (item.get("code"), item.get("artifactKey"), item.get("message")) == identity
+                for item in blocker_details
+            ):
+                blocker_details.append(detail)
+        normalized = normalized.copy(qa_blocker_details=blocker_details)
+
         qa_errors = (
             list(state.qa_db_blockers or state.qa_db_issues)
             + list(state.qa_api_blockers or state.qa_api_issues)

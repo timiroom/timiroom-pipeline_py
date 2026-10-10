@@ -15,6 +15,7 @@ class PipelineState:
     target_users: list[Any] = field(default_factory=list)
 
     must_features: list[str] = field(default_factory=list)
+    supporting_feature_names: list[str] = field(default_factory=list)
     should_features: list[str] = field(default_factory=list)
     could_features: list[str] = field(default_factory=list)
     excluded_features: list[str] = field(default_factory=list)

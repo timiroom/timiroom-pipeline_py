@@ -5,6 +5,7 @@ import pytest
 
 from phase2.agents.api_agent import (
     ApiAgent,
+    api_self_check,
     _endpoint_soft_cap,
     _normalize_endpoints,
     _prune_plan,
@@ -36,6 +37,51 @@ class _GraphResult:
 
     async def ainvoke(self, _state):
         return self.value
+
+
+def test_api_self_check_removes_unknown_and_duplicate_endpoints():
+    registry = [{
+        "featureId": "market.list",
+        "name": "물품 목록",
+        "apiContract": [{"method": "GET", "path": "/api/v1/items"}],
+    }]
+    endpoints, issues = api_self_check([
+        {
+            "method": "GET", "path": "/api/v1/items", "featureId": "market.list",
+            "description": "물품 목록 조회", "requestBody": "없음",
+            "successResponse": "items: array", "errorCodes": "404 — 목록 없음",
+        },
+        {
+            "method": "GET", "path": "/api/v1/items", "featureId": "market.list",
+            "description": "물품 목록 조회", "requestBody": "없음",
+            "successResponse": "items: array", "errorCodes": "404 — 목록 없음",
+        },
+        {"method": "POST", "path": "/api/v1/reports", "featureId": "unknown.feature"},
+    ], registry)
+    assert endpoints
+    assert any(issue.startswith("API_FEATURE_ID_REQUIRED:") for issue in issues)
+    assert len([item for item in endpoints if item.get("featureId") == "market.list"]) == 1
+
+
+def test_api_self_check_reports_contract_path_and_placeholder_details():
+    registry = [{
+        "featureId": "market.create",
+        "name": "물품 등록",
+        "apiContract": [{"method": "POST", "path": "/api/v1/items"}],
+    }]
+    endpoints, issues = api_self_check([{
+        "method": "POST",
+        "path": "/api/v1/item-register",
+        "featureId": "market.create",
+        "description": "물품 등록",
+        "requestBody": "계약 기반 요청 본문",
+        "successResponse": "success: boolean",
+        "errorCodes": "400 — 요청 오류",
+    }], registry)
+
+    assert any(issue.startswith("API_CONTRACT_PATH_MISMATCH:") for issue in issues)
+    assert any(issue.startswith("API_CONTRACT_DETAIL_PLACEHOLDER:") for issue in issues)
+    assert any(endpoint.get("path") == "/api/v1/items" for endpoint in endpoints)
 
 
 class _Progress:
