@@ -270,3 +270,112 @@ def classify_issue(message: str) -> IssueSeverity:
     if any(token in lowered for token in warning_tokens):
         return IssueSeverity.WARNING
     return IssueSeverity.ERROR
+
+
+def normalize_feature_contract(spec: dict, auth_required: bool) -> dict:
+    normalized = dict(spec)
+    raw_ownership = normalized.get("ownership")
+    if isinstance(raw_ownership, dict):
+        scope = str(raw_ownership.get("scope") or "").upper()
+    else:
+        ownership_values = [raw_ownership] if isinstance(raw_ownership, str) else (raw_ownership or [])
+        ownership_text = " ".join(str(value) for value in ownership_values).upper()
+        scope = next((value for value in ("USER", "SHARED", "PUBLIC") if value in ownership_text), "")
+    if feature_requires_user_scope(normalized):
+        scope = "USER"
+    if scope not in {"USER", "SHARED", "PUBLIC", "SYSTEM"}:
+        scope = "USER" if auth_required or feature_requires_user_scope(normalized) else "PUBLIC"
+    normalized["ownership"] = {
+        "scope": scope,
+        "ownerEntity": "users" if scope in {"USER", "SHARED"} else "",
+        "ownerKey": "user_id" if scope in {"USER", "SHARED"} else "",
+        "access": (
+            "인증 주체의 소유권 또는 명시된 역할을 검증"
+            if scope in {"USER", "SHARED"} else "인증 없이 허용된 공개 범위"
+        ),
+    }
+    if isinstance(raw_ownership, dict) and scope in {"USER", "SHARED"}:
+        for key in ("ownerEntity", "ownerKey", "access"):
+            if raw_ownership.get(key):
+                normalized["ownership"][key] = raw_ownership[key]
+    for key in ("states", "stateTransitions", "transactionRules"):
+        values = [
+            str(value).strip() for value in normalized.get(key) or []
+            if str(value).strip() and str(value).strip().upper() != "NONE"
+        ]
+        normalized[key] = list(dict.fromkeys(values))
+    if normalized["states"] and not normalized["stateTransitions"]:
+        normalized["stateTransitions"] = [
+            "현재 상태 → 요청 상태: 기능별 선행 조건과 권한 검증 성공"
+        ]
+    if not normalized["transactionRules"]:
+        normalized["transactionRules"] = [
+            f"{normalized.get('name', '기능')}의 연관 데이터 변경은 한 트랜잭션으로 처리하고 실패 시 롤백한다"
+        ]
+    return normalized
+
+
+_PRE_AUTH_ROUTE = re.compile(
+    r"^/api/v1/auth/(?:signup|sign-up|register|registrations|login|sign-in"
+    r"|refresh|refresh-tokens?|token-refresh|tokens?/refresh"
+    r"|password-reset[a-z-]*|forgot-password|verify-email|email-verifications?)(?:/|$)"
+)
+
+
+def is_pre_auth_route(path: Any) -> bool:
+    """Identity routes a caller must reach before holding a session."""
+    return bool(_PRE_AUTH_ROUTE.match(normalize_api_path(str(path or ""))))
+
+
+def canonical_api_method(method: Any, path: Any) -> str:
+    """Canonical HTTP method shared by registry contracts and the generated API spec.
+
+    Updates addressed through a path variable are published as PATCH, so a registry
+    contract declared as PUT must be compared in the same form.
+    """
+    value = str(method or "GET").strip().upper()
+    return "PATCH" if value == "PUT" and "{" in str(path or "") else value
+
+
+def route_contract_table(path: Any, candidates: list[str]) -> str | None:
+    """Table named by the most specific resource segment of a route, among a feature's contract tables.
+
+    ``/teams/{id}/members`` names ``team_members``; ``/tasks/{id}/status`` names no table of
+    its own and falls back to ``tasks``. An ambiguous segment is resolved by the parent
+    named earlier in the route, otherwise left undecided instead of guessing the parent.
+    """
+    route = normalize_api_path(str(path or "")).removeprefix("/api/v1/")
+    segments = [part.replace("-", "_") for part in route.split("/") if part and not part.startswith("{")]
+    for index in range(len(segments) - 1, -1, -1):
+        segment = segments[index]
+        matched = [name for name in candidates if name == segment or name.endswith(f"_{segment}")]
+        if len(matched) == 1:
+            return matched[0]
+        if matched:
+            parents = set()
+            for earlier in segments[:index]:
+                parents.add(earlier)
+                parents.add(earlier[:-3] + "y" if earlier.endswith("ies") else earlier.removesuffix("s"))
+            narrowed = [name for name in matched if any(name.startswith(f"{parent}_") for parent in parents)]
+            if len(narrowed) == 1:
+                return narrowed[0]
+            return segment if segment in matched else None
+    return None
+
+
+def endpoint_feature_table(path: Any, mapping: dict | None, table_names) -> str:
+    """Table an endpoint is checked against: the one its route names within the feature
+    contract, else the feature's primary table. Shared by API finalization and QA."""
+    if not isinstance(mapping, dict):
+        return ""
+    declared = [str(name) for name in mapping.get("tables") or [] if str(name) in table_names]
+    return route_contract_table(path, declared) or str(mapping.get("table") or "")
+
+
+def normalize_api_path(path: str) -> str:
+    """Canonical public path shared by registry, generation and repair."""
+    value = "/" + str(path or "").strip().lstrip("/")
+    value = re.sub(r"/{2,}", "/", value)
+    while re.match(r"^/(?:api(?:/v\d+)?|v\d+)(?=/|$)", value, re.I):
+        value = re.sub(r"^/(?:api(?:/v\d+)?|v\d+)(?=/|$)", "", value, count=1, flags=re.I)
+    return ("/api/v1/" + value.lstrip("/")).rstrip("/")

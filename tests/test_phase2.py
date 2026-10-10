@@ -5,12 +5,12 @@ import pytest
 
 from phase2.agents.api_agent import (
     ApiAgent,
-    api_self_check,
     _endpoint_soft_cap,
     _normalize_endpoints,
     _prune_plan,
     _sanitize_plan_paths,
     _semantic_endpoint_key,
+    api_self_check,
 )
 from phase2.agents.dba_agent import (
     DbaAgent,

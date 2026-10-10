@@ -3,6 +3,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from phase2.agent_contract import canonical_api_method, is_pre_auth_route
 from phase2.agents.api_agent import _canonical_api_path, _invalid_paths
 from phase2.agents.dba_agent import USER_REFERENCE_STEMS
 from phase2.feature_coverage import strictly_uncovered_features, uncovered_features
@@ -39,6 +40,14 @@ class ValidationResult:
     normalized_prd_document: str | None = None
     blocker_details: list[dict] = field(default_factory=list)
 
+    @classmethod
+    def ok(cls) -> "ValidationResult":
+        return cls(success=True, errors=[])
+
+    @classmethod
+    def fail(cls, errors: list[str]) -> "ValidationResult":
+        return cls(success=False, errors=errors)
+
     def errors_to_string(self) -> str:
         return "\n".join(self.errors)
 
@@ -49,9 +58,16 @@ class SchemaValidator:
         feature_list: list[str],
         db_schema: str,
         api_spec: str,
-        prd_document: str = "",
+        prd_document: str | list[dict] = "",
         feature_registry: list[dict] | None = None,
+        feature_specs: list[dict] | None = None,
     ) -> ValidationResult:
+        # Older callers pass feature specs as the fourth argument. Keep that
+        # contract while supporting the full PRD and Registry validation path.
+        legacy_specs = isinstance(prd_document, list)
+        if legacy_specs:
+            feature_specs = feature_specs or prd_document
+            prd_document = ""
         errors: list[str] = []
         codes: list[str] = []
         targets: set[str] = set()
@@ -96,7 +112,9 @@ class SchemaValidator:
 
         db, normalized_db = self._parse_object(db_schema, "DB 스키마", "DB_JSON", "db", add)
         api, normalized_api = self._parse_object(api_spec, "API 스펙", "API_JSON", "api", add)
-        prd, normalized_prd = self._parse_object(prd_document, "PRD 문서", "PRD_JSON", "prd", add)
+        prd, normalized_prd = (None, None) if legacy_specs else self._parse_object(
+            prd_document, "PRD 문서", "PRD_JSON", "prd", add,
+        )
 
         raw_features = feature_list or []
         cleaned_features = [value.strip() for value in raw_features if isinstance(value, str) and value.strip()]
@@ -119,6 +137,11 @@ class SchemaValidator:
                 self._check_contract_graph(db, api, feature_registry, add)
         if db is not None and prd is not None:
             self._check_prd_db_entities(prd, db, add)
+
+        if feature_specs and db is not None and api is not None:
+            for error in self._check_feature_contracts(feature_specs, db_schema, api_spec):
+                target = "db" if error.startswith("DB ") else "api" if error.startswith("API ") else "prd"
+                add(f"{target.upper()}_FEATURE_CONTRACT", target, error)
 
         if errors:
             logger.warning("검증 실패 — %d개 오류: %s", len(errors), errors)
@@ -276,7 +299,14 @@ class SchemaValidator:
         else:
             missing = strictly_uncovered_features(
                 backend_features(feature_list),
-                [str(endpoint.get("description", "")) for endpoint in endpoints if isinstance(endpoint, dict)],
+                [
+                    f"{endpoint.get('featureName', '')} {endpoint.get('description', '')}"
+                    for endpoint in endpoints if isinstance(endpoint, dict)
+                ] + [
+                    str(item.get("featureName") or "")
+                    for item in data.get("featureMappings") or []
+                    if isinstance(item, dict) and item.get("operations")
+                ],
             )
             if missing:
                 add("API_FEATURE_COVERAGE", "api", f"API 스펙: 기능에 대응하는 endpoint가 없어 보입니다 — {missing}")
@@ -527,3 +557,105 @@ class SchemaValidator:
         if tail in {"file", "document", "pdf"}:
             candidates.update({"file", "files", "documents"})
         return candidates
+
+    def _check_api_coverage(self, api_spec: str, feature_list: list[str]) -> list[str]:
+        data = try_parse_json(api_spec)
+        if not isinstance(data, dict):
+            return []
+        errors = []
+        def add(code, _target, message):
+            if code in {"API_FEATURE_COVERAGE", "API_PATH_INVALID"}:
+                errors.append(message)
+        self._check_api(data, feature_list, add)
+        return errors
+
+    def _check_feature_contracts(
+        self, feature_specs: list[dict], db_schema: str, api_spec: str,
+    ) -> list[str]:
+        db = try_parse_json(db_schema) or {}
+        api = try_parse_json(api_spec) or {}
+        tables = {
+            str(table.get("name") or ""): table
+            for table in db.get("tables") or [] if isinstance(table, dict) and table.get("name")
+        }
+        db_mappings = {
+            str(item.get("featureName") or ""): item
+            for item in db.get("featureMappings") or [] if isinstance(item, dict)
+        }
+        api_mappings = {
+            str(item.get("featureName") or ""): item
+            for item in api.get("featureMappings") or [] if isinstance(item, dict)
+        }
+        endpoints = {
+            (str(ep.get("method") or "").upper(), str(ep.get("path") or "")): ep
+            for ep in api.get("endpoints") or [] if isinstance(ep, dict)
+        }
+        errors: list[str] = []
+        for spec in feature_specs:
+            if not isinstance(spec, dict) or not spec.get("name"):
+                continue
+            name = str(spec["name"])
+            ownership = spec.get("ownership") if isinstance(spec.get("ownership"), dict) else {}
+            scope = str(ownership.get("scope") or "").upper()
+            owner_entity = str(ownership.get("ownerEntity") or "users")
+            owner_key = str(ownership.get("ownerKey") or "user_id")
+            db_contract = spec.get("dbContract") if isinstance(spec.get("dbContract"), dict) else {}
+            for declared in db_contract.get("tables") or []:
+                declared_table = str(
+                    declared.get("name") or declared.get("table") or ""
+                ) if isinstance(declared, dict) else str(declared)
+                if declared_table and declared_table not in tables:
+                    errors.append(f"DB 기능 계약 테이블 누락: {name} → {declared_table}")
+            for operation in spec.get("apiContract") or []:
+                if not isinstance(operation, dict):
+                    continue
+                key = (
+                    canonical_api_method(operation.get("method"), operation.get("path")),
+                    str(operation.get("path") or ""),
+                )
+                if key[1] and key not in endpoints:
+                    errors.append(f"API 기능 계약 엔드포인트 누락: {name} → {key[0]} {key[1]}")
+            if not spec.get("transactionRules"):
+                errors.append(f"기능 계약: 트랜잭션 규칙 누락 — {name}")
+            if spec.get("states") and not spec.get("stateTransitions"):
+                errors.append(f"기능 계약: 상태 전이 누락 — {name}")
+            db_mapping = db_mappings.get(name)
+            table_name = str((db_mapping or {}).get("table") or "")
+            if not db_mapping or not table_name or table_name not in tables:
+                errors.append(f"DB 기능 매핑 누락: {name}")
+            elif scope in {"USER", "SHARED"} and table_name not in {owner_entity, "refresh_tokens"}:
+                columns = {
+                    str(column.get("name") or ""): str(column.get("constraints") or "")
+                    for column in tables[table_name].get("columns") or [] if isinstance(column, dict)
+                }
+                owner_reference = re.search(
+                    rf"\bREFERENCES\s+{re.escape(owner_entity)}\s*\(",
+                    columns.get(owner_key, ""), re.IGNORECASE,
+                )
+                if not owner_reference or owner_entity not in tables:
+                    errors.append(
+                        f"DB 사용자 소유 FK 누락: {name} → {table_name}.{owner_key} REFERENCES {owner_entity}(id)"
+                    )
+            api_mapping = api_mappings.get(name)
+            operations = (api_mapping or {}).get("operations") or []
+            if not operations:
+                errors.append(f"API 기능 매핑 누락: {name}")
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    continue
+                key = (str(operation.get("method") or "").upper(), str(operation.get("path") or ""))
+                endpoint = endpoints.get(key)
+                if not endpoint:
+                    errors.append(f"API 기능 매핑 대상 없음: {name} → {key[0]} {key[1]}")
+                    continue
+                if scope in {"USER", "SHARED"} and not (
+                    key[1].endswith(("/signup", "/login", "/refresh")) or is_pre_auth_route(key[1])
+                ):
+                    if not endpoint.get("authRequired"):
+                        errors.append(f"API 사용자 소유 기능 인증 누락: {key[0]} {key[1]}")
+                for field in ("requestBody", "successResponse", "errorCodes"):
+                    if not str(endpoint.get(field) or "").strip():
+                        errors.append(f"API {field} 계약 누락: {key[0]} {key[1]}")
+                if key[0] in {"POST", "PATCH", "PUT", "DELETE"} and not endpoint.get("transactionRules"):
+                    errors.append(f"API 트랜잭션 계약 누락: {key[0]} {key[1]}")
+        return list(dict.fromkeys(errors))

@@ -2,12 +2,13 @@ import asyncio
 import json
 import logging
 
-from phase2.agents.api_agent import ApiAgent
+from phase2.agents.api_agent import ApiAgent, _api_feature_mappings, finalize_api_contracts
 from phase2.agents.dba_agent import DbaAgent
 from phase2.agents.pm_agent import PmAgent
-from phase2.agents.prd_agent import PrdAgent
+from phase2.agents.prd_agent import PrdAgent, sync_core_features_with_registry
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent
+from phase2.json_utils import try_parse_json
 from phase2.sse_service import PipelineProgressService
 from phase2.state import PipelineState
 
@@ -66,18 +67,24 @@ class OrchestrationGraph:
             if dump:
                 dump.log_state("SEARCH", after_search)
 
-            self._progress.send(pipeline_id, "PM", "기능 분석 및 설계 지시 생성 중...", 40)
-            after_pm = await self._pm.execute(after_search, dump)
+            self._progress.send(pipeline_id, "PRD", "PRD 문서 작성 중...", 40)
+            after_prd = await self._prd.execute(after_search, dump)
+            self._progress.send(pipeline_id, "PM", "PRD 기준 기능 및 설계 계약 확정 중...", 50)
+            after_pm = await self._pm.execute(after_prd, dump)
             if dump:
                 dump.log_state("PM", after_pm)
 
-            self._progress.send(pipeline_id, "PRD", "PRD 문서 작성 중...", 50)
-            after_prd_dba_api = await self._run_prd_with_rollback(after_pm, pipeline_id, dump)
+            after_prd_dba_api = await self._run_prd_with_rollback(
+                after_pm, pipeline_id, dump, prd_ready=True,
+            )
+            after_prd_dba_api = self._align_api_to_final_db(after_prd_dba_api)
             if dump:
                 dump.log_state("PRD_DBA_API", after_prd_dba_api)
 
             self._progress.send(pipeline_id, "QA", "QA 검수·수정 중...", 75)
             final_state = await self._qa.execute(after_prd_dba_api, dump)
+            if final_state.qa_repair_issues:
+                final_state = await self._repair_once(final_state, pipeline_id, dump)
             if dump:
                 dump.log_state("QA", final_state)
 
@@ -128,7 +135,7 @@ class OrchestrationGraph:
             self._progress.send(pipeline_id, "PRD_REPAIR", "변경된 기능 목록 기준 산출물을 재생성 중...", 68)
             repaired = await self._run_prd_with_rollback(after_pm, pipeline_id)
             self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
-            return await self._qa.execute(repaired)
+            return await self._qa.execute(self._align_api_to_final_db(repaired))
 
         if not targets:
             logger.warning("선택적 재생성 대상을 판단할 수 없어 QA 정규화 후 Phase 3로 반환")
@@ -137,9 +144,12 @@ class OrchestrationGraph:
         if "prd" in targets:
             self._progress.send(pipeline_id, "PRD_REPAIR", "지적된 PRD 섹션만 수정 중...", 68)
             repair = getattr(self._prd, "repair", None)
-            repaired = await repair(state, validation_error) if callable(repair) else await self._run_prd_with_rollback(state, pipeline_id)
-            self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
-            return await self._qa.execute(repaired)
+            if callable(repair):
+                state = await repair(state, validation_error)
+                targets.remove("prd")
+            else:
+                state = await self._run_prd_with_rollback(state, pipeline_id)
+                targets.clear()
 
         repair_state = state
         tasks = []
@@ -183,7 +193,55 @@ class OrchestrationGraph:
                 )
 
         self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
-        return await self._qa.execute(repair_state)
+        return await self._qa.execute(self._align_api_to_final_db(repair_state))
+
+    @staticmethod
+    def _align_api_to_final_db(state: PipelineState) -> PipelineState:
+        """Reconcile fields after both parallel drafts are available."""
+        api = try_parse_json(state.api_spec)
+        db = try_parse_json(state.db_schema)
+        if not isinstance(api, dict) or not isinstance(db, dict):
+            return state
+        if not isinstance(api.get("endpoints"), list) or not db.get("tables"):
+            return state
+        api["endpoints"] = finalize_api_contracts(
+            api["endpoints"], state.db_schema, state.prd_document,
+            state.feature_list, state.feature_registry, state.context_prompt,
+        )
+        features = [
+            str(item["name"]) for item in state.feature_specs or state.feature_registry
+            if isinstance(item, dict) and item.get("name")
+        ] or state.feature_list
+        api["featureMappings"] = _api_feature_mappings(api["endpoints"], state.db_schema, features)
+        return state.copy(api_spec=json.dumps(api, ensure_ascii=False))
+
+    async def _repair_once(self, state: PipelineState, pipeline_id: str | None, dump=None) -> PipelineState:
+        """Repair only QA findings, with API observing the repaired PRD and DB."""
+        if state.generation_blockers:
+            return state
+        grouped = {"DBA": [], "PRD": [], "API": []}
+        for issue in state.qa_repair_issues:
+            if isinstance(issue, dict) and str(issue.get("agent", "")).upper() in grouped:
+                grouped[str(issue["agent"]).upper()].append(issue)
+        async with asyncio.timeout(self._repair_timeout_seconds):
+            current = state
+            for label, agent in (("DBA", self._dba), ("PRD", self._prd), ("API", self._api)):
+                issues = grouped[label]
+                if label == "API" and grouped["DBA"] and not issues:
+                    issues = [{"agent": "API", "target": "erd-contract", "reason": "DB 계약 변경 반영"}]
+                if not issues:
+                    continue
+                domain = "db" if label == "DBA" else label.lower()
+                if current.targeted_repair_attempts.get(domain, 0) >= 1:
+                    continue
+                current = current.copy(targeted_repair_attempts={
+                    **current.targeted_repair_attempts,
+                    domain: current.targeted_repair_attempts.get(domain, 0) + 1,
+                })
+                self._progress.send(pipeline_id, f"{label}_PATCH", f"{label} 검증 실패 항목 수정 중...", 80)
+                current = await self._repair_agent(agent, current, json.dumps(issues, ensure_ascii=False))
+            self._progress.send(pipeline_id, "QA_RECHECK", "수정된 문서 관계 재검증 중...", 88)
+            return await self._qa.execute(self._align_api_to_final_db(current), dump)
 
     @staticmethod
     async def _repair_agent(agent, state: PipelineState, feedback: str) -> PipelineState:
@@ -206,17 +264,17 @@ class OrchestrationGraph:
         )
 
     async def _run_prd_with_rollback(
-        self, pm_state: PipelineState, pipeline_id: str | None, dump=None
+        self, pm_state: PipelineState, pipeline_id: str | None, dump=None, *, prd_ready: bool = False
     ) -> PipelineState:
         current = pm_state
 
         # PRD repair는 최대 한 번만 수행한다. 동일 blocker는 Phase3 blocker로 남긴다.
         for attempt in range(2):
             logger.info("PRD 에이전트 실행 중... (시도 %d)", attempt + 1)
-            after_prd = await self._prd.execute(current, dump)
+            after_prd = current if prd_ready and attempt == 0 else await self._prd.execute(current, dump)
             if self._feature_spec is not None:
                 self._progress.send(pipeline_id, "FEATURE_SPEC", "기능명세서 및 지원 기능 확정 중...", 55)
-                after_prd = await self._feature_spec.execute(after_prd, dump)
+                after_prd = sync_core_features_with_registry(await self._feature_spec.execute(after_prd, dump))
 
             # DBA·API는 rag-pipeline과 동일하게 독립적으로 병렬 실행 (교차 주입 없음)
             self._progress.send(pipeline_id, "DBA_API", "DB 스키마 · API 설계 중...", 60)
@@ -238,7 +296,7 @@ class OrchestrationGraph:
                     api_spec=api_result.api_spec,
                 )
 
-            if attempt < 2:
+            if attempt < 1:
                 feedback = "\n".join(
                     item for item in (
                         dba_result.prd_feedback_from_dba,
@@ -299,7 +357,9 @@ class OrchestrationGraph:
                             pipeline_id, "FEATURE_SPEC_RESYNC",
                             "수정된 PRD 기준 기능 계약 재동기화 중...", 70,
                         )
-                        resynced = await self._feature_spec.execute(resynced, dump)
+                        resynced = sync_core_features_with_registry(
+                            await self._feature_spec.execute(resynced, dump)
+                        )
 
                     if changed_ids and not repeated_repair:
                         repair_domains.update(self._changed_registry_domains(
@@ -377,6 +437,8 @@ class OrchestrationGraph:
                 return self._merge_agent_quality(after_prd, dba_result, api_result).copy(
                     db_schema=dba_result.db_schema,
                     api_spec=api_result.api_spec,
+                    prd_feedback_from_dba=dba_result.prd_feedback_from_dba,
+                    prd_feedback_from_api=api_result.prd_feedback_from_api,
                 )
 
         return current
