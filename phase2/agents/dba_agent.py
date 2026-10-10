@@ -37,6 +37,21 @@ _PRESENCE_PENALTY = 0.0
 # temp=1.0은 실행마다 편차를 키우므로 이 단계만 낮춰 완성도/재현성을 높인다.
 _PLAN_TEMPERATURE = 0.4
 
+# 사용자 역할을 나타내는 FK 컬럼명. 도메인 테이블명과 무관하게
+# ``sender_id``/``reporter_id``처럼 생성되는 컬럼을 users(id)에 연결한다.
+USER_REFERENCE_STEMS = frozenset({
+    "actor", "owner", "creator", "author", "sender", "receiver", "recipient",
+    "reporter", "reviewer", "reviewee", "commenter", "moderator", "uploader",
+    "assignee", "signer", "renter", "borrower", "requester", "provider",
+    "buyer", "seller", "member", "customer", "client", "operator", "student",
+    "teacher", "instructor", "participant", "applicant", "beneficiary", "subscriber",
+    "manager", "approver", "admin", "administrator", "staff", "coordinator",
+    "organizer", "supervisor", "volunteer", "host", "leader",
+})
+EXTERNAL_OR_POLYMORPHIC_FK_STEMS = frozenset({
+    "target", "feature", "provider_message", "provider_route",
+})
+
 WORKER_SYSTEM = "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."
 
 MANAGER_SYSTEM = """당신은 시니어 DBA 겸 DB manager입니다.
@@ -164,6 +179,9 @@ def _table_name_variants(name: str) -> set[str]:
         # classes -> class. 단순히 마지막 s 하나만 제거하면 classe가 되어
         # class_id FK를 classes 테이블에 연결하지 못한다.
         variants.add(name[:-2])
+    elif name.endswith(("ches", "shes", "xes", "zes", "ses")):
+        # -es 복수형은 마지막 s 하나만 제거하면 잘못된 alias가 된다.
+        variants.add(name[:-2])
     elif name.endswith("s"):
         variants.add(name[:-1])
     else:
@@ -277,12 +295,18 @@ def annotate_table_feature_ids(tables: list[dict], registry: list[dict] | None) 
         if not isinstance(table, dict) or not table.get("name"):
             continue
         ids = by_table.get(str(table["name"]).strip(), [])
-        if ids:
-            table["featureIds"] = sorted(set(ids))
+        # 기존 worker가 남긴 feature_### 같은 stale ID를 보존하지 않는다.
+        # 매번 Registry 계약에서 계산한 값으로 덮어써야 그래프에 고립 노드가
+        # 남지 않고, 계약이 없는 테이블은 빈 배열로 명시된다.
+        table["featureIds"] = sorted(set(ids))
     return tables
 
 
-def _fk_target(col_name, name_lookup: dict[str, str]) -> str | None:
+def _fk_target(
+    col_name,
+    name_lookup: dict[str, str],
+    current_table: str | None = None,
+) -> str | None:
     """FK 패턴 컬럼명(`<참조테이블>_id`)에서 참조 대상 테이블명을 해석. FK가 아니면 None."""
     if not isinstance(col_name, str) or col_name == "id" or not col_name.endswith("_id"):
         return None
@@ -290,6 +314,37 @@ def _fk_target(col_name, name_lookup: dict[str, str]) -> str | None:
     direct = name_lookup.get(stem)
     if direct:
         return direct
+    # 관계형 컬럼은 ``parent_course_id``처럼 역할 접두사와 함께 생성될 수
+    # 있다. 현재 테이블의 단수형과 일치하면 도메인명에 의존하지 않고
+    # 자기참조 FK로 확정한다.
+    if current_table:
+        current_name = str(current_table)
+        current_variants = _table_name_variants(current_name)
+        tail = current_name.rsplit("_", 1)[-1]
+        current_variants.update(_table_name_variants(tail))
+        current_variants.add(tail.removesuffix("s"))
+        if re.fullmatch(r"feature_\d+_records", current_name) and stem in {"parent_feature", "parent_record"}:
+            return current_name
+        for prefix in ("parent", "root", "previous", "next"):
+            if stem in {f"{prefix}_{value}" for value in current_variants}:
+                return current_name
+    # 출발지/도착지처럼 컬럼명에 역할이 붙은 FK는 역할을 제거한 엔티티
+    # 이름으로 계약 테이블을 찾는다. provider는 외부 식별자일 수 있으므로
+    # 자동 연결하지 않는다.
+    for prefix in ("from", "to", "source", "destination", "start", "end"):
+        marker = f"{prefix}_"
+        if stem.startswith(marker):
+            base = stem[len(marker):]
+            target = name_lookup.get(base)
+            if not target:
+                matches = {
+                    table_name for variant, table_name in name_lookup.items()
+                    if variant == base or variant.endswith(f"_{base}")
+                }
+                if len(matches) == 1:
+                    target = next(iter(matches))
+            if target:
+                return target
     # refresh token rotation is an internal self-reference.
     if stem == "replaced_by_token":
         # 토큰 회전은 refresh_tokens라는 이름을 쓰기도 하고 password_reset_tokens
@@ -304,18 +359,11 @@ def _fk_target(col_name, name_lookup: dict[str, str]) -> str | None:
         if len(token_tables) == 1:
             return token_tables[0]
     # created_by_id, recorded_by_id, actor_user_id 같은 감사/행위자 FK는 users를 가리킨다.
-    if stem.endswith("_user") or stem.endswith("_by") or stem in {
-        "actor", "owner", "creator", "uploader", "assignee", "reviewer", "signer",
-        "renter", "borrower", "requester", "provider", "buyer", "seller", "owner_user", "created_by_user", "updated_by_user", "recorded_by_user",
-        "processed_by_user", "changed_by_user", "actor_user", "generated_by_user",
-        "user", "student", "member", "customer", "client", "operator",
-        "teacher", "instructor", "participant", "applicant", "requester_user",
-        "recipient", "recipient_user", "beneficiary", "subscriber",
-        "manager", "admin", "administrator", "staff", "coordinator", "organizer", "supervisor",
-        "approver", "volunteer", "host", "leader",
-    }:
-        if "users" in name_lookup:
-            return name_lookup["users"]
+    if (
+        stem.endswith(("_user", "_by", "_manager", "_approver"))
+        or stem in USER_REFERENCE_STEMS
+    ) and "users" in name_lookup:
+        return name_lookup["users"]
     # space_id -> kitchen_spaces처럼 도메인 접두사가 붙은 테이블도 허용한다.
     for variant, table_name in name_lookup.items():
         if stem.endswith(f"_{variant}"):
@@ -540,10 +588,10 @@ def _ensure_fk_references(tables: list[dict], registry: list[dict] | None = None
                 (str(table.get("name") or ""), name),
                 contract_targets.get(("*", name), (None, None)),
             )
-            target = target_table or _fk_target(name, lookup)
+            target = target_table or _fk_target(name, lookup, str(table.get("name") or ""))
             if target_table:
                 target = lookup.get(target_table, target_table if target_table in lookup.values() else None)
-            if not target or (target == table.get("name") and not target_table and name != "replaced_by_token_id"):
+            if not target:
                 # 순번 기반 generic Feature Spec fallback은 실제 도메인 계약이
                 # 아니므로, 존재하지 않는 임의 FK를 제약으로 남기지 않는다.
                 # 명시된 Registry FK는 contract_targets 경로에서 보존된다.
@@ -716,6 +764,83 @@ def _normalize_relationships(relationships: list | None, tables: list[dict]) -> 
         if relationship not in normalized:
             normalized.append(relationship)
     return sorted(normalized)
+
+
+def dba_self_check(
+    tables: list[dict],
+    relationships: list[str] | None = None,
+    registry: list[dict] | None = None,
+) -> tuple[list[dict], list[str], list[str]]:
+    """DBA 결과를 LLM과 독립적으로 보정하고 최종 규칙을 검증한다."""
+    tables = sanitize_tables(list(tables or []))
+    tables, relationships = normalize_table_contract_names(tables, relationships, registry or [])
+    tables = _ensure_contract_tables(tables, registry or [])
+    tables = dedupe_meta_tables(tables)
+    tables = ensure_primary_keys(tables)
+    tables = annotate_table_feature_ids(tables, registry or [])
+    valid_feature_ids = {
+        str(item.get("featureId") or item.get("id") or "").strip()
+        for item in registry or []
+        if isinstance(item, dict) and str(item.get("featureId") or item.get("id") or "").strip()
+    }
+    # LLM이 이전 featureList의 순번 ID를 섞어 넣으면 지식그래프에 고립된
+    # feature 노드가 생긴다. Registry 밖의 ID는 테이블 계약에서 제거하고,
+    # Registry 계약은 annotate_table_feature_ids로 다시 부착한다.
+    if valid_feature_ids:
+        for table in tables:
+            if isinstance(table, dict) and isinstance(table.get("featureIds"), list):
+                table["featureIds"] = sorted({
+                    str(value).strip()
+                    for value in table["featureIds"]
+                    if str(value).strip() in valid_feature_ids
+                })
+        tables = annotate_table_feature_ids(tables, registry or [])
+    _ensure_fk_references(tables, registry or [])
+    tables = reconcile_fk_types(tables)
+
+    table_names = {
+        str(table.get("name")) for table in tables
+        if isinstance(table, dict) and table.get("name")
+    }
+    lookup = _build_name_lookup(tables)
+    issues: list[str] = []
+    for table in tables:
+        if not isinstance(table, dict) or not table.get("name"):
+            issues.append("DBA_SELF_CHECK_BLOCKER: 테이블명이 비어 있습니다")
+            continue
+        table_name = str(table["name"])
+        columns = table.get("columns") or []
+        if not any(
+            isinstance(column, dict)
+            and "PRIMARY_KEY" in str(column.get("constraints") or "").upper()
+            for column in columns
+        ):
+            issues.append(f"DBA_SELF_CHECK_BLOCKER: {table_name}에 PRIMARY_KEY가 없습니다")
+        for column in columns:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name") or "")
+            constraints = str(column.get("constraints") or "")
+            if not column_name.endswith("_id"):
+                continue
+            stem = column_name[:-3]
+            if stem in EXTERNAL_OR_POLYMORPHIC_FK_STEMS or stem.startswith("target_"):
+                continue
+            reference = re.search(
+                r"\bREFERENCES\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                constraints,
+                re.IGNORECASE,
+            )
+            target = reference.group(1) if reference else None
+            if not target or target.casefold() not in {name.casefold() for name in table_names}:
+                target = _fk_target(column_name, lookup, table_name)
+            if not target or target.casefold() not in {name.casefold() for name in table_names}:
+                issues.append(
+                    f"DBA_SELF_CHECK_BLOCKER: {table_name}.{column_name}의 FK 참조 대상을 찾을 수 없습니다"
+                )
+
+    normalized_relationships = _normalize_relationships(relationships, tables)
+    return tables, normalized_relationships, list(dict.fromkeys(issues))
 
 
 def _pk_column(table: dict) -> tuple[str, str] | None:
@@ -2066,11 +2191,21 @@ class DbaAgent:
     async def execute(self, state: PipelineState, dump=None) -> PipelineState:
         logger.info("DBA 에이전트 시작 (manager plan + 동적 fan-out 서브그래프)")
 
-        source_registry = normalize_feature_registry(
-            state.feature_registry, state.feature_list, preserve_extra=True,
-        )
+        # Feature Spec이 확정한 ID를 downstream에서 다시 순번화하지 않는다.
+        source_registry = [
+            dict(item) for item in (state.feature_registry or [])
+            if isinstance(item, dict) and str(item.get("featureId") or item.get("id") or "").strip()
+        ]
+        if not source_registry:
+            source_registry = normalize_feature_registry(
+                state.feature_registry, state.feature_list, preserve_extra=True,
+            )
         registry_features = [str(item.get("name")) for item in source_registry if item.get("name")]
-        scoped_features = backend_features(registry_features or state.feature_list)
+        # API와 동일하게 Feature Spec 전체를 DB 계약의 기준으로 사용한다.
+        # 일부 supporting 기능을 제외하면 해당 기능의 dbContract가 실제 테이블에
+        # featureId로 부착되지 않아 지식 그래프가 끊긴다.
+        scoped_features = registry_features or list(state.feature_list or [])
+        registry = source_registry
         feature_str = "- " + "\n- ".join(scoped_features) if scoped_features else "(DB 대상 기능 없음)"
         registry = [item for item in source_registry if item.get("name") in scoped_features]
         graph_input: _DbaGraphState = {
@@ -2190,6 +2325,16 @@ class DbaAgent:
         tables = reconcile_fk_types(tables)
         tables = _stable_schema_order(tables)
         relationships = _normalize_relationships(relationships, tables)
+        tables, relationships, self_check_issues = dba_self_check(
+            tables,
+            relationships,
+            registry_items if isinstance(registry_items, list) else [],
+        )
+        if self_check_issues:
+            logger.warning("DBA self-check blocker: %s", self_check_issues)
+        tables = _stable_schema_order(tables)
+        relationships = _normalize_relationships(relationships, tables)
+        mappings = build_feature_mappings(tables, state.feature_specs or registry_items)
         clean = json.dumps({"tables": tables, "relationships": relationships, "featureMappings": mappings}, ensure_ascii=False)
         prd_issues = result.get("prd_issues", "")
 
@@ -2203,9 +2348,13 @@ class DbaAgent:
                 [*state.generation_blockers, blocker] if blocker else state.generation_blockers
             ),
             qa_db_blockers=(
-                [*state.qa_db_blockers, blocker] if blocker else state.qa_db_blockers
+                list(dict.fromkeys([
+                    *state.qa_db_blockers,
+                    *self_check_issues,
+                    *( [blocker] if blocker else [] ),
+                ]))
             ),
-            qa_approved=False if blocker else state.qa_approved,
+            qa_approved=False if blocker or self_check_issues else state.qa_approved,
             status_message="DBA 에이전트 완료 — DB 스키마 생성",
         )
 
@@ -2280,6 +2429,10 @@ class DbaAgent:
             tables = reconcile_fk_types(tables)
             tables = _stable_schema_order(tables)
             relationships = _normalize_relationships(relationships, tables)
+            tables, relationships, self_check_issues = dba_self_check(
+                tables, relationships, registry,
+            )
+            mappings = build_feature_mappings(tables, state.feature_specs or registry)
             repaired = json.dumps({
                 **current, "tables": tables, "relationships": relationships,
                 "featureMappings": mappings,
@@ -2288,6 +2441,9 @@ class DbaAgent:
             return state.copy(
                 db_schema=repaired,
                 prd_feedback_from_dba="",
+                qa_db_blockers=self_check_issues,
+                qa_db_issues=self_check_issues,
+                qa_approved=False if self_check_issues else state.qa_approved,
                 status_message="DBA 에이전트 완료 — 지적 테이블만 수정",
             )
         except Exception as e:

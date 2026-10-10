@@ -158,6 +158,7 @@ async def _run_pipeline_inner(
                 problem_definition=form_data.problem_definition,
                 target_users=form_data.target_users,
                 must_features=form_to_query_svc.extract_must_features(form_data),
+                supporting_feature_names=form_to_query_svc.extract_supporting_features(form_data),
                 excluded_features=form_to_query_svc.extract_excluded_features(form_data),
                 feature_list=form_to_query_svc.extract_all_included_features(form_data),
                 user_query=user_query,
@@ -225,7 +226,11 @@ async def _run_pipeline_inner(
         supporting_count = sum(1 for item in spec_features if isinstance(item, dict) and item.get("source") == "supporting")
         result = {
             "projectName": validated.project_name,
-            "featureList": validated.feature_list,
+            # 내부 Phase/ Kafka 계약은 문자열 feature_list를 유지하지만,
+            # 저장되는 FEATURE_LIST 아티팩트는 Feature Spec 상세 객체를
+            # 우선 사용해야 프론트가 설명·요구사항·계약을 잃지 않는다.
+            "featureNames": validated.feature_list,
+            "featureList": validated.feature_registry,
             "projectPlan": validated.project_plan,
             "featureSpecDocument": feature_spec,
             "featureRegistry": validated.feature_registry,

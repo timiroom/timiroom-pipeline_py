@@ -791,8 +791,9 @@ class PrdAgent:
 
         try:
             market_data = state.market_research or "시장 데이터 없음"
-            feature_str = "- " + "\n- ".join(state.feature_list)
-            feature_count = len(state.feature_list)
+            feature_list = [str(value).strip() for value in (state.feature_list or []) if str(value).strip()]
+            feature_str = "- " + "\n- ".join(feature_list)
+            feature_count = len(feature_list)
             rollback_section = self._build_rollback_section(state) if is_rollback else ""
 
             project_context = state.user_query + "\n[PM projectPlan]\n" + json.dumps(state.project_plan or {}, ensure_ascii=False)
@@ -803,8 +804,8 @@ class PrdAgent:
                     "user_query": project_context,
                     "feature_str": feature_str,
                     "feature_count": feature_count,
-                    "feature_list": state.feature_list,
-                    "feature_registry_text": registry_text(normalize_feature_registry(state.feature_registry, state.feature_list)),
+                    "feature_list": feature_list,
+                    "feature_registry_text": registry_text(normalize_feature_registry(state.feature_registry, feature_list)),
                     "market_data": market_data,
                     "rag_context": state.context_prompt or "",
                     "priority_context": self._priority_context(state),
@@ -828,23 +829,23 @@ class PrdAgent:
                 # coreFeatures 누락 시 fallback — feature_list로 최소 구성
                 if not parsed.get("coreFeatures"):
                     logger.warning("coreFeatures 누락 — feature_list로 fallback 구성")
-                    parsed.update(_fallback_section("coreFeatures", state.feature_list, state.user_query))
+                    parsed.update(_fallback_section("coreFeatures", feature_list, state.user_query))
                 else:
                     # 배치 병합 과정에서 같은 기능이 두 번 들어왔거나 껍데기가 섞였을 수 있어 정리
                     parsed["coreFeatures"] = self._dedup_list(
                         self._drop_empty_features(parsed["coreFeatures"])
                     )
                     parsed["coreFeatures"] = self._limit_core_features(
-                        parsed["coreFeatures"], state.feature_list,
+                        parsed["coreFeatures"], feature_list,
                     )
                     parsed["coreFeatures"] = ensure_registry_core_features(
-                        parsed["coreFeatures"], state.feature_list,
-                        normalize_feature_registry(state.feature_registry, state.feature_list),
+                        parsed["coreFeatures"], feature_list,
+                        normalize_feature_registry(state.feature_registry, feature_list),
                     )
 
                 attach_feature_ids(
                     parsed.get("coreFeatures") or [],
-                    normalize_feature_registry(state.feature_registry, state.feature_list),
+                    normalize_feature_registry(state.feature_registry, feature_list),
                 )
 
                 # 우선순위는 항상 마지막에 정리 — MVP 범위가 확정된 뒤라야 도출할 수 있다
@@ -863,8 +864,27 @@ class PrdAgent:
 
         except Exception as e:
             logger.error("PRD 에이전트 실패: %s", e)
+            # Repair/재실행 중 예외가 나도 이미 성공한 PRD를 빈 객체로
+            # 덮어쓰지 않는다. 빈 PRD는 원인과 무관하게 모든 필수 섹션을
+            # 잃고 Phase3에서 연쇄 blocker를 만든다.
+            preserved = state.prd_document if isinstance(state.prd_document, str) and state.prd_document.strip() else ""
+            if not preserved or not isinstance(try_parse_json(preserved), dict):
+                fallback = {}
+                for section_key in SECTION_PROMPTS:
+                    fallback.update(_fallback_section(section_key, feature_list, state.user_query))
+                fallback["coreFeatures"] = ensure_registry_core_features(
+                    fallback.get("coreFeatures") or [],
+                    feature_list,
+                    normalize_feature_registry(state.feature_registry, feature_list),
+                )
+                attach_feature_ids(
+                    fallback["coreFeatures"],
+                    normalize_feature_registry(state.feature_registry, feature_list),
+                )
+                self._reconcile_priorities(fallback["coreFeatures"], fallback.get("mvpScope"))
+                preserved = json.dumps(fallback, ensure_ascii=False)
             return state.copy(
-                prd_document="{}",
+                prd_document=preserved,
                 status_message=f"PRD 에이전트 실패: {e}",
             )
 

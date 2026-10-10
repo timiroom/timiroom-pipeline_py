@@ -83,8 +83,12 @@ logging.getLogger("aiokafka").setLevel(logging.INFO)
 # ── API 클라이언트 ────────────────────────────────────────────────
 
 openai_http_client = httpx.AsyncClient(trust_env=False)
+# Importing the application module must remain safe for unit tests and tooling
+# that do not invoke an LLM. The real key is still required when an endpoint
+# actually sends a request.
+_openai_api_key = settings.openai_api_key or "test-placeholder-key"
 openai_client = AsyncOpenAI(
-    api_key=settings.openai_api_key,
+    api_key=_openai_api_key,
     base_url=settings.openai_base_url,
     timeout=settings.openai_request_timeout_seconds,
     max_retries=settings.openai_max_retries,

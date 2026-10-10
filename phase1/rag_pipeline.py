@@ -145,6 +145,10 @@ class RagPipelineService:
                 problem_definition=form.problem_definition,
                 target_users=form.target_users,
                 must_features=must_features,
+                supporting_feature_names=(
+                    self._form_to_query.extract_supporting_features(form)
+                    if hasattr(self._form_to_query, "extract_supporting_features") else []
+                ),
                 excluded_features=self._form_to_query.extract_excluded_features(form),
                 feature_list=self._form_to_query.extract_all_included_features(form),
                 context_prompt=context_prompt,
