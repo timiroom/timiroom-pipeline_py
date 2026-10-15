@@ -1,6 +1,8 @@
+import json
 import logging
 
 from phase2.agent_contract import IssueSeverity, classify_issue
+from phase2.openapi_spec import build_openapi_document
 from phase2.state import PipelineState
 from phase3.schema_validator import SchemaValidator
 
@@ -38,13 +40,38 @@ class ValidationService:
             feature_specs=state.feature_specs,
         )
 
+        normalized_api = result.normalized_api_spec or state.api_spec
         normalized = state.copy(
             db_schema=result.normalized_db_schema or state.db_schema,
-            api_spec=result.normalized_api_spec or state.api_spec,
+            api_spec=normalized_api,
+            openapi_spec=json.dumps(
+                build_openapi_document(normalized_api, state.project_name), ensure_ascii=False,
+            ),
             prd_document=result.normalized_prd_document or state.prd_document,
             validation_error_codes=result.error_codes,
             validation_repair_targets=result.repair_targets,
         )
+
+        # SchemaValidator가 만든 table/column/endpoint 단위 target을 QA가
+        # 만든 blocker detail과 합쳐 targeted repair 입력으로 보존한다.
+        blocker_details = [
+            detail for detail in (state.qa_blocker_details or [])
+            if isinstance(detail, dict)
+        ]
+        for detail in result.blocker_details:
+            if not isinstance(detail, dict):
+                continue
+            identity = (
+                detail.get("code"),
+                detail.get("artifactKey"),
+                detail.get("message"),
+            )
+            if not any(
+                (item.get("code"), item.get("artifactKey"), item.get("message")) == identity
+                for item in blocker_details
+            ):
+                blocker_details.append(detail)
+        normalized = normalized.copy(qa_blocker_details=blocker_details)
 
         blocking_details = [
             item for item in state.qa_issue_details

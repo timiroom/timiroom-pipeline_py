@@ -670,7 +670,13 @@ def _normalize_form_data(node: dict) -> dict:
         # commonFeatures: 문자열 아이템 → 객체 변환
         common = fd.get("commonFeatures") or []
         if common and isinstance(common[0], str):
-            fd["commonFeatures"] = [{"featureName": f} for f in common]
+            fd["commonFeatures"] = [{"featureName": f, "selected": True} for f in common]
+        else:
+            # Chat에서 명시적으로 생성된 공통 기능은 사용자가 요청한
+            # supporting 후보이므로 selected 누락을 미선택으로 해석하지 않는다.
+            for cf in common:
+                if isinstance(cf, dict):
+                    cf.setdefault("selected", True)
 
     # problemDefinition 필수 필드 보완
     pd = node.get("problemDefinition")

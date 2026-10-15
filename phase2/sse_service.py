@@ -68,9 +68,16 @@ class PipelineProgressService:
         self._cleanup_terminal_events()
         q = self._get_or_create_queue(pipeline_id)
 
-        # 버퍼에 쌓인 이벤트 먼저 전송
-        for evt in self._buffers.get(pipeline_id, []):
+        # send()는 구독 전 이벤트를 buffer와 queue 양쪽에 넣는다. snapshot을
+        # replay한 뒤 같은 수만큼 queue에서 제거해야 최초 이벤트가 중복되지 않는다.
+        buffered = list(self._buffers.get(pipeline_id, []))
+        for evt in buffered:
             yield self._format(evt["type"], evt["data"])
+        for _ in buffered:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
         # 이미 끝난 파이프라인에 늦게 연결된 구독자는 terminal event를 즉시
         # 재생하고 대기하지 않는다. 이 경로가 Phase3 blocker 확인을 보장한다.

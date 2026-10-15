@@ -1,14 +1,21 @@
 import asyncio
+import copy
+import hashlib
 import json
 import logging
 
-from phase2.agents.api_agent import ApiAgent, _api_feature_mappings, finalize_api_contracts
+from phase2.agents.api_agent import (
+    ApiAgent,
+    _api_feature_mappings,
+    finalize_api_contracts,
+)
 from phase2.agents.dba_agent import DbaAgent
 from phase2.agents.pm_agent import PmAgent
 from phase2.agents.prd_agent import PrdAgent, sync_core_features_with_registry
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent
 from phase2.json_utils import try_parse_json
+from phase2.openapi_spec import build_openapi_document
 from phase2.sse_service import PipelineProgressService
 from phase2.state import PipelineState
 
@@ -173,22 +180,30 @@ class OrchestrationGraph:
                 repair_state = repair_state.copy(
                     db_schema=result.db_schema,
                     prd_feedback_from_dba=result.prd_feedback_from_dba,
+                    targeted_repair_results={
+                        **repair_state.targeted_repair_results,
+                        **result.targeted_repair_results,
+                    },
                     generation_blockers=list(dict.fromkeys(
                         [*repair_state.generation_blockers, *result.generation_blockers]
                     )),
                     qa_db_blockers=list(dict.fromkeys(
-                        [*repair_state.qa_db_blockers, *result.qa_db_blockers]
+                        result.qa_db_blockers
                     )),
                 )
             else:
                 repair_state = repair_state.copy(
                     api_spec=result.api_spec,
                     prd_feedback_from_api=result.prd_feedback_from_api,
+                    targeted_repair_results={
+                        **repair_state.targeted_repair_results,
+                        **result.targeted_repair_results,
+                    },
                     generation_blockers=list(dict.fromkeys(
                         [*repair_state.generation_blockers, *result.generation_blockers]
                     )),
                     qa_api_blockers=list(dict.fromkeys(
-                        [*repair_state.qa_api_blockers, *result.qa_api_blockers]
+                        result.qa_api_blockers
                     )),
                 )
 
@@ -212,8 +227,16 @@ class OrchestrationGraph:
             str(item["name"]) for item in state.feature_specs or state.feature_registry
             if isinstance(item, dict) and item.get("name")
         ] or state.feature_list
-        api["featureMappings"] = _api_feature_mappings(api["endpoints"], state.db_schema, features)
-        return state.copy(api_spec=json.dumps(api, ensure_ascii=False))
+        api["featureMappings"] = _api_feature_mappings(
+            api["endpoints"], state.db_schema, features, state.feature_registry,
+        )
+        api_spec = json.dumps(api, ensure_ascii=False)
+        return state.copy(
+            api_spec=api_spec,
+            openapi_spec=json.dumps(
+                build_openapi_document(api, state.project_name), ensure_ascii=False,
+            ),
+        )
 
     async def _repair_once(self, state: PipelineState, pipeline_id: str | None, dump=None) -> PipelineState:
         """Repair only QA findings, with API observing the repaired PRD and DB."""
@@ -260,7 +283,7 @@ class OrchestrationGraph:
             generation_blockers=generation_blockers,
             qa_db_blockers=list(dict.fromkeys([*base.qa_db_blockers, *dba.qa_db_blockers])),
             qa_api_blockers=list(dict.fromkeys([*base.qa_api_blockers, *api.qa_api_blockers])),
-            qa_approved=False if generation_blockers else base.qa_approved,
+            qa_approved=False if generation_blockers or dba.qa_db_blockers or api.qa_api_blockers else base.qa_approved,
         )
 
     async def _run_prd_with_rollback(
@@ -275,12 +298,15 @@ class OrchestrationGraph:
             if self._feature_spec is not None:
                 self._progress.send(pipeline_id, "FEATURE_SPEC", "기능명세서 및 지원 기능 확정 중...", 55)
                 after_prd = sync_core_features_with_registry(await self._feature_spec.execute(after_prd, dump))
+            after_prd = self._freeze_feature_registry(after_prd)
 
             # DBA·API는 rag-pipeline과 동일하게 독립적으로 병렬 실행 (교차 주입 없음)
             self._progress.send(pipeline_id, "DBA_API", "DB 스키마 · API 설계 중...", 60)
+            dba_input = self._clone_frozen_registry(after_prd)
+            api_input = self._clone_frozen_registry(after_prd)
             dba_result, api_result = await asyncio.gather(
-                self._dba.execute(after_prd, dump),
-                self._api.execute(after_prd, dump),
+                self._dba.execute(dba_input, dump),
+                self._api.execute(api_input, dump),
             )
             if dump:
                 dump.log_state(f"DBA (attempt {attempt + 1})", dba_result)
@@ -290,7 +316,14 @@ class OrchestrationGraph:
             has_api_feedback = bool((api_result.prd_feedback_from_api or "").strip())
 
             if not has_dba_feedback and not has_api_feedback:
-                logger.info("PRD ↔ DBA/API 검증 통과 (시도 %d)", attempt + 1)
+                agent_blockers = [*dba_result.qa_db_blockers, *api_result.qa_api_blockers]
+                if agent_blockers:
+                    logger.warning(
+                        "PRD 계약 생성 완료, DBA/API 자체검증 blocker %d건을 QA repair로 이관 (시도 %d)",
+                        len(agent_blockers), attempt + 1,
+                    )
+                else:
+                    logger.info("PRD ↔ DBA/API 검증 통과 (시도 %d)", attempt + 1)
                 return self._merge_agent_quality(after_prd, dba_result, api_result).copy(
                     db_schema=dba_result.db_schema,
                     api_spec=api_result.api_spec,
@@ -360,6 +393,10 @@ class OrchestrationGraph:
                         resynced = sync_core_features_with_registry(
                             await self._feature_spec.execute(resynced, dump)
                         )
+                        resynced = self._retain_unchanged_registry(
+                            after_prd, resynced, changed_ids,
+                        )
+                    resynced = self._freeze_feature_registry(resynced)
 
                     if changed_ids and not repeated_repair:
                         repair_domains.update(self._changed_registry_domains(
@@ -376,7 +413,11 @@ class OrchestrationGraph:
                             pipeline_id, "PHASE2_TARGETED_RESYNC",
                             f"변경된 계약·blocker 대상만 재동기화 중: {', '.join(sorted(repair_domains))}", 72,
                         )
-                        async def targeted(domain: str):
+                        async def targeted(
+                            domain: str,
+                            base_state: PipelineState,
+                            repair_feedback: str,
+                        ):
                             timeout = (
                                 self._dba_resync_timeout_seconds
                                 if domain == "db"
@@ -385,9 +426,9 @@ class OrchestrationGraph:
                             try:
                                 async with asyncio.timeout(timeout):
                                     result = await (
-                                        self._repair_agent(self._dba, resynced, targeted_feedback)
+                                        self._repair_agent(self._dba, base_state, repair_feedback)
                                         if domain == "db"
-                                        else self._repair_agent(self._api, resynced, targeted_feedback)
+                                        else self._repair_agent(self._api, base_state, repair_feedback)
                                     )
                                 return domain, result
                             except Exception as exc:
@@ -398,28 +439,41 @@ class OrchestrationGraph:
                                 )
                                 logger.error(blocker)
                                 if domain == "db":
-                                    return domain, resynced.copy(
+                                    return domain, base_state.copy(
                                         prd_feedback_from_dba=blocker,
                                         qa_db_blockers=[blocker],
                                         qa_approved=False,
                                     )
-                                return domain, resynced.copy(
+                                return domain, base_state.copy(
                                     prd_feedback_from_api=blocker,
                                     qa_api_blockers=[blocker],
                                     qa_approved=False,
                                 )
 
-                        results = await asyncio.gather(*(targeted(domain) for domain in sorted(repair_domains)))
+                        results = await asyncio.gather(*(
+                            targeted(domain, resynced, targeted_feedback)
+                            for domain in sorted(repair_domains)
+                        ))
                         for domain, result in results:
                             if domain == "db":
                                 resynced = resynced.copy(
                                     db_schema=result.db_schema,
                                     prd_feedback_from_dba=result.prd_feedback_from_dba,
+                                    qa_db_blockers=result.qa_db_blockers,
+                                    targeted_repair_results={
+                                        **resynced.targeted_repair_results,
+                                        **result.targeted_repair_results,
+                                    },
                                 )
                             else:
                                 resynced = resynced.copy(
                                     api_spec=result.api_spec,
                                     prd_feedback_from_api=result.prd_feedback_from_api,
+                                    qa_api_blockers=result.qa_api_blockers,
+                                    targeted_repair_results={
+                                        **resynced.targeted_repair_results,
+                                        **result.targeted_repair_results,
+                                    },
                                 )
                     return resynced.copy(
                         db_schema=resynced.db_schema or after_prd.db_schema,
@@ -501,3 +555,55 @@ class OrchestrationGraph:
             "instruction": "수정 대상 artifact만 patch하고 나머지 산출물은 보존하세요.",
         }
         return str(feedback or "")[:8000] + "\n\n[TARGETED_RESYNC]\n" + json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _freeze_feature_registry(state: PipelineState) -> PipelineState:
+        """Detach and fingerprint the Registry before parallel consumers run."""
+        registry = copy.deepcopy([
+            item for item in state.feature_registry if isinstance(item, dict)
+        ])
+        canonical = json.dumps(
+            registry, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return state.copy(
+            feature_registry=registry,
+            feature_specs=copy.deepcopy(state.feature_specs),
+            feature_registry_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        )
+
+    @staticmethod
+    def _clone_frozen_registry(state: PipelineState) -> PipelineState:
+        return state.copy(
+            feature_registry=copy.deepcopy(state.feature_registry),
+            feature_specs=copy.deepcopy(state.feature_specs),
+        )
+
+    @classmethod
+    def _retain_unchanged_registry(
+        cls,
+        before: PipelineState,
+        candidate: PipelineState,
+        changed_ids: set[str],
+    ) -> PipelineState:
+        """Accept Feature Spec resync output only for PRD feature IDs that changed."""
+        old_by_id = {
+            str(item.get("featureId") or item.get("id") or ""): copy.deepcopy(item)
+            for item in before.feature_registry if isinstance(item, dict)
+        }
+        new_by_id = {
+            str(item.get("featureId") or item.get("id") or ""): copy.deepcopy(item)
+            for item in candidate.feature_registry if isinstance(item, dict)
+        }
+        ordered_ids = list(old_by_id)
+        ordered_ids.extend(key for key in new_by_id if key not in old_by_id and key in changed_ids)
+        merged = [
+            new_by_id.get(feature_id, old_by_id.get(feature_id))
+            if feature_id in changed_ids else old_by_id[feature_id]
+            for feature_id in ordered_ids
+        ]
+        merged = [item for item in merged if isinstance(item, dict)]
+        return candidate.copy(
+            feature_registry=merged,
+            feature_specs=copy.deepcopy(merged),
+            feature_spec_document=json.dumps({"features": merged}, ensure_ascii=False),
+        )

@@ -8,6 +8,7 @@ from phase2.orchestration_graph import OrchestrationGraph
 from phase2.state import PipelineState
 from phase3.schema_validator import SchemaValidator, ValidationResult
 from phase3.validation_service import ValidationService
+from routers.orchestration import _artifact_snapshot
 
 
 class _Progress:
@@ -182,6 +183,85 @@ def test_item_repair_consumes_domain_budget_and_does_not_repeat_provider_failure
 
     failed = state.copy(generation_blockers=["API_GENERATION_BLOCKER: provider unavailable"])
     assert asyncio.run(graph._repair_once(failed, None)).api_spec == ""
+
+
+def test_contract_external_db_patch_does_not_consume_phase3_budget():
+    from phase3.retry_service import RetryService
+
+    class Graph:
+        async def repair(self, state, _feedback, _pipeline_id, repair_targets=None):
+            assert repair_targets == ["db"]
+            return state.copy(targeted_repair_results={"db": "rejected_contract_external"})
+
+    class Validation:
+        def validate(self, state):
+            return state.copy(validated=True)
+
+    state = PipelineState(
+        validation_repair_targets=["db"],
+        validation_blockers=["DB 계약 밖 document patch"],
+        validation_unresolved_blockers=["DB 계약 밖 document patch"],
+    )
+    result = asyncio.run(RetryService().retry_with(state, Graph(), Validation()))
+
+    assert result.validated is True
+    assert result.targeted_repair_attempts == {}
+
+
+def test_phase3_targeted_repair_replaces_resolved_domain_blockers():
+    class Agent:
+        async def execute(self, state, _dump=None):
+            return state
+
+    class Dba(Agent):
+        async def repair(self, state, _feedback):
+            return state.copy(db_schema='{"tables":[]}', qa_db_blockers=[])
+
+    graph = OrchestrationGraph(Agent(), Agent(), Agent(), Dba(), Agent(), Agent(), _Progress())
+    state = PipelineState(
+        db_schema='{"tables":[{"name":"bad"}]}',
+        qa_db_blockers=["DBA_SELF_CHECK_BLOCKER: 이전 결함"],
+    )
+
+    result = asyncio.run(graph._repair_inner(state, "DB 스키마 결함", None, ["db"]))
+
+    assert result.qa_db_blockers == []
+    assert result.db_schema == '{"tables":[]}'
+
+
+def test_qa_blocker_detail_does_not_guess_artifact_from_prose():
+    details = QaAgent._build_blocker_details({
+        "db_blockers": ["Refresh Token API가 있지만 만료·회수 가능한 토큰 저장 구조가 없음"],
+        "api_blockers": [],
+        "prd_blockers": [],
+    })
+
+    assert details == [{
+        "category": "db",
+        "problem": "Refresh Token API가 있지만 만료·회수 가능한 토큰 저장 구조가 없음",
+        "repairTarget": "db",
+    }]
+
+
+def test_failure_artifact_snapshot_keeps_phase2_documents():
+    state = PipelineState(
+        project_name="중간 산출물",
+        feature_registry=[{"featureId": "items.read", "name": "목록 조회"}],
+        feature_registry_hash="abc",
+        feature_spec_document='{"features":[]}',
+        prd_document='{"coreFeatures":[]}',
+        db_schema='{"tables":[]}',
+        api_spec='{"endpoints":[]}',
+        openapi_spec='{"openapi":"3.1.0"}',
+        rag_chunks_retrieved=0,
+        rag_context_fallback=True,
+    )
+
+    snapshot = _artifact_snapshot(state)
+
+    assert snapshot["projectName"] == "중간 산출물"
+    assert snapshot["apiSpec"] == {"endpoints": []}
+    assert snapshot["rag"] == {"chunksRetrieved": 0, "usedFormDataOnly": True}
 
 
 @pytest.mark.parametrize(("owner_entity", "owner_key"), [("members", "member_id"), ("users", "user_id")])
