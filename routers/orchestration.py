@@ -4,7 +4,7 @@ import logging
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Form, File, UploadFile, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from common.api_response import ok
@@ -14,8 +14,8 @@ from phase1.models import FormData
 from phase1.pdf_parsing import MAX_FILES
 from phase1.rag_pipeline import RagPipelineService
 from phase2.orchestration_graph import OrchestrationGraph
-from phase2.state import PipelineState
 from phase2.sse_service import PipelineProgressService
+from phase2.state import PipelineState
 from phase3.retry_service import RetryService
 from phase3.validation_service import ValidationService
 from phase4.kafka_producer import KafkaProducerService
@@ -31,8 +31,13 @@ _pipeline_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PIPELINES)
 
 def _services():
     from main import (
-        rag_pipeline_service, orchestration_graph, validation_service,
-        retry_service, kafka_producer_service, progress_service, form_to_query,
+        form_to_query,
+        kafka_producer_service,
+        orchestration_graph,
+        progress_service,
+        rag_pipeline_service,
+        retry_service,
+        validation_service,
     )
     return (
         rag_pipeline_service, orchestration_graph, validation_service,
@@ -146,6 +151,7 @@ async def _run_pipeline_inner(
     form_to_query_svc: FormToQueryService,
     skip_phase1: bool = False,
 ) -> None:
+    latest_state: PipelineState | None = None
     try:
         # Phase 1
         if skip_phase1:
@@ -169,17 +175,21 @@ async def _run_pipeline_inner(
             progress_svc.send(pipeline_id, "PHASE1_START", "PDF 파싱 및 검색 준비 중...", 5)
             state = await rag_svc.build_from_form(form_data, pdf_bytes)
             progress_svc.send(pipeline_id, "PHASE1_DONE", "검색 컨텍스트 구성 완료", 25)
+        latest_state = state
 
         # Phase 2
         phase2_state = await orch.run(state, pipeline_id)
+        latest_state = phase2_state
         logger.debug("Phase 2 완료 | retryCount: %d", phase2_state.retry_count)
 
         # Phase 3
         progress_svc.send(pipeline_id, "PHASE3", "결과 검증 중...", 85)
         validated = val_svc.validate(phase2_state)
+        latest_state = validated
         if not validated.validated:
             logger.warning("Phase 3 검증 실패 — RetryService 진입")
             validated = await retry_svc.retry_with(validated, orch, val_svc, pipeline_id=pipeline_id)
+            latest_state = validated
 
         if not validated.validated:
             logger.warning("HITL 요청 | 자동 검증 실패")
@@ -209,6 +219,8 @@ async def _run_pipeline_inner(
                             "prd": validated.qa_prd_warnings,
                         },
                     },
+                    "phaseReached": "PHASE3",
+                    "partialResult": _artifact_snapshot(validated),
                 },
             )
             return
@@ -246,6 +258,7 @@ async def _run_pipeline_inner(
             "prdDocument": _parse_json(validated.prd_document),
             "dbSchema": _parse_json(validated.db_schema),
             "apiSpec": _parse_json(validated.api_spec),
+            "openApiSpec": _parse_json(validated.openapi_spec),
             "marketResearch": validated.market_research,
             "status": validated.status_message,
             "qa": {
@@ -272,6 +285,10 @@ async def _run_pipeline_inner(
             "pdfFilesTotal": validated.pdf_files_total,
             "pdfFilesProcessed": validated.pdf_files_processed,
             "pdfFilesFailed": validated.pdf_files_failed,
+            "rag": {
+                "chunksRetrieved": validated.rag_chunks_retrieved,
+                "usedFormDataOnly": validated.rag_context_fallback,
+            },
         }
         progress_svc.complete(pipeline_id, result)
 
@@ -285,6 +302,7 @@ async def _run_pipeline_inner(
             details={
                 "errorType": error_type,
                 "errorDetail": repr(e),
+                "partialResult": _artifact_snapshot(latest_state),
             },
         )
 
@@ -297,6 +315,29 @@ def _parse_json(value: str | None) -> dict | list:
         return json.loads(value)
     except Exception:
         return {}
+
+
+def _artifact_snapshot(state: PipelineState | None) -> dict:
+    """Return inspectable, non-secret artifacts even when Phase4 is not reached."""
+    if state is None:
+        return {}
+    return {
+        "projectName": state.project_name,
+        "projectPlan": state.project_plan,
+        "featureNames": state.feature_list,
+        "featureRegistry": state.feature_registry,
+        "featureRegistryHash": state.feature_registry_hash,
+        "featureSpecDocument": _parse_json(state.feature_spec_document),
+        "prdDocument": _parse_json(state.prd_document),
+        "dbSchema": _parse_json(state.db_schema),
+        "apiSpec": _parse_json(state.api_spec),
+        "openApiSpec": _parse_json(state.openapi_spec),
+        "marketResearch": state.market_research,
+        "rag": {
+            "chunksRetrieved": state.rag_chunks_retrieved,
+            "usedFormDataOnly": state.rag_context_fallback,
+        },
+    }
 
 
 def _validate_form(form: FormData) -> None:

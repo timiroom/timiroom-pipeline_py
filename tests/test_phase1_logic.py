@@ -14,6 +14,7 @@ from phase1.hybrid_search import (
     SESSION_BOOST,
     HybridSearchService,
 )
+from phase1.rag_pipeline import RagPipelineService
 from phase1.recommendation.models import (
     PersonaRecommendationRequest,
     PersonaRecommendationResponse,
@@ -42,6 +43,15 @@ def make_search() -> HybridSearchService:
         embedder=DummyEmbedder(),
         session_store=SessionVectorStore(),
     )
+
+
+def test_empty_rag_context_is_explicitly_marked():
+    service = object.__new__(RagPipelineService)
+
+    context = service._assemble_context([], "폼 기반 프로젝트 요구사항")
+
+    assert "관련 지식베이스 없음" in context
+    assert "FormData 컨텍스트만 사용" in context
 
 
 def test_long_single_sentence_chunking_terminates_and_respects_max_size():

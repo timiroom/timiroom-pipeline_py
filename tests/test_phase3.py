@@ -191,6 +191,31 @@ def test_phase3_fk_missing_target_is_structured_even_without_foreign_key_token()
     assert detail["repairScope"] == "table_column"
 
 
+def test_phase3_treats_request_id_as_correlation_without_requests_table():
+    db = _db()
+    db["tables"].append({
+        "name": "audit_logs",
+        "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "request_id", "type": "VARCHAR(100)", "constraints": "NULL"},
+        ],
+    })
+    db["relationships"].append("users (1:N) audit_logs")
+
+    result = SchemaValidator().validate(
+        FEATURES,
+        json.dumps(db),
+        json.dumps(_api()),
+        json.dumps(_prd(), ensure_ascii=False),
+    )
+
+    assert not any(
+        detail.get("column") == "request_id"
+        for detail in result.blocker_details
+        if detail.get("code") == "DB_FOREIGN_KEY_TARGET_MISSING"
+    )
+
+
 def test_malformed_array_items_are_rejected_without_crashing():
     result = SchemaValidator().validate(
         FEATURES,

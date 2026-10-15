@@ -8,8 +8,13 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from phase2.agent_contract import (
+    feature_methods,
+    normalize_api_path,
+    normalize_feature_contract,
+    requires_auth,
+)
 from phase2.feature_registry import normalize_feature_registry
-from phase2.agent_contract import normalize_api_path, normalize_feature_contract, requires_auth
 from phase2.json_utils import try_parse_json
 from phase2.llm_runtime import LlmRuntime
 from phase2.state import PipelineState
@@ -86,18 +91,30 @@ def _contract_domain(item: dict) -> str:
         return "notifications"
     if any(term in name for term in ("audit", "감사", "이력")):
         return "audit_logs"
-    # 한국어 supporting 기능명은 slug가 숫자/빈 문자열로 떨어질 수 있다.
-    # supporting.1.1 같은 ID를 도메인으로 해석하면 1s 테이블이 생기므로
-    # 이름 기반 도메인이 없는 경우 공용 supporting 테이블로 수렴시킨다.
+    if any(term in name for term in ("validation", "검증")):
+        return "validation_rules"
+    if any(term in name for term in ("search", "filter", "검색", "필터")):
+        return "searches"
+    db_contract = item.get("dbContract") if isinstance(item.get("dbContract"), dict) else {}
+    declared_tables = []
+    for raw in db_contract.get("tables") or []:
+        table = raw.get("name") or raw.get("table") if isinstance(raw, dict) else raw
+        table = str(table or "").strip().casefold()
+        if table and not re.fullmatch(r"(?:feature_?\d+_records|supporting_features)", table):
+            declared_tables.append(table)
+    if declared_tables:
+        return declared_tables[0]
+    # 의미 없는 순번 ID를 URL에 노출하지 않는다. 구체적인 DB 계약이나 공통
+    # 도메인을 찾지 못한 supporting 기능은 공유 workflow 리소스에 연결한다.
     if feature_id.startswith(("supporting.", "supporting-")):
-        return "supporting_features"
+        return "workflows"
     # PM이 의미 없는 순번 ID만 제공한 경우에도 API/DB 계약은 필요하다.
     # 숫자를 제거한 feature001s 같은 이름은 sanitize_tables와 충돌하므로
     # 안정적인 fallback 식별자를 사용하고, 의미 있는 Registry 계약이 있으면
     # 아래에서 항상 그 계약을 우선한다.
     generic_feature = re.match(r"^(feature_\d+)(?:\.|$)", feature_id)
     if generic_feature:
-        return f"{generic_feature.group(1)}_records"
+        return "workflows"
     parts = [re.sub(r"[^a-z0-9]+", "", part) for part in feature_id.split(".")]
     parts = [part for part in parts if part]
     domain = parts[-2] if len(parts) > 1 else (parts[0] if parts else "feature")
@@ -149,12 +166,9 @@ def _semantic_contracts(item: dict, domain: str) -> tuple[list[dict], list[str]]
             {"method": "POST", "path": "/api/v1/clubs/{clubId}/facilities", "featureId": feature_id, "action": "create"},
             {"method": "POST", "path": "/api/v1/clubs/{clubId}/classes", "featureId": feature_id, "action": "create"},
         ], ["clubs", "facilities", "classes"]
-    base = "/api/v1/" + domain
+    base = normalize_api_path(domain)
     if domain == "users":
         base = "/api/v1/auth"
-    if domain == "supporting_features" or re.fullmatch(r"feature_\d+_records", domain):
-        suffix = re.sub(r"[^a-z0-9]+", "-", feature_id.casefold()).strip("-") or "feature"
-        base = f"{base}/{suffix}"
     contracts = []
     for action in _contract_action(item):
         if action in {"register", "signup"}:
@@ -193,16 +207,7 @@ def _ensure_required_contracts(item: dict) -> dict:
     name = str(item.get("name") or "").casefold()
     parts = feature_id.lower().split(".")
     namespace = parts[-2] if len(parts) > 1 else ""
-    base_path = f"/api/v1/auth/{parts[-1]}" if namespace == "auth" else f"/api/v1/{domain}"
-    # supporting/subfeature 기능은 모두 공용 테이블을 사용하더라도 API 계약은
-    # 기능별로 고유해야 한다. 같은 /supporting_features 경로를 공유하면 API
-    # dedupe 단계에서 한 기능만 남아 나머지 Registry 노드가 고립된다.
-    unique_contract_domain = domain == "supporting_features" or bool(
-        re.fullmatch(r"feature_\d+_records", domain)
-    )
-    if unique_contract_domain:
-        suffix = re.sub(r"[^a-z0-9]+", "-", feature_id.casefold()).strip("-") or "feature"
-        base_path = f"{base_path}/{suffix}"
+    base_path = normalize_api_path(f"auth/{parts[-1]}") if namespace == "auth" else normalize_api_path(domain)
     contracts = item.get("apiContract") if isinstance(item.get("apiContract"), list) else []
     # A source registry item can carry a stale auth contract after PM/PRD
     # repair. Do not let that contract turn an unrelated generic supporting
@@ -210,6 +215,7 @@ def _ensure_required_contracts(item: dict) -> dict:
     auth_feature = any(term in name for term in (
         "login", "signin", "로그인", "register", "회원가입", "signup",
         "logout", "로그아웃", "profile", "프로필", "password", "비밀번호",
+        "refresh", "session renewal", "token renewal", "세션 갱신", "토큰 갱신",
     ))
     if not auth_feature:
         contracts = [
@@ -218,7 +224,7 @@ def _ensure_required_contracts(item: dict) -> dict:
         ]
         item["apiContract"] = contracts
     generic_contract = any(
-        re.fullmatch(r"/api/v1/feature_\d+_records/?", str(c.get("path") or ""))
+        re.search(r"/api/v1/(?:feature[-_]\d+[-_]records|supporting[-_]features)(?:/|$)", str(c.get("path") or ""))
         for c in contracts if isinstance(c, dict)
     )
     generic_table = any(
@@ -230,7 +236,6 @@ def _ensure_required_contracts(item: dict) -> dict:
         item["actions"] = ["create", "read"]
     if (
         not contracts
-        or unique_contract_domain
         or (domain not in {"feature", "feature_records"} and (generic_contract or generic_table))
     ):
         contracts, semantic_tables = _semantic_contracts(item, domain)
@@ -259,6 +264,54 @@ def _ensure_required_contracts(item: dict) -> dict:
             })
         item["apiContract"] = generated
 
+    # Core features are persisted user journeys. Expand their Registry contract
+    # from the PRD prose so downstream API generation cannot silently omit a
+    # read/update/delete action that the requirements explicitly promise.
+    if re.fullmatch(r"feature_\d+", feature_id):
+        behavior_text = " ".join([
+            str(item.get("name") or ""),
+            str(item.get("description") or ""),
+            *[str(value) for value in item.get("requirements") or []],
+        ])
+        required_methods = feature_methods(behavior_text)
+        contracts = [
+            contract for contract in item.get("apiContract") or []
+            if isinstance(contract, dict)
+        ]
+        existing_methods = {
+            str(contract.get("method") or "GET").upper()
+            for contract in contracts
+        }
+        anchor = next(
+            (contract for contract in contracts if str(contract.get("method") or "").upper() == "POST"),
+            contracts[0] if contracts else None,
+        )
+        anchor_path = normalize_api_path((anchor or {}).get("path") or base_path)
+        for method in required_methods:
+            if method in existing_methods:
+                continue
+            path = anchor_path
+            action = {
+                "GET": "read",
+                "POST": "create",
+                "PATCH": "update",
+                "DELETE": "delete",
+            }.get(method, "manage")
+            if method in {"PATCH", "DELETE"} and "{" not in path.rsplit("/", 1)[-1]:
+                resource = path.rstrip("/").rsplit("/", 1)[-1]
+                singular = resource[:-3] + "y" if resource.endswith("ies") else resource.removesuffix("s")
+                words = [word for word in singular.split("-") if word]
+                parameter = words[0] + "".join(word.title() for word in words[1:]) + "Id"
+                path = f"{path}/{{{parameter}}}"
+            contracts.append({
+                "method": method,
+                "path": path,
+                "featureId": feature_id,
+                "action": action,
+            })
+            existing_methods.add(method)
+        item["apiContract"] = contracts
+
     db = item.get("dbContract") if isinstance(item.get("dbContract"), dict) else {}
     tables = db.get("tables") if isinstance(db.get("tables"), list) else []
     if not tables:
@@ -267,6 +320,35 @@ def _ensure_required_contracts(item: dict) -> dict:
         "tables": tables,
         "foreignKeys": db.get("foreignKeys") if isinstance(db.get("foreignKeys"), list) else [],
     }
+    refresh_declared = any(
+        isinstance(contract, dict)
+        and str(contract.get("method") or "GET").upper() == "POST"
+        and normalize_api_path(contract.get("path")) == "/api/v1/auth/refresh"
+        for contract in item.get("apiContract") or []
+    )
+    if refresh_declared:
+        # Refresh is not a standalone HTTP detail: expiry and revocation need a
+        # durable DB contract. Keep both sides in the same Registry item so the
+        # parallel API/DBA agents cannot interpret the flow differently.
+        owner = str((item.get("ownership") or {}).get("ownerEntity") or "users").strip()
+        owner = owner if re.fullmatch(r"[a-z][a-z0-9_]*", owner) else "users"
+        db_contract = item["dbContract"]
+        db_contract["tables"] = list(dict.fromkeys([*db_contract["tables"], owner, "refresh_tokens"]))
+        owner_column = f"{owner[:-1] if owner.endswith('s') else owner}_id"
+        refresh_fk = {
+            "table": "refresh_tokens",
+            "column": owner_column,
+            "references": {"table": owner, "column": "id"},
+            "nullable": False,
+        }
+        existing_fks = db_contract["foreignKeys"]
+        if not any(
+            isinstance(fk, dict)
+            and fk.get("table") == "refresh_tokens"
+            and fk.get("column") == owner_column
+            for fk in existing_fks
+        ):
+            existing_fks.append(refresh_fk)
     return _normalize_contracts(item)
 
 

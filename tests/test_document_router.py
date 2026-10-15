@@ -25,7 +25,6 @@ class StubClient:
     async def _create(self, **kwargs):
         self.calls.append(kwargs)
         content, finish = self._responder(kwargs)
-        await asyncio.sleep(0)  # 실제 호출처럼 한 번 양보
         return SimpleNamespace(
             choices=[SimpleNamespace(
                 message=SimpleNamespace(content=content),
@@ -273,6 +272,88 @@ def test_unknown_doc_type_still_404():
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.post("/api/v1/document/nope/edit", json={"document": {}, "instruction": "고쳐줘"})
     assert resp.status_code == 404
+
+
+@pytest.mark.parametrize(("doc_type", "section", "document", "replacement"), [
+    (
+        "prd", "goals",
+        {"goals": ["기존 목표를 달성한다"]},
+        "사용자 요구사항을 반영한 측정 가능한 목표를 달성한다",
+    ),
+    (
+        "features", "features",
+        {"features": [{"name": "프로필 관리", "description": "사용자가 프로필을 관리한다", "priority": "P1", "requirements": ["이름을 변경한다"]}]},
+        {"name": "프로필 관리", "description": "사용자가 이름과 연락처를 안전하게 변경한다", "priority": "P1", "requirements": ["이름과 연락처를 검증 후 변경한다"]},
+    ),
+    (
+        "api", "endpoints",
+        {"endpoints": [_endpoint("GET", "/api/v1/profiles")]},
+        dict(_endpoint("GET", "/api/v1/profiles"), description="인증 사용자의 프로필을 조회한다"),
+    ),
+    (
+        "erd", "tables",
+        {"tables": [{"name": "users", "description": "사용자", "columns": [{"name": "id", "type": "BIGINT"}]}], "relationships": []},
+        {"name": "users", "description": "인증 사용자 계정", "columns": [{"name": "id", "type": "BIGINT"}]},
+    ),
+])
+def test_all_document_types_return_structured_change_analysis(
+    monkeypatch, doc_type, section, document, replacement,
+):
+    def responder(kwargs):
+        stage = _stage(kwargs)
+        if stage == "classify":
+            return json.dumps({"intent": "edit", "targets": [section], "reply": "분석합니다"}), "stop"
+        if stage == "scope":
+            return '{"scope":"item","indices":[1],"operation":"edit"}', "stop"
+        if stage == "item":
+            return json.dumps({"value": replacement}, ensure_ascii=False), "stop"
+        if stage == "proposal":
+            return json.dumps({
+                "summary": "요구사항과 현재 명세를 비교해 수정 범위를 확인했습니다.",
+                "reason": "요청한 동작이 현재 명세에 충분히 표현되지 않았습니다.",
+                "proposal": "선택한 항목을 요구사항에 맞게 구체화합니다.",
+            }, ensure_ascii=False), "stop"
+        raise AssertionError(stage)
+
+    client = StubClient(responder)
+    monkeypatch.setattr(sys.modules["main"], "openai_client", client)
+    response = asyncio.run(doc.edit_document(
+        doc_type,
+        doc.DocumentEditRequest(document=document, instruction="요구사항에 맞게 더 구체적으로 수정해줘"),
+    ))
+
+    data = response["data"]
+    assert data["intent"] == "edit"
+    assert data["analysis"]["summary"]
+    assert data["analysis"]["reason"]
+    assert data["analysis"]["affectedSections"]
+    assert data["analysis"]["changes"][0]["changedLines"] > 0
+    assert data["edits"][0]["section"] == section
+
+
+def test_document_question_uses_full_document_instead_of_outline_preview(monkeypatch):
+    marker = "문서 뒤쪽에만 있는 고유한 검증 기준"
+
+    def responder(kwargs):
+        prompt = kwargs["messages"][-1]["content"]
+        if "## 사용자 질문" in prompt:
+            assert marker in prompt
+            return json.dumps({"reply": f"현재 문서에는 {marker}이 있습니다."}, ensure_ascii=False), "stop"
+        return '{"intent":"chat","targets":[],"reply":"분류 결과"}', "stop"
+
+    client = StubClient(responder)
+    monkeypatch.setattr(sys.modules["main"], "openai_client", client)
+    response = asyncio.run(doc.edit_document(
+        "prd",
+        doc.DocumentEditRequest(
+            document={"background": "가" * 500 + marker},
+            instruction="현재 검증 기준이 뭐야?",
+        ),
+    ))
+
+    assert response["data"]["intent"] == "chat"
+    assert marker in response["data"]["reply"]
+    assert len(client.calls) == 2
 
 
 # ── 4번: 직전 대화가 모든 단계에 실린다 ──────────────────────────────

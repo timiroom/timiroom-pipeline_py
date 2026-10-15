@@ -2,6 +2,10 @@ import json
 import logging
 import re
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from phase2.state import PipelineState
 
 from .form_to_query import FormToQueryService
 from .hybrid_search import HybridSearchService
@@ -96,6 +100,11 @@ class RagPipelineService:
             logger.info("[%s] ▶ Step 4: Hybrid Search (벡터 + 키워드)", session_id[:8])
             retrieved = await self._hybrid_search.search_with_session(queries, session_id)
             logger.info("[%s] ✔ Step 4: %d개 청크 검색됨", session_id[:8], len(retrieved))
+            if not retrieved:
+                logger.warning(
+                    "[%s] RAG 검색 결과 0건 — FormData 컨텍스트만 사용",
+                    session_id[:8],
+                )
             for i, c in enumerate(retrieved[:5], 1):
                 logger.info(
                     "[%s]   [%d] rrf=%.5f topic=%s | %s",
@@ -152,6 +161,8 @@ class RagPipelineService:
                 excluded_features=self._form_to_query.extract_excluded_features(form),
                 feature_list=self._form_to_query.extract_all_included_features(form),
                 context_prompt=context_prompt,
+                rag_chunks_retrieved=len(retrieved),
+                rag_context_fallback=not bool(retrieved),
                 pdf_files_total=pdf_result.total_files if pdf_result else 0,
                 pdf_files_processed=pdf_result.processed_files if pdf_result else 0,
                 pdf_files_failed=pdf_result.failed_files if pdf_result else 0,
@@ -215,4 +226,6 @@ class RagPipelineService:
                     "content": c.content,
                 }, ensure_ascii=False))
             parts.append("[/REFERENCE_JSONL]")
+        else:
+            parts.append("[관련 지식베이스 없음 — FormData 컨텍스트만 사용]")
         return "\n".join(parts)

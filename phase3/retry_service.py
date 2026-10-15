@@ -123,6 +123,22 @@ class RetryService:
                 timeout_state, orchestration_graph, validation_service, pipeline_id
             )
 
+        rejected = {
+            target for target in targets
+            if result.targeted_repair_results.get(target) == "rejected_contract_external"
+        }
+        if rejected:
+            attempts = dict(result.targeted_repair_attempts)
+            for target in rejected:
+                attempts[target] = max(0, attempts.get(target, 0) - 1)
+                if attempts[target] == 0:
+                    attempts.pop(target)
+            result = result.copy(targeted_repair_attempts=attempts)
+            logger.warning(
+                "Registry 계약 밖 patch는 repair 예산에서 제외: %s",
+                ", ".join(sorted(rejected)),
+            )
+
         validated = validation_service.validate(result)
 
         if validated.validated:

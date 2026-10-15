@@ -157,6 +157,8 @@ class KafkaConsumerService:
             (event.api_spec, {**base_meta, "type": "api"}),
             ("\n".join(event.feature_list), {**base_meta, "type": "features"}),
         ]
+        if event.openapi_spec.strip() and event.openapi_spec.strip() != "{}":
+            documents.append((event.openapi_spec, {**base_meta, "type": "openapi"}))
         if event.feature_spec_document.strip() and event.feature_spec_document.strip() != "{}":
             documents.append((event.feature_spec_document, {**base_meta, "type": "feature_spec"}))
         if event.feature_registry:

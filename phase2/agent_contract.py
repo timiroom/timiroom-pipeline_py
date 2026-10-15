@@ -378,4 +378,43 @@ def normalize_api_path(path: str) -> str:
     value = re.sub(r"/{2,}", "/", value)
     while re.match(r"^/(?:api(?:/v\d+)?|v\d+)(?=/|$)", value, re.I):
         value = re.sub(r"^/(?:api(?:/v\d+)?|v\d+)(?=/|$)", "", value, count=1, flags=re.I)
-    return ("/api/v1/" + value.lstrip("/")).rstrip("/")
+    segments = []
+    for segment in value.strip("/").split("/"):
+        if not segment:
+            continue
+        if re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_-]*\}", segment):
+            segments.append(segment)
+            continue
+        segment = re.sub(r"[_\s]+", "-", segment.casefold())
+        segment = re.sub(r"[^a-z0-9-]+", "-", segment)
+        segment = re.sub(r"-{2,}", "-", segment).strip("-")
+        if segment:
+            segments.append(segment)
+    return "/api/v1" + ("/" + "/".join(segments) if segments else "")
+
+
+def endpoint_feature_ids(endpoint: dict[str, Any] | None) -> list[str]:
+    """Return every Registry feature linked to an endpoint, preserving order."""
+    if not isinstance(endpoint, dict):
+        return []
+    values = endpoint.get("featureIds")
+    result = [
+        str(value).strip()
+        for value in values if str(value).strip()
+    ] if isinstance(values, list) else []
+    primary = str(endpoint.get("featureId") or "").strip()
+    if primary and primary not in result:
+        result.insert(0, primary)
+    return list(dict.fromkeys(result))
+
+
+def bind_endpoint_features(endpoint: dict[str, Any], feature_ids: list[str]) -> dict[str, Any]:
+    """Store N:M feature links while retaining featureId for older consumers."""
+    normalized = list(dict.fromkeys(str(value).strip() for value in feature_ids if str(value).strip()))
+    if normalized:
+        endpoint["featureId"] = normalized[0]
+        endpoint["featureIds"] = normalized
+    else:
+        endpoint.pop("featureId", None)
+        endpoint.pop("featureIds", None)
+    return endpoint

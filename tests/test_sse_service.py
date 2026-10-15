@@ -49,3 +49,24 @@ def test_terminal_event_retention_is_bounded() -> None:
 
     assert "pipeline-1" not in service._terminal_events
     assert "pipeline-2" in service._terminal_events
+
+
+def test_pre_subscription_progress_is_not_replayed_twice() -> None:
+    asyncio.run(_test_pre_subscription_progress_is_not_replayed_twice())
+
+
+async def _test_pre_subscription_progress_is_not_replayed_twice() -> None:
+    service = PipelineProgressService()
+    service.send("pipeline-3", "PHASE1_START", "시작", 5)
+
+    async def collect():
+        return [chunk async for chunk in service.subscribe("pipeline-3")]
+
+    task = asyncio.create_task(collect())
+    await asyncio.sleep(0)
+    service.send("pipeline-3", "PHASE1_DONE", "완료", 25)
+    service.complete("pipeline-3", {"status": "SUCCESS"})
+    events = await asyncio.wait_for(task, timeout=1)
+
+    assert sum('"step": "PHASE1_START"' in event for event in events) == 1
+    assert sum('"step": "PHASE1_DONE"' in event for event in events) == 1

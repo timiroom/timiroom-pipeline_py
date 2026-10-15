@@ -360,7 +360,7 @@ def _fk_target(
             return token_tables[0]
     # created_by_id, recorded_by_id, actor_user_id 같은 감사/행위자 FK는 users를 가리킨다.
     if (
-        stem.endswith(("_user", "_by", "_manager", "_approver"))
+        stem.endswith(("_user", "_by"))
         or stem in USER_REFERENCE_STEMS
     ) and "users" in name_lookup:
         return name_lookup["users"]
@@ -550,6 +550,7 @@ def _normalize_special_references(tables: list[dict]) -> None:
     """Normalize external and polymorphic IDs before FK validation."""
     if not isinstance(tables, list):
         return
+    lookup = _build_name_lookup(tables)
     for table in tables:
         if not isinstance(table, dict):
             continue
@@ -560,7 +561,11 @@ def _normalize_special_references(tables: list[dict]) -> None:
             if "target_id" in names and "target_type" not in names:
                 columns.append({"name": "target_type", "type": "VARCHAR(50)", "constraints": "NOT_NULL"})
         for col in columns:
-            if not isinstance(col, dict) or str(col.get("name") or "") not in {"provider_message_id", "target_id"}:
+            if not isinstance(col, dict):
+                continue
+            column_name = str(col.get("name") or "")
+            is_correlation_id = column_name == "request_id" and not lookup.get("request")
+            if column_name not in {"provider_message_id", "target_id"} and not is_correlation_id:
                 continue
             constraints = str(col.get("constraints") or "")
             constraints = re.sub(r"\bFOREIGN_KEY\b", "", constraints, flags=re.IGNORECASE)
@@ -754,6 +759,28 @@ def _normalize_relationships(relationships: list | None, tables: list[dict]) -> 
                 text = candidate
         if not re.search(r"\(\s*[0-9Nn*]+\s*:\s*[0-9Nn*]+\s*\)", text):
             continue
+        canonical = re.match(
+            r"^([A-Za-z_][\w]*)\s+\([^)]*\)\s+([A-Za-z_][\w]*)$",
+            text,
+        )
+        if canonical and canonical.group(1) == canonical.group(2):
+            table_name = canonical.group(1)
+            table = next(
+                (item for item in tables if isinstance(item, dict) and item.get("name") == table_name),
+                None,
+            )
+            has_self_fk = bool(table) and any(
+                isinstance(column, dict)
+                and str(column.get("name") or "") != "id"
+                and re.search(
+                    rf"\bREFERENCES\s+{re.escape(table_name)}\s*\(",
+                    str(column.get("constraints") or ""),
+                    re.IGNORECASE,
+                )
+                for column in table.get("columns") or []
+            )
+            if not has_self_fk:
+                continue
         mentioned = re.findall(r"\b[A-Za-z_][\w]*\b", text)
         if len([name for name in mentioned if name in table_names]) < 2:
             continue
@@ -778,6 +805,7 @@ def dba_self_check(
     tables = dedupe_meta_tables(tables)
     tables = ensure_primary_keys(tables)
     tables = annotate_table_feature_ids(tables, registry or [])
+    _normalize_special_references(tables)
     valid_feature_ids = {
         str(item.get("featureId") or item.get("id") or "").strip()
         for item in registry or []
@@ -797,6 +825,7 @@ def dba_self_check(
         tables = annotate_table_feature_ids(tables, registry or [])
     _ensure_fk_references(tables, registry or [])
     tables = reconcile_fk_types(tables)
+    tables = finalize_table_indexes(tables)
 
     table_names = {
         str(table.get("name")) for table in tables
@@ -824,7 +853,11 @@ def dba_self_check(
             if not column_name.endswith("_id"):
                 continue
             stem = column_name[:-3]
-            if stem in EXTERNAL_OR_POLYMORPHIC_FK_STEMS or stem.startswith("target_"):
+            if (
+                stem in EXTERNAL_OR_POLYMORPHIC_FK_STEMS
+                or stem.startswith("target_")
+                or (stem == "request" and not lookup.get("request"))
+            ):
                 continue
             reference = re.search(
                 r"\bREFERENCES\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
@@ -902,6 +935,21 @@ def _stable_schema_order(tables: list[dict]) -> list[dict]:
         indexes = [str(index).strip() for index in table.get("indexes") or [] if str(index).strip()]
         table["indexes"] = sorted(dict.fromkeys(indexes), key=str.casefold)
     return sorted(normalized, key=lambda table: str(table.get("name")).casefold())
+
+
+def finalize_table_indexes(tables: list[dict]) -> list[dict]:
+    """Validate and synthesize indexes only against the final column set."""
+    for table in tables or []:
+        if not isinstance(table, dict):
+            continue
+        _repair_indexes(table)
+        for column in table.get("columns") or []:
+            if isinstance(column, dict) and re.search(
+                r"REFERENCES\s+", str(column.get("constraints") or ""), re.IGNORECASE,
+            ):
+                _ensure_index(table, (str(column.get("name")),))
+        _repair_indexes(table)
+    return tables
 
 
 def reconcile_fk_types(tables: list) -> list:
@@ -993,11 +1041,7 @@ def reconcile_fk_types(tables: list) -> list:
     # Column removal/retargeting happens after the first sanitize pass. Reconcile
     # indexes against the final columns and guarantee an index for every real FK,
     # so repeated selective repairs are idempotent instead of oscillating.
-    for tbl in tables:
-        _repair_indexes(tbl)
-        for col in tbl.get("columns") or []:
-            if isinstance(col, dict) and re.search(r"REFERENCES\s+", str(col.get("constraints") or ""), re.I):
-                _ensure_index(tbl, (str(col.get("name")),))
+    finalize_table_indexes(tables)
 
     if fixed:
         logger.info("DBA FK 타입 %d개 교정 — 참조 PK 타입에 정합", fixed)
@@ -2412,9 +2456,23 @@ class DbaAgent:
             relationships = result.get("relationships")
             if not isinstance(relationships, list):
                 relationships = current.get("relationships", [])
-            if not applied and relationships == current.get("relationships", []):
+            candidate_relationships = _normalize_relationships(
+                relationships, list(by_name.values()),
+            )
+            current_relationships = _normalize_relationships(
+                current.get("relationships", []), list(by_name.values()),
+            )
+            relationship_changed = candidate_relationships != current_relationships
+            if not applied and not relationship_changed:
                 logger.warning("DBA targeted repair — 적용 가능한 patch 없음, 원본 유지")
-                return state
+                return state.copy(
+                    targeted_repair_results={
+                        **state.targeted_repair_results,
+                        "db": "rejected_contract_external",
+                    },
+                    status_message="DBA targeted repair 무시 — Registry 계약 밖 patch",
+                )
+            relationships = candidate_relationships
             tables = ensure_primary_keys(
                 dedupe_meta_tables(sanitize_tables(list(by_name.values())))
             )
@@ -2444,6 +2502,7 @@ class DbaAgent:
                 qa_db_blockers=self_check_issues,
                 qa_db_issues=self_check_issues,
                 qa_approved=False if self_check_issues else state.qa_approved,
+                targeted_repair_results={**state.targeted_repair_results, "db": "applied"},
                 status_message="DBA 에이전트 완료 — 지적 테이블만 수정",
             )
         except Exception as e:
@@ -2897,7 +2956,9 @@ def _ensure_reference_column(table: dict, target: str, nullable: bool = False) -
     constraints = f"{'NULL' if nullable else 'NOT_NULL'} FOREIGN_KEY REFERENCES {target}(id)"
     for column in table.setdefault("columns", []):
         if isinstance(column, dict) and column.get("name") == name:
-            column["type"] = "BIGINT"
+            # The referenced PK may be UUID (or another valid key type). Keep an
+            # existing type here; reconcile_fk_types owns cross-table alignment.
+            column["type"] = column.get("type") or "BIGINT"
             column["constraints"] = constraints
             return
     table["columns"].append({"name": name, "type": "BIGINT", "constraints": constraints})

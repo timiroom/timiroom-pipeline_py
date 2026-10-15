@@ -1,5 +1,7 @@
 import asyncio
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -17,11 +19,17 @@ from phase2.agents.dba_agent import (
     _fk_target,
     _normalize_special_references,
     annotate_table_feature_ids,
+    dba_self_check,
     ensure_primary_keys,
+    finalize_table_indexes,
     normalize_table_contract_names,
     reconcile_fk_types,
 )
-from phase2.agents.feature_spec_agent import FeatureSpecAgent, _score_supporting
+from phase2.agents.feature_spec_agent import (
+    FeatureSpecAgent,
+    _ensure_required_contracts,
+    _score_supporting,
+)
 from phase2.agents.prd_agent import reconcile_core_features
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent, _polish_market_research_text
@@ -63,7 +71,7 @@ def test_api_self_check_removes_unknown_and_duplicate_endpoints():
     assert len([item for item in endpoints if item.get("featureId") == "market.list"]) == 1
 
 
-def test_api_self_check_reports_contract_path_and_placeholder_details():
+def test_api_self_check_replaces_wrong_path_with_contract_endpoint():
     registry = [{
         "featureId": "market.create",
         "name": "물품 등록",
@@ -79,9 +87,104 @@ def test_api_self_check_reports_contract_path_and_placeholder_details():
         "errorCodes": "400 — 요청 오류",
     }], registry)
 
-    assert any(issue.startswith("API_CONTRACT_PATH_MISMATCH:") for issue in issues)
+    assert not any(issue.startswith("API_CONTRACT_PATH_MISMATCH:") for issue in issues)
     assert any(issue.startswith("API_CONTRACT_DETAIL_PLACEHOLDER:") for issue in issues)
     assert any(endpoint.get("path") == "/api/v1/items" for endpoint in endpoints)
+
+
+def test_api_self_check_drops_contract_external_endpoint_without_leaking_its_placeholder():
+    registry = [{
+        "featureId": "auth.login",
+        "name": "로그인",
+        "apiContract": [{"method": "POST", "path": "/api/v1/auth/login"}],
+    }]
+    endpoints, issues = api_self_check([
+        {
+            "method": "POST", "path": "/api/v1/auth/login", "featureId": "auth.login",
+            "description": "로그인: 자격 증명 검증", "requestBody": "email, password",
+            "successResponse": "accessToken", "errorCodes": "401 — 인증 실패",
+        },
+        {
+            "method": "POST", "path": "/api/v1/auth/refresh", "featureId": "auth.login",
+            "description": "Registry 계약 endpoint", "requestBody": "계약 기반 요청 본문",
+            "successResponse": "success: boolean", "errorCodes": "400 — 요청 오류",
+        },
+    ], registry)
+
+    assert {(item["method"], item["path"]) for item in endpoints} == {
+        ("POST", "/api/v1/auth/login"),
+    }
+    assert not any("/auth/refresh" in issue for issue in issues)
+
+
+def test_refresh_api_contract_adds_atomic_db_contract():
+    item = _ensure_required_contracts({
+        "featureId": "auth.refresh",
+        "name": "세션 갱신",
+        "actions": ["refresh"],
+        "ownership": {"ownerEntity": "members"},
+        "apiContract": [{"method": "POST", "path": "/api/v1/auth/refresh"}],
+        "dbContract": {"tables": ["members"], "foreignKeys": []},
+    })
+
+    assert {"members", "refresh_tokens"} <= set(item["dbContract"]["tables"])
+    assert {
+        "table": "refresh_tokens",
+        "column": "member_id",
+        "references": {"table": "members", "column": "id"},
+    } in item["dbContract"]["foreignKeys"]
+
+
+def test_truncated_api_repair_response_is_not_partially_applied():
+    agent = object.__new__(ApiAgent)
+    agent._call = AsyncMock(return_value=(
+        '{"patches":[{"method":"GET","path":"/api/v1/items",'
+        '"description":"부분 patch"}]'
+    ))
+    original = {
+        "authentication": "공개 API",
+        "endpoints": [{
+            "method": "GET", "path": "/api/v1/items", "featureId": "items.read",
+            "description": "목록 조회", "requestBody": "없음",
+            "successResponse": "items: array", "errorCodes": "500 — 서버 오류",
+        }],
+    }
+    state = PipelineState(
+        api_spec=json.dumps(original, ensure_ascii=False),
+        feature_list=["목록 조회"],
+        feature_registry=[{
+            "featureId": "items.read", "name": "목록 조회",
+            "apiContract": [{"method": "GET", "path": "/api/v1/items"}],
+        }],
+    )
+
+    result = asyncio.run(agent.repair(state, "description 수정"))
+
+    assert result.api_spec == state.api_spec
+
+
+def test_indexes_are_finalized_after_columns_and_fk_targets():
+    tables = [
+        {
+            "name": "users",
+            "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
+            "indexes": [],
+        },
+        {
+            "name": "items",
+            "columns": [
+                {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+                {"name": "user_id", "type": "BIGINT", "constraints": "FOREIGN_KEY REFERENCES users(id)"},
+            ],
+            "indexes": ["CREATE INDEX idx_items_missing ON items(missing_column)"],
+        },
+    ]
+
+    finalized = finalize_table_indexes(tables)
+    indexes = finalized[1]["indexes"]
+
+    assert not any("missing_column" in index for index in indexes)
+    assert any("(user_id)" in index for index in indexes)
 
 
 class _Progress:
@@ -255,12 +358,77 @@ def test_dba_special_references_distinguish_external_polymorphic_and_self_fk():
     assert "target_type" in audit_names
 
 
+def test_dba_request_id_is_correlation_id_without_requests_table():
+    tables = [{"name": "audit_logs", "columns": [
+        {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+        {
+            "name": "request_id",
+            "type": "BIGINT",
+            "constraints": "NULL FOREIGN_KEY REFERENCES audit_logs(id)",
+        },
+    ]}]
+
+    checked, relationships, issues = dba_self_check(
+        tables, ["audit_logs (1:N) audit_logs"], [],
+    )
+
+    request_id = checked[0]["columns"][1]
+    assert "FOREIGN_KEY" not in request_id["constraints"]
+    assert "REFERENCES" not in request_id["constraints"]
+    assert relationships == []
+    assert issues == []
+
+
+def test_dba_request_id_keeps_fk_when_requests_table_exists():
+    tables = [
+        {"name": "requests", "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+        ]},
+        {"name": "request_events", "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "request_id", "type": "BIGINT", "constraints": "NOT_NULL"},
+        ]},
+    ]
+
+    checked, relationships, issues = dba_self_check(tables, [], [])
+
+    request_id = checked[1]["columns"][1]
+    assert "REFERENCES requests(id)" in request_id["constraints"]
+    assert "requests (1:N) request_events" in relationships
+    assert issues == []
+
+
 def test_supporting_priority_uses_dependency_score_and_release_gate():
     priority, score, gate = _score_supporting("inventory validation", "required release blocker for data integrity")
 
     assert priority == "P1"
     assert score >= 5
     assert gate is True
+
+
+def test_feature_spec_core_contract_expands_methods_from_requirements():
+    item = {
+        "featureId": "feature_001",
+        "name": "식물 등록",
+        "description": "사용자의 식물을 저장하고 목록으로 제공한다.",
+        "requirements": ["등록한 식물을 조회하고 수정하며 삭제할 수 있어야 한다."],
+        "actions": ["create"],
+        "apiContract": [
+            {"method": "POST", "path": "/api/v1/plants", "action": "create"},
+        ],
+        "dbContract": {"tables": ["plants"], "foreignKeys": []},
+    }
+
+    result = _ensure_required_contracts(item)
+    contracts = {
+        (contract["method"], contract["path"])
+        for contract in result["apiContract"]
+    }
+
+    assert ("POST", "/api/v1/plants") in contracts
+    assert ("GET", "/api/v1/plants") in contracts
+    assert ("PATCH", "/api/v1/plants/{plantId}") in contracts
+    assert ("DELETE", "/api/v1/plants/{plantId}") in contracts
 
 
 def test_feature_spec_fallback_uses_prd_core_features():

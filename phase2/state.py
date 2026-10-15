@@ -23,6 +23,8 @@ class PipelineState:
     # Phase 1 결과
     user_query: str = ""
     context_prompt: str = ""
+    rag_chunks_retrieved: int = 0
+    rag_context_fallback: bool = False
     pdf_files_total: int = 0
     pdf_files_processed: int = 0
     pdf_files_failed: int = 0
@@ -31,6 +33,7 @@ class PipelineState:
     feature_list: list[str] = field(default_factory=list)
     feature_specs: list[dict[str, Any]] = field(default_factory=list)
     feature_registry: list[dict[str, Any]] = field(default_factory=list)
+    feature_registry_hash: str = ""
     project_plan: dict[str, Any] = field(default_factory=dict)
     feature_spec_document: str = ""
     dba_instruction: str = ""
@@ -39,6 +42,7 @@ class PipelineState:
     # 병렬 에이전트 결과
     db_schema: str = ""
     api_spec: str = ""
+    openapi_spec: str = ""
 
     # Phase 3 검증
     retry_count: int = 0
@@ -82,6 +86,9 @@ class PipelineState:
     # Phase3 targeted repair budget. Keys are pm/prd/db/api and each domain is
     # allowed one automatic repair per pipeline.
     targeted_repair_attempts: dict[str, int] = field(default_factory=dict)
+    # Repair agents report whether a requested delta was actually applied.
+    # Rejected contract-external patches must not consume the domain budget.
+    targeted_repair_results: dict[str, str] = field(default_factory=dict)
     # Phase 3 blocker bundle: repair 전후에 어떤 결함이 남고 해결됐는지 추적한다.
     validation_blockers: list[str] = field(default_factory=list)
     validation_resolved_blockers: list[str] = field(default_factory=list)

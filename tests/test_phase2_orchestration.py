@@ -56,6 +56,40 @@ def test_top_level_phase2_builds_prd_then_pm_and_fans_out_dba_api():
     assert result.prd_document == '{"coreFeatures":[]}'
 
 
+def test_registry_is_frozen_and_parallel_clones_do_not_share_mutations():
+    state = PipelineState(
+        feature_registry=[{
+            "featureId": "items.read", "name": "목록 조회",
+            "apiContract": [{"method": "GET", "path": "/api/v1/items"}],
+        }],
+        feature_specs=[{"featureId": "items.read", "name": "목록 조회"}],
+    )
+
+    frozen = OrchestrationGraph._freeze_feature_registry(state)
+    left = OrchestrationGraph._clone_frozen_registry(frozen)
+    right = OrchestrationGraph._clone_frozen_registry(frozen)
+    left.feature_registry[0]["name"] = "변경됨"
+
+    assert frozen.feature_registry[0]["name"] == "목록 조회"
+    assert right.feature_registry[0]["name"] == "목록 조회"
+    assert len(frozen.feature_registry_hash) == 64
+
+
+def test_registry_resync_preserves_unchanged_feature_ids():
+    before = PipelineState(feature_registry=[
+        {"featureId": "a", "name": "A", "apiContract": [{"path": "/api/v1/a"}]},
+        {"featureId": "b", "name": "B", "apiContract": [{"path": "/api/v1/b"}]},
+    ])
+    candidate = PipelineState(feature_registry=[
+        {"featureId": "a", "name": "A2", "apiContract": [{"path": "/api/v1/a2"}]},
+        {"featureId": "b", "name": "B2", "apiContract": [{"path": "/api/v1/b2"}]},
+    ])
+
+    result = OrchestrationGraph._retain_unchanged_registry(before, candidate, {"a"})
+
+    assert [item["name"] for item in result.feature_registry] == ["A2", "B"]
+
+
 def test_qa_reports_findings_without_rewriting_documents():
     state = PipelineState(
         feature_list=["예약 생성"],

@@ -1,8 +1,8 @@
 import asyncio
 import json
 import logging
-from typing import Any
 from datetime import UTC, datetime
+from typing import Any
 
 import psycopg2
 from aiokafka import AIOKafkaProducer
@@ -128,6 +128,7 @@ class KafkaProducerService:
             marketResearch=state.market_research,
             dbSchema=state.db_schema,
             apiSpec=state.api_spec,
+            openApiSpec=state.openapi_spec or "{}",
             featureSpecDocument=state.feature_spec_document or "{}",
             featureRegistry=state.feature_registry or [],
             retryCount=state.retry_count,

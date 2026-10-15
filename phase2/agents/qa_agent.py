@@ -35,7 +35,15 @@ from phase2.state import PipelineState
 
 from phase2.agents.dba_agent import _build_name_lookup, _fk_target
 from phase2.agents.api_agent import _endpoint_quality_issues, _feature_methods, _feature_resource_slug
-from phase2.agent_contract import IssueSeverity, canonical_api_method, classify_issue, endpoint_feature_table, feature_relation_kind, requires_auth
+from phase2.agent_contract import (
+    IssueSeverity,
+    canonical_api_method,
+    classify_issue,
+    endpoint_feature_ids,
+    endpoint_feature_table,
+    feature_relation_kind,
+    requires_auth,
+)
 from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts, scoped_unique_columns
 
 logger = logging.getLogger(__name__)
@@ -515,6 +523,9 @@ class QaAgent:
         db_issues = list(result.get("db_issues", []))
         api_issues = list(result.get("api_issues", []))
         prd_issues = list(result.get("prd_issues", []))
+        db_issues.extend(x for x in state.qa_db_blockers if x not in db_issues)
+        api_issues.extend(x for x in state.qa_api_blockers if x not in api_issues)
+        prd_issues.extend(x for x in state.qa_prd_blockers if x not in prd_issues)
         deterministic_db = self._check_db_completeness(
             try_parse_json(db_draft), state.feature_list, state.feature_registry,
         )
@@ -629,6 +640,9 @@ class QaAgent:
         db_issues.extend(x for x in contract_db if x not in db_issues)
         api_issues.extend(x for x in contract_api if x not in api_issues)
         prd_issues.extend(x for x in contract_prd if x not in prd_issues)
+        db_issues.extend(x for x in state.qa_db_blockers if x not in db_issues)
+        api_issues.extend(x for x in state.qa_api_blockers if x not in api_issues)
+        prd_issues.extend(x for x in state.qa_prd_blockers if x not in prd_issues)
         db_issues.extend(x for x in self._check_domain_scope(db_parsed, prd_parsed) if x not in db_issues)
         db_issues.extend(x for x in self._check_duplicate_domains(db_parsed) if x not in db_issues)
         total_issues = len(db_issues) + len(api_issues) + len(prd_issues)
@@ -695,10 +709,8 @@ class QaAgent:
                 if endpoint:
                     detail["artifactKey"] = f"{endpoint.group(1)} {endpoint.group(2)}"
                 if category == "db":
-                    table = re.search(r"(?:DB 스키마:\s*)?([a-z][a-z0-9_]*)", text)
-                    if table:
-                        detail["artifactKey"] = table.group(1)
                     fk = re.search(
+                        r"(?:DBA_SELF_CHECK_BLOCKER:\s*|DB 스키마:\s*)"
                         r"([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)의 FK 참조 대상을 찾을 수 없습니다",
                         text,
                     )
@@ -806,8 +818,8 @@ class QaAgent:
         }
         registry_ids = {str(item.get("featureId") or item.get("id") or "").strip() for item in registry or []}
         for endpoint in endpoints:
-            feature_id = str(endpoint.get("featureId") or "").strip()
-            if not feature_id or feature_id not in registry_ids:
+            feature_ids = endpoint_feature_ids(endpoint)
+            if not feature_ids or any(feature_id not in registry_ids for feature_id in feature_ids):
                 api_issues.append(
                     f"API endpoint {endpoint.get('method', 'GET')} {endpoint.get('path', '')}: Registry featureId 매핑 누락"
                 )
@@ -893,6 +905,10 @@ class QaAgent:
                 if (
                     column_name in {"target_id", "feature_id", "provider_message_id"}
                     or column_name.startswith("target_")
+                    or (
+                        column_name == "request_id"
+                        and not ({"request", "requests"} & table_names)
+                    )
                 ):
                     continue
                 constraints = str(column.get("constraints", "")).upper()
@@ -935,7 +951,7 @@ class QaAgent:
                     })
                     if (
                         stem in USER_REFERENCE_STEMS
-                        or stem.endswith(("_user", "_by", "_manager", "_approver"))
+                        or stem.endswith(("_user", "_by"))
                     ):
                         candidates.update({"user", "users"})
                     # Prefixes such as target_equipment_id still refer to the
@@ -1616,7 +1632,7 @@ class QaAgent:
         for item in prd_doc.get("userPersonas") or []:
             if isinstance(item, dict):
                 sig = f"{item.get('age', '')} {item.get('job', '')}"
-                if any(near_duplicate(sig, prior, 0.75) for prior in signatures):
+                if sig in signatures:
                     issues.append("Persona 연령·직업 조합이 중복되어 세그먼트 구분이 약함")
                     break
                 signatures.append(sig)
@@ -1642,7 +1658,7 @@ class QaAgent:
             endpoint_texts = [
                 " ".join(
                     str(ep.get(key, ""))
-                    for key in ("method", "path", "description", "featureId", "featureName", "action")
+                    for key in ("method", "path", "description", "featureId", "featureIds", "featureName", "action")
                 )
                 for ep in endpoints if isinstance(ep, dict)
             ]

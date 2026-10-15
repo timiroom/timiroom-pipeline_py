@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from phase2.agent_contract import canonical_api_method, normalize_api_path
-
+from phase2.agent_contract import (
+    canonical_api_method,
+    endpoint_feature_ids,
+    normalize_api_path,
+)
 
 _ACTION_TERMS = (
     ("생성", "create"), ("등록", "create"), ("조회", "read"), ("검색", "read"),
@@ -165,38 +168,10 @@ def normalize_feature_registry(
             normalized.append(value)
             known_names.add(name)
             used_ids.add(value["id"])
-    # 하나의 REST route는 최종 API 산출물에서 하나의 featureId만 가질 수
-    # 있다. LLM/repair가 같은 auth 계약을 여러 supporting 기능에 복사하면
-    # 어느 기능에도 안정적으로 연결되지 않으므로 Registry에서 소유자를
-    # 결정론적으로 하나만 선택한다. 인증 route는 이름이 실제 인증 기능인
-    # 항목을 우선하고, 그 외 중복은 Registry 순서를 따른다.
-    auth_terms = ("login", "signin", "로그인", "register", "회원가입", "signup", "logout", "로그아웃")
-    contract_owner: dict[tuple[str, str], tuple[int, int]] = {}
-    for index, item in enumerate(normalized):
-        for contract in item.get("apiContract") or []:
-            if not isinstance(contract, dict):
-                continue
-            key = (
-                str(contract.get("method") or "GET").upper(),
-                _normalize_api_path(contract.get("path")),
-            )
-            score = 1 if any(term in str(item.get("name") or "").casefold() for term in auth_terms) else 0
-            previous = contract_owner.get(key)
-            if previous is None or (score, -index) > (previous[1], -previous[0]):
-                contract_owner[key] = (index, score)
-    for index, item in enumerate(normalized):
-        kept = []
-        for contract in item.get("apiContract") or []:
-            if not isinstance(contract, dict):
-                continue
-            key = (
-                str(contract.get("method") or "GET").upper(),
-                _normalize_api_path(contract.get("path")),
-            )
-            if contract_owner.get(key, (index, 0))[0] == index:
-                kept.append(contract)
-        item["apiContract"] = kept
-        item["api"] = kept
+    # 여러 기능이 같은 사용자 작업을 공유할 수 있다. 예를 들어 목록 조회는
+    # 검색·필터·페이지네이션 기능을 동시에 구현한다. Registry에서 한 소유자만
+    # 남기면 지식 그래프가 끊기므로 중복 route 계약을 그대로 보존하고 API
+    # 산출 단계에서 endpoint.featureIds로 병합한다.
     return normalized
 
 
@@ -247,14 +222,20 @@ def missing_api_contract_features(
     endpoints: list[dict] | None,
 ) -> list[str]:
     """Return feature IDs whose declared API contracts are absent from the final spec."""
-    endpoint_keys = {
-        (
+    endpoint_keys: dict[str, set[tuple[str, str]]] = {}
+    unscoped_keys: set[tuple[str, str]] = set()
+    for endpoint in endpoints or []:
+        if not isinstance(endpoint, dict) or not endpoint.get("path"):
+            continue
+        key = (
             canonical_api_method(endpoint.get("method"), endpoint.get("path")),
             _normalize_api_path(endpoint.get("path")),
         )
-        for endpoint in endpoints or []
-        if isinstance(endpoint, dict) and endpoint.get("path")
-    }
+        feature_ids = endpoint_feature_ids(endpoint)
+        if not feature_ids:
+            unscoped_keys.add(key)
+        for feature_id in feature_ids:
+            endpoint_keys.setdefault(feature_id, set()).add(key)
     missing: list[str] = []
     for item in registry or []:
         if not isinstance(item, dict):
@@ -270,7 +251,12 @@ def missing_api_contract_features(
                 canonical_api_method(contract.get("method"), contract.get("path")),
                 _normalize_api_path(contract.get("path")),
             )
-            if key[1] and key not in endpoint_keys and feature_id not in missing:
+            if (
+                key[1]
+                and key not in endpoint_keys.get(feature_id, set())
+                and key not in unscoped_keys
+                and feature_id not in missing
+            ):
                 missing.append(feature_id)
                 break
     return missing

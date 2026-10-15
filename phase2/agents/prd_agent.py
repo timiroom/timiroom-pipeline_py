@@ -1607,8 +1607,7 @@ class PrdAgent:
             if not persona_name or persona_name in persona_names:
                 continue
             sig = (str(item.get("age") or "").strip(), str(item.get("job") or "").strip())
-            signature_text = " ".join(sig)
-            if any(near_duplicate(signature_text, " ".join(prior), 0.75) for prior in signatures):
+            if sig in signatures:
                 continue
             signatures.add(sig)
             persona_names.add(persona_name)
@@ -1617,9 +1616,7 @@ class PrdAgent:
             if len(personas) >= 3:
                 break
             sig = (item["age"], item["job"])
-            if item["name"] not in persona_names and not any(
-                near_duplicate(" ".join(sig), " ".join(prior), 0.75) for prior in signatures
-            ):
+            if item["name"] not in persona_names and sig not in signatures:
                 signatures.add(sig)
                 persona_names.add(item["name"])
                 personas.append(item)
@@ -1632,6 +1629,10 @@ class PrdAgent:
                 if len(personas) >= 3:
                     break
                 if item["name"] not in persona_names:
+                    sig = (item["age"], item["job"])
+                    if sig in signatures:
+                        continue
+                    signatures.add(sig)
                     persona_names.add(item["name"])
                     personas.append(item)
         out["userPersonas"] = personas[:3]

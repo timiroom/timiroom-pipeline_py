@@ -13,7 +13,7 @@
                - remove: 모델을 부르지 않고 Python에서 해당 항목만 뺀다
                - add   : 새 항목만 만들게 하고 기존 목록 뒤에 이어붙인다
                셋 다 기존 항목 객체가 모델을 거치지 않으므로 변형될 수 없다.
-  4) 제안문  : 확정된 변경 내용을 근거로 "무엇을 어떤 값으로 바꾸는지" 문장을 만든다.
+  4) 분석    : 확정된 변경 내용을 근거로 수정 이유·영향 범위·변경 요약을 만든다.
 
 한 번의 호출로 "JSON Patch 경로를 직접 만들어라"고 시키지 않는 이유는 EXAONE이
 경로 표현식을 안정적으로 못 만들기 때문이다. 섹션/항목을 통째로 재작성시키면
@@ -28,11 +28,15 @@ import unicodedata
 from dataclasses import dataclass, field
 
 from fastapi import APIRouter, HTTPException
-from openai import InternalServerError, APITimeoutError, APIConnectionError
+from openai import APIConnectionError, APITimeoutError, InternalServerError
 from pydantic import BaseModel, Field
 
 from common.api_response import ok
-from phase2.json_utils import try_parse_json, has_suspicious_script, find_json_syntax_leak
+from phase2.json_utils import (
+    find_json_syntax_leak,
+    has_suspicious_script,
+    try_parse_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -786,6 +790,47 @@ _CLASSIFY_PROMPT = """## 문서 종류: {doc_label}
 reply는 항상 한국어 존댓말로 작성하세요."""
 
 
+_QUESTION_SYSTEM = """당신은 소프트웨어 명세를 검토하는 시니어 PM 겸 아키텍트입니다.
+사용자의 질문에 현재 문서의 실제 내용만 근거로 답하세요.
+
+JSON 하나만 출력하세요. 설명·마크다운 코드블록 금지."""
+
+_QUESTION_PROMPT = """## 문서 종류: {doc_label}
+
+## 현재 문서
+{document}
+
+## 사용자 질문
+{instruction}
+
+## 답변 규칙
+- 현재 문서에서 확인되는 사실과 개선 의견을 구분하세요.
+- 문서에 없는 내용을 이미 존재하는 것처럼 말하지 마세요.
+- 질문에 직접 답하고, 필요한 경우 확인할 섹션 이름을 함께 적으세요.
+- 문서 수정은 수행하지 않습니다.
+
+## 출력 형식
+{{"reply":"한국어 답변"}}"""
+
+
+async def _answer_document_question(
+    client, profile: DocProfile, document: dict, instruction: str, history: list[dict],
+) -> str:
+    """분류기의 짧은 미리보기가 아니라 현재 문서 전체를 근거로 질문에 답한다."""
+    prompt = _QUESTION_PROMPT.format(
+        doc_label=profile.label,
+        document=json.dumps(document, ensure_ascii=False, indent=2),
+        instruction=instruction,
+    )
+    raw, _ = await _call_openai(
+        client, _messages(_QUESTION_SYSTEM, prompt, history), max_tokens=2400,
+    )
+    node = try_parse_json(raw, strict=True)
+    if isinstance(node, dict) and isinstance(node.get("reply"), str) and node["reply"].strip():
+        return node["reply"].strip()
+    return "현재 문서를 바탕으로 답변을 만들지 못했습니다. 질문을 조금 더 구체적으로 알려주세요."
+
+
 async def _classify(client, profile: DocProfile, document: dict, instruction: str, history: list[dict]) -> dict:
     prompt = _CLASSIFY_PROMPT.format(
         doc_label=profile.label,
@@ -938,7 +983,7 @@ async def _ask_scope(
     messages = _messages(_SCOPE_SYSTEM, prompt, history)
     try:
         raw, _ = await _call_openai(client, messages, max_tokens=500)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - 범위 판정 실패 시 안전하게 전체 재작성한다.
         logger.warning("섹션 %s 범위 판정 호출 실패: %s — 전체 재작성으로 진행", key, e)
         return None, "edit"
 
@@ -1389,8 +1434,8 @@ async def _rewrite_section(
 # 이 시점에는 재작성이 이미 끝나 있으므로, 제안문은 추측이 아니라 실제로 적용될
 # 변경만을 근거로 쓰인다 — 제안과 결과가 어긋날 수 없다.
 
-_PROPOSAL_SYSTEM = """당신은 소프트웨어 기획 문서를 관리하는 시니어 PM입니다.
-문서에 적용할 변경 내용을 사용자에게 설명하고 동의를 구하는 문장을 씁니다.
+_PROPOSAL_SYSTEM = """당신은 소프트웨어 기획 문서를 관리하는 시니어 PM 겸 아키텍트입니다.
+사용자 요구사항과 확정된 문서 변경을 비교해 검토 가능한 분석 결과를 씁니다.
 
 JSON 하나만 출력하세요. 설명·마크다운 코드블록 금지."""
 
@@ -1403,14 +1448,15 @@ _PROPOSAL_PROMPT = """## 문서 종류: {doc_label}
 {changes}
 
 ## 작성 규칙
-- 2~4문장, 한국어 존댓말.
-- **무엇을 어떤 값으로 바꾸는지 구체적으로** 밝히세요. "적절히 조정하겠습니다" 같은 모호한 표현 금지.
-- 왜 그렇게 바꾸는지 근거를 한 문장 덧붙이세요.
+- summary: 요구사항과 현재 명세를 비교한 결론을 1~2문장으로 작성하세요.
+- reason: 왜 이 수정이 필요한지, 수정하지 않으면 어떤 불일치가 남는지 1~2문장으로 작성하세요.
+- proposal: **무엇을 어떤 값으로 바꾸는지 구체적으로** 2~4문장으로 작성하세요.
+- "적절히 조정" 같은 모호한 표현을 쓰지 마세요.
 - 위 '확정된 변경 내용'에 없는 것을 지어내지 마세요.
-- 마지막은 "진행할까요?"로 끝내세요.
+- 사용자에게 이미 diff가 함께 표시되므로 별도의 재확인 질문은 쓰지 마세요.
 
 ## 출력 형식
-{{"proposal": "..."}}"""
+{{"summary":"...", "reason":"...", "proposal":"..."}}"""
 
 # 제안문 프롬프트에 넣을 변경 줄 수 상한 — 넘으면 요약만 넣는다
 _MAX_PROPOSAL_LINES = 40
@@ -1434,21 +1480,41 @@ def _changes_digest(edits: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def _fallback_proposal(edits: list[dict]) -> str:
-    """제안문 생성이 실패했을 때 쓰는 결정론적 문구.
-    LLM 호출 실패로 흐름 전체가 막히면 안 되므로 변경 규모만이라도 알린다."""
-    summaries = []
+def _change_stats(edits: list[dict]) -> list[dict]:
+    """프론트가 LLM 문장을 다시 해석하지 않도록 변경 규모를 구조화한다."""
+    stats = []
     for edit in edits:
-        added = sum(1 for d in edit["diff"] if d["type"] == "add")
-        removed = sum(1 for d in edit["diff"] if d["type"] == "del")
-        summaries.append(f'{edit["label"]}({removed}줄 → {added}줄)')
-    return f"{', '.join(summaries)}을(를) 수정하려 합니다. 아래 변경 내용을 확인해 주세요. 진행할까요?"
+        added = sum(1 for line in edit["diff"] if line["type"] == "add")
+        removed = sum(1 for line in edit["diff"] if line["type"] == "del")
+        stats.append({
+            "section": edit["section"],
+            "label": edit["label"],
+            "addedLines": added,
+            "removedLines": removed,
+            "changedLines": added + removed,
+        })
+    return stats
+
+
+def _fallback_analysis(profile: DocProfile, edits: list[dict]) -> dict:
+    """분석 문장 생성이 실패해도 실제 diff를 근거로 검토 가능한 응답을 만든다."""
+    summaries = []
+    for stat in _change_stats(edits):
+        summaries.append(f'{stat["label"]}(추가 {stat["addedLines"]}줄, 삭제 {stat["removedLines"]}줄)')
+    affected = [edit["label"] for edit in edits]
+    return {
+        "summary": f"{profile.label}의 {', '.join(affected)}에서 요구사항과 관련된 변경을 찾았습니다.",
+        "reason": "요청한 범위만 수정하고 그 외 문서 내용은 유지합니다.",
+        "proposal": f"{', '.join(summaries)}을 수정합니다. 아래 변경 내용을 검토한 뒤 적용해 주세요.",
+        "affectedSections": affected,
+        "changes": _change_stats(edits),
+    }
 
 
 async def _build_proposal(
     client, profile: DocProfile, instruction: str, edits: list[dict],
     history: list[dict] | None = None,
-) -> str:
+) -> dict:
     prompt = _PROPOSAL_PROMPT.format(
         doc_label=profile.label, instruction=instruction, changes=_changes_digest(edits),
     )
@@ -1457,13 +1523,21 @@ async def _build_proposal(
         raw, _ = await _call_openai(client, messages, max_tokens=800)
         node = try_parse_json(raw)
         if isinstance(node, dict):
+            summary = node.get("summary")
+            reason = node.get("reason")
             proposal = node.get("proposal")
-            if isinstance(proposal, str) and len(proposal.strip()) >= 10:
-                return proposal.strip()
-        logger.warning("제안문 파싱 실패 — 결정론적 문구로 대체")
-    except Exception as e:
-        logger.warning("제안문 생성 실패: %s — 결정론적 문구로 대체", e)
-    return _fallback_proposal(edits)
+            if all(isinstance(value, str) and value.strip() for value in (summary, reason, proposal)):
+                return {
+                    "summary": summary.strip(),
+                    "reason": reason.strip(),
+                    "proposal": proposal.strip(),
+                    "affectedSections": [edit["label"] for edit in edits],
+                    "changes": _change_stats(edits),
+                }
+        logger.warning("변경 분석 파싱 실패 — 결정론적 분석으로 대체")
+    except Exception as e:  # noqa: BLE001 - 분석 문장 실패 시 결정론적 결과를 반환한다.
+        logger.warning("변경 분석 생성 실패: %s — 결정론적 분석으로 대체", e)
+    return _fallback_analysis(profile, edits)
 
 
 def _append_relationship_sync(profile: DocProfile, document: dict, edits: list[dict]) -> None:
@@ -1572,14 +1646,21 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
 
     try:
         decision = await _classify(openai_client, profile, req.document, req.instruction, history)
-    except Exception as e:
-        logger.error("문서편집 분류 실패(%s): %s", doc_type, e, exc_info=True)
+    except Exception:
+        logger.exception("문서편집 분류 실패(%s)", doc_type)
         return ok({"intent": "chat", "reply": "잠시 후 다시 시도해 주세요.", "edits": []})
 
     if decision["intent"] == "chat":
+        try:
+            reply = await _answer_document_question(
+                openai_client, profile, req.document, req.instruction, history,
+            )
+        except Exception:
+            logger.exception("문서 질문 답변 실패(%s)", doc_type)
+            reply = "현재 문서를 분석하는 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
         return ok({
             "intent": "chat",
-            "reply": decision["reply"] or "무엇을 수정할지 조금 더 구체적으로 알려주시겠어요?",
+            "reply": reply,
             "edits": [],
         })
 
@@ -1626,7 +1707,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
 
     # 재작성이 끝난 뒤에 제안문을 만든다 — 실제 적용될 변경만 근거로 삼으므로
     # "이렇게 바꾸겠습니다"라고 말한 내용과 최종 결과가 어긋나지 않는다
-    proposal = await _build_proposal(openai_client, profile, req.instruction, edits, history)
+    analysis = await _build_proposal(openai_client, profile, req.instruction, edits, history)
 
     logger.info(
         "문서편집 제안 생성 (%s) — %d개 섹션: %s",
@@ -1634,6 +1715,7 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
     )
     return ok({
         "intent": "edit",
-        "reply": proposal,
+        "reply": analysis["proposal"],
+        "analysis": analysis,
         "edits": edits,
     })

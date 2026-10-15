@@ -3,7 +3,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from phase2.agent_contract import canonical_api_method, is_pre_auth_route
+from phase2.agent_contract import (
+    bind_endpoint_features,
+    canonical_api_method,
+    endpoint_feature_ids,
+    is_pre_auth_route,
+)
 from phase2.agents.api_agent import _canonical_api_path, _invalid_paths
 from phase2.agents.dba_agent import USER_REFERENCE_STEMS
 from phase2.feature_coverage import strictly_uncovered_features, uncovered_features
@@ -13,6 +18,7 @@ from phase2.feature_registry import (
 )
 from phase2.feature_scope import backend_features
 from phase2.json_utils import try_parse_json
+from phase2.openapi_spec import build_openapi_document, validate_openapi_document
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +79,7 @@ class SchemaValidator:
         targets: set[str] = set()
         blocker_details: list[dict] = []
 
-        def add(code: str, target: str, message: str) -> None:
+        def add(code: str, target: str, message: str, **artifact: object) -> None:
             if code not in codes:
                 codes.append(code)
             if message not in errors:
@@ -84,29 +90,7 @@ class SchemaValidator:
                 "repairTarget": target,
                 "message": message,
             }
-            fk = re.search(
-                r"(?:DB 스키마:\s*)?([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)의 FK 참조 대상을 찾을 수 없습니다",
-                message,
-            )
-            if fk:
-                detail.update({
-                    "artifactKey": fk.group(1),
-                    "table": fk.group(1),
-                    "column": fk.group(2),
-                    "repairScope": "table_column",
-                })
-            endpoint = re.search(
-                r"\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(/api/v1/[^\s:]+)",
-                message,
-                re.IGNORECASE,
-            )
-            if endpoint:
-                detail.update({
-                    "artifactKey": f"{endpoint.group(1).upper()} {endpoint.group(2)}",
-                    "method": endpoint.group(1).upper(),
-                    "path": endpoint.group(2),
-                    "repairScope": "endpoint",
-                })
+            detail.update({key: value for key, value in artifact.items() if value is not None})
             if detail not in blocker_details:
                 blocker_details.append(detail)
 
@@ -273,7 +257,15 @@ class SchemaValidator:
                 keys.append((method, path))
             for field_name in ("description", "successResponse", "errorCodes"):
                 if not str(endpoint.get(field_name, "")).strip():
-                    add("API_FIELDS_REQUIRED", "api", f"API 스펙: {method} {path}의 {field_name}이 비어있습니다")
+                    add(
+                        "API_FIELDS_REQUIRED",
+                        "api",
+                        f"API 스펙: {method} {path}의 {field_name}이 비어있습니다",
+                        artifactKey=f"{method} {path}",
+                        method=method,
+                        path=path,
+                        repairScope="endpoint",
+                    )
 
         if len(keys) != len(set(keys)):
             add("API_ENDPOINT_DUPLICATED", "api", "API 스펙: method/path가 중복된 엔드포인트가 있습니다")
@@ -285,17 +277,33 @@ class SchemaValidator:
                 str(item.get("featureId") or item.get("id") or "").strip()
                 for item in feature_registry if isinstance(item, dict)
             }
-            unmapped = [
-                f"{endpoint.get('method', 'GET')} {endpoint.get('path', '')}"
-                for endpoint in endpoints
-                if isinstance(endpoint, dict)
-                and str(endpoint.get("featureId") or "").strip() not in registry_ids
-            ]
-            if unmapped:
-                add("API_FEATURE_ID_REQUIRED", "api", f"API 스펙: Registry featureId 매핑 누락 — {unmapped}")
+            for endpoint in endpoints:
+                if not isinstance(endpoint, dict):
+                    continue
+                feature_ids = endpoint_feature_ids(endpoint)
+                if feature_ids and all(feature_id in registry_ids for feature_id in feature_ids):
+                    continue
+                method = str(endpoint.get("method") or "GET").upper()
+                path = str(endpoint.get("path") or "")
+                add(
+                    "API_FEATURE_ID_REQUIRED",
+                    "api",
+                    f"API 스펙: Registry featureId 매핑 누락 — {method} {path}",
+                    artifactKey=f"{method} {path}",
+                    method=method,
+                    path=path,
+                    repairScope="endpoint",
+                )
             missing_contracts = missing_api_contract_features(feature_registry, endpoints)
-            if missing_contracts:
-                add("API_CONTRACT_MISSING", "api", f"API 스펙: apiContract endpoint 누락 — {missing_contracts}")
+            for feature_id in missing_contracts:
+                add(
+                    "API_CONTRACT_MISSING",
+                    "api",
+                    f"API 스펙: apiContract endpoint 누락 — {feature_id}",
+                    artifactKey=feature_id,
+                    featureId=feature_id,
+                    repairScope="feature_contract",
+                )
         else:
             missing = strictly_uncovered_features(
                 backend_features(feature_list),
@@ -310,6 +318,8 @@ class SchemaValidator:
             )
             if missing:
                 add("API_FEATURE_COVERAGE", "api", f"API 스펙: 기능에 대응하는 endpoint가 없어 보입니다 — {missing}")
+        for issue in validate_openapi_document(build_openapi_document(data)):
+            add("OPENAPI_INVALID", "api", f"OpenAPI 스펙: {issue}")
     @staticmethod
     def _check_prd(data: dict, feature_list: list[str], add, feature_registry=None) -> None:
         missing_fields = sorted(_REQUIRED_PRD_FIELDS - set(data))
@@ -384,7 +394,11 @@ class SchemaValidator:
                 # local table, so requiring a REFERENCES target here creates a
                 # false Phase3 blocker.
                 stem = name[:-3]
-                if stem in {"target", "feature", "provider_message", "provider_route"} or stem.startswith("target_"):
+                if (
+                    stem in {"target", "feature", "provider_message", "provider_route"}
+                    or stem.startswith("target_")
+                    or (stem == "request" and not ({"request", "requests"} & table_names))
+                ):
                     continue
                 # 구조화된 FK가 명시되어 있으면 컬럼명 추론보다 REFERENCES를 기준으로
                 # 검증한다. recorded_by_id, actor_id, job_id처럼 이름만으로 대상을
@@ -397,6 +411,10 @@ class SchemaValidator:
                         "DB_FOREIGN_KEY_TARGET_MISSING",
                         "db",
                         f"DB 스키마: {table.get('name')}.{name}의 FK 참조 대상을 찾을 수 없습니다",
+                        artifactKey=str(table.get("name") or ""),
+                        table=str(table.get("name") or ""),
+                        column=name,
+                        repairScope="table_column",
                     )
                     continue
                 candidates = SchemaValidator._fk_target_candidates(stem)
@@ -430,6 +448,10 @@ class SchemaValidator:
                         "DB_FOREIGN_KEY_TARGET_MISSING",
                         "db",
                         f"DB 스키마: {table.get('name')}.{name}의 FK 참조 대상을 찾을 수 없습니다",
+                        artifactKey=str(table.get("name") or ""),
+                        table=str(table.get("name") or ""),
+                        column=name,
+                        repairScope="table_column",
                     )
 
     @staticmethod
@@ -454,19 +476,25 @@ class SchemaValidator:
         endpoint_keys_by_feature: dict[str, set[tuple[str, str]]] = {}
         endpoint_by_key: dict[tuple[str, str], dict] = {}
         for endpoint in endpoints:
-            feature_id = str(endpoint.get("featureId") or "").strip()
-            if feature_id not in features:
-                add(
-                    "CONTRACT_GRAPH_API_FEATURE_UNKNOWN",
-                    "api",
-                    f"계약 그래프: endpoint가 Registry에 없는 featureId를 사용합니다 — {feature_id or '(없음)'}",
-                )
-                continue
             key = (
                 str(endpoint.get("method") or "GET").upper(),
                 _canonical_api_path(endpoint.get("path")),
             )
-            endpoint_keys_by_feature.setdefault(feature_id, set()).add(key)
+            feature_ids = endpoint_feature_ids(endpoint)
+            if not feature_ids:
+                add(
+                    "CONTRACT_GRAPH_API_FEATURE_UNKNOWN", "api",
+                    "계약 그래프: endpoint에 featureId/featureIds가 없습니다",
+                )
+            for feature_id in feature_ids:
+                if feature_id not in features:
+                    add(
+                        "CONTRACT_GRAPH_API_FEATURE_UNKNOWN",
+                        "api",
+                        f"계약 그래프: endpoint가 Registry에 없는 featureId를 사용합니다 — {feature_id}",
+                    )
+                    continue
+                endpoint_keys_by_feature.setdefault(feature_id, set()).add(key)
             endpoint_by_key.setdefault(key, endpoint)
 
         table_features: dict[str, set[str]] = {}
@@ -500,10 +528,9 @@ class SchemaValidator:
             for key in list(missing_api):
                 endpoint = endpoint_by_key.get(key)
                 if endpoint is not None:
-                    old_feature_id = str(endpoint.get("featureId") or "").strip()
-                    endpoint["featureId"] = feature_id
-                    if old_feature_id and old_feature_id in endpoint_keys_by_feature:
-                        endpoint_keys_by_feature[old_feature_id].discard(key)
+                    bind_endpoint_features(
+                        endpoint, [*endpoint_feature_ids(endpoint), feature_id],
+                    )
                     endpoint_keys_by_feature.setdefault(feature_id, set()).add(key)
                     missing_api.discard(key)
             if missing_api:
@@ -563,7 +590,7 @@ class SchemaValidator:
         if not isinstance(data, dict):
             return []
         errors = []
-        def add(code, _target, message):
+        def add(code, _target, message, **_artifact):
             if code in {"API_FEATURE_COVERAGE", "API_PATH_INVALID"}:
                 errors.append(message)
         self._check_api(data, feature_list, add)
