@@ -265,6 +265,9 @@ app = FastAPI(
     title="RAG Pipeline API",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url="/docs" if settings.expose_api_docs else None,
+    redoc_url="/redoc" if settings.expose_api_docs else None,
+    openapi_url="/openapi.json" if settings.expose_api_docs else None,
 )
 
 app.add_middleware(UsageMiddleware)
