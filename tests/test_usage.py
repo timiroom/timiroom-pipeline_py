@@ -202,3 +202,83 @@ def test_api_docs_are_hidden_by_default():
     from config.settings import Settings
 
     assert Settings(_env_file=None).expose_api_docs is False
+
+
+def test_model_tier_replaces_only_server_default_model(monkeypatch):
+    monkeypatch.setattr(settings, "openai_chat_model", "server-model")
+    monkeypatch.setattr(settings, "model_tier_high", "big-model")
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        seen.append(body["model"])
+        return httpx.Response(200, json=_completion(model=body["model"]))
+
+    async def run():
+        client = _client(handler)
+        token = usage.current_model_tier.set("high")
+        try:
+            await client.chat.completions.create(model="server-model", messages=[{"role": "user", "content": "hi"}])
+            # 다른 제공자·모델로 가는 호출(예: EXAONE)은 그대로 둔다.
+            await client.chat.completions.create(model="exaone", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            usage.current_model_tier.reset(token)
+        await client.chat.completions.create(model="server-model", messages=[{"role": "user", "content": "hi"}])
+
+    asyncio.run(run())
+    assert seen == ["big-model", "exaone", "server-model"]
+
+
+def test_responses_usage_is_recorded_and_tier_applied(monkeypatch):
+    monkeypatch.setattr(settings, "openai_chat_model", "server-model")
+    monkeypatch.setattr(settings, "model_tier_low", "fast-model")
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        seen.append(body["model"])
+        return httpx.Response(200, json={
+            "id": "r1", "object": "response", "created_at": 0, "model": body["model"], "status": "completed",
+            "output": [], "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
+            "usage": {"input_tokens": 30, "output_tokens": 5, "total_tokens": 35,
+                      "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}},
+        })
+
+    async def run():
+        client = _client(handler)
+        collector = UsageCollector()
+        c_token = current_collector.set(collector)
+        t_token = usage.current_model_tier.set("low")
+        try:
+            await client.responses.create(model="server-model", input="검색")
+        finally:
+            usage.current_model_tier.reset(t_token)
+            current_collector.reset(c_token)
+        return collector.summary()
+
+    summary = asyncio.run(run())
+    assert seen == ["fast-model"]
+    assert summary[0]["model"] == "fast-model"
+    assert summary[0]["inputTokens"] == 30 and summary[0]["outputTokens"] == 5
+
+
+def test_middleware_ignores_tier_when_user_key_is_used():
+    app = FastAPI()
+    app.add_middleware(UsageMiddleware)
+
+    @app.get("/api/v1/chat/tier")
+    async def tier():
+        return {"tier": usage.current_model_tier.get()}
+
+    client = TestClient(app)
+    original = settings.internal_api_token
+    settings.internal_api_token = ""
+    try:
+        assert client.get("/api/v1/chat/tier", headers={"X-Timiroom-Model-Tier": "HIGH"}).json() == {"tier": "high"}
+        assert client.get("/api/v1/chat/tier", headers={"X-Timiroom-Model-Tier": "best"}).json() == {"tier": None}
+        byok = {"X-Timiroom-Model-Tier": "high", "X-Timiroom-Llm-Provider": "openai",
+                "X-Timiroom-Llm-Base-Url": "https://api.openai.com/v1", "X-Timiroom-Llm-Api-Key": "k",
+                "X-Timiroom-Llm-Model": "m"}
+        assert client.get("/api/v1/chat/tier", headers=byok).json() == {"tier": None}
+    finally:
+        settings.internal_api_token = original

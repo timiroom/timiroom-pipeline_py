@@ -19,7 +19,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from common.usage import LlmOverride, UsageCollector, current_collector, current_override
+from common.usage import TIERS, LlmOverride, UsageCollector, current_collector, current_model_tier, current_override
 from config.settings import settings
 
 PROTECTED_PREFIXES = (
@@ -73,14 +73,17 @@ class UsageMiddleware(BaseHTTPMiddleware):
         except ValueError as e:
             return JSONResponse({"detail": str(e)}, status_code=400)
 
+        tier = request.headers.get("x-timiroom-model-tier", "").strip().lower()
         collector = UsageCollector() if tracking else None
         collector_token = current_collector.set(collector)
         override_token = current_override.set(override)
+        tier_token = current_model_tier.set(tier if tier in TIERS and override is None else None)
         try:
             response = await call_next(request)
         finally:
             current_collector.reset(collector_token)
             current_override.reset(override_token)
+            current_model_tier.reset(tier_token)
 
         if collector is not None and "text/event-stream" not in response.headers.get("content-type", ""):
             response.headers[USAGE_HEADER] = encode_usage(collector.summary())

@@ -9,6 +9,8 @@ create 함수를 한 번 감싸서 처리한다(install()).
   같은 수집기에 기록된다.
 - 사용자 키: 백엔드가 사용자 키를 헤더로 넘기면 그 요청 안의 "글 생성" 호출(chat completions)은
   사용자 서비스·모델로 보낸다. 검색용 임베딩은 서버 키를 그대로 쓴다.
+- AI 품질: 사용자 키가 없을 때 백엔드가 고른 품질(low·medium·high)을 넘기면, 서버 기본 모델로 가는
+  글 생성·웹 검색 호출의 모델만 그 품질의 모델로 바꾼다(다른 제공자로 가는 호출은 그대로).
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from typing import Any
 from openai import AsyncOpenAI
 from openai.resources.chat.completions import AsyncCompletions
 from openai.resources.embeddings import AsyncEmbeddings
+from openai.resources.responses import AsyncResponses
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +73,14 @@ class LlmOverride:
 
 current_collector: ContextVar[UsageCollector | None] = ContextVar("usage_collector", default=None)
 current_override: ContextVar[LlmOverride | None] = ContextVar("llm_override", default=None)
+# 이 요청의 AI 품질(low | medium | high). 없으면 서버 기본 모델.
+current_model_tier: ContextVar[str | None] = ContextVar("model_tier", default=None)
 _redirecting: ContextVar[bool] = ContextVar("llm_redirecting", default=False)
 
 _installed = False
 _original_chat_create = AsyncCompletions.create
 _original_embedding_create = AsyncEmbeddings.create
+_original_responses_create = AsyncResponses.create
 _override_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 
 
@@ -143,7 +149,36 @@ async def _patched_chat_create(self: AsyncCompletions, *args: Any, **kwargs: Any
                                     provider=override.provider, byok=True)
         finally:
             _redirecting.reset(token)
+    _apply_tier(kwargs)
     return await _call_chat(self, args, kwargs, provider="server", byok=False)
+
+
+TIERS = ("low", "medium", "high")
+
+
+def tier_model(tier: str | None) -> str | None:
+    from config.settings import settings
+    if tier not in TIERS:
+        return None
+    return getattr(settings, f"model_tier_{tier}") or None
+
+
+def _apply_tier(kwargs: dict) -> None:
+    """서버 기본 모델로 가는 호출만 사용자가 고른 품질의 모델로 바꾼다(EXAONE 같은 다른 제공자 호출은 그대로)."""
+    from config.settings import settings
+    model = tier_model(current_model_tier.get())
+    if model and kwargs.get("model") == settings.openai_chat_model:
+        kwargs["model"] = model
+
+
+async def _patched_responses_create(self: AsyncResponses, *args: Any, **kwargs: Any) -> Any:
+    """웹 검색(Responses API) 호출: 품질별 모델을 적용하고 사용량을 기록한다(사용자 키는 쓰지 않는다)."""
+    _apply_tier(kwargs)
+    response = await _original_responses_create(self, *args, **kwargs)
+    if not kwargs.get("stream"):
+        _record("chat", getattr(response, "model", None) or kwargs.get("model", ""), getattr(response, "usage", None),
+                provider="server", byok=False)
+    return response
 
 
 async def _call_chat(target: AsyncCompletions, args: tuple, kwargs: dict, *, provider: str, byok: bool) -> Any:
@@ -174,6 +209,7 @@ def install() -> None:
         return
     AsyncCompletions.create = _patched_chat_create  # type: ignore[method-assign]
     AsyncEmbeddings.create = _patched_embedding_create  # type: ignore[method-assign]
+    AsyncResponses.create = _patched_responses_create  # type: ignore[method-assign]
     _installed = True
     logger.info("AI 사용량 수집 설치 완료")
 
@@ -183,4 +219,5 @@ def uninstall() -> None:
     global _installed
     AsyncCompletions.create = _original_chat_create  # type: ignore[method-assign]
     AsyncEmbeddings.create = _original_embedding_create  # type: ignore[method-assign]
+    AsyncResponses.create = _original_responses_create  # type: ignore[method-assign]
     _installed = False
