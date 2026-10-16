@@ -92,7 +92,8 @@ class Settings(BaseSettings):
 
     # ── 검증 ─────────────────────────────────────────────────────
     validation_max_retry: int = 3
-    phase3_targeted_repair_max_per_domain: int = 1
+    # 문서 생성 중 자체 복구가 1회를 쓰므로, 최종 검증에서 한 번 더 고칠 수 있게 2로 둔다.
+    phase3_targeted_repair_max_per_domain: int = 2
     phase3_repair_timeout_seconds: float = 300.0
 
     # ── CORS ──────────────────────────────────────────────────────
