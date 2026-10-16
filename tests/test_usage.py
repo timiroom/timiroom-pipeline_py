@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 from openai import AsyncOpenAI
 
 from common import usage
-from common.usage import LlmOverride, UsageCollector, current_collector, current_override
+from common.usage import (
+    LlmOverride,
+    UsageCollector,
+    current_collector,
+    current_override,
+)
 from common.usage_middleware import UsageMiddleware
 from config.settings import settings
 
