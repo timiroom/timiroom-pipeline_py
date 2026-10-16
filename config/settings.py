@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     # ── Kafka ─────────────────────────────────────────────────────
     # 로컬에서 운영 Kafka와 같은 소비자 그룹을 쓰지 않도록 끌 수 있다. 끄면 결과 발행을 건너뛴다.
     kafka_enabled: bool = True
+    # API 문서(/docs, /redoc, /openapi.json)는 운영에서 숨긴다. 로컬에서 보려면 EXPOSE_API_DOCS=true.
+    expose_api_docs: bool = False
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic_pipeline_result: str = "rag.pipeline.result"
     kafka_topic_dead_letter: str = "rag.pipeline.result.DLT"

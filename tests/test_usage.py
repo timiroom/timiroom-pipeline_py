@@ -196,3 +196,9 @@ def test_byok_headers_validated(monkeypatch):
     assert client.post("/api/agent/chat", headers=partial).status_code == 400
     plain = dict(full, **{"X-Timiroom-Llm-Base-Url": "http://evil.test/v1"})
     assert client.post("/api/agent/chat", headers=plain).status_code == 400
+
+
+def test_api_docs_are_hidden_by_default():
+    from config.settings import Settings
+
+    assert Settings(_env_file=None).expose_api_docs is False
