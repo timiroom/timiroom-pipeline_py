@@ -794,3 +794,34 @@ def test_api_feedback_triggers_prd_rollback():
     assert prd.calls == 2
     assert api.calls == 2
     assert result.rollback_count == 1
+
+
+def test_llm_runtime_retries_busy_gateway_then_succeeds():
+    import httpx
+    from openai import RateLimitError
+
+    calls = {"n": 0}
+
+    async def factory():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            response = httpx.Response(429, request=httpx.Request("POST", "https://gw.test/v1/chat/completions"))
+            raise RateLimitError("busy", response=response, body=None)
+        return "ok"
+
+    runtime = LlmRuntime(max_concurrency=1, request_timeout_seconds=1, busy_retries=3, busy_backoff_seconds=0.001)
+    assert asyncio.run(runtime.call(factory)) == "ok"
+    assert calls["n"] == 3
+
+
+def test_llm_runtime_gives_up_after_busy_retries():
+    import httpx
+    from openai import RateLimitError
+
+    async def factory():
+        response = httpx.Response(429, request=httpx.Request("POST", "https://gw.test/v1/chat/completions"))
+        raise RateLimitError("busy", response=response, body=None)
+
+    runtime = LlmRuntime(max_concurrency=1, request_timeout_seconds=1, busy_retries=2, busy_backoff_seconds=0.001)
+    with pytest.raises(RateLimitError):
+        asyncio.run(runtime.call(factory))
