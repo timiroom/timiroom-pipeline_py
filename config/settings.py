@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_chat_model: str = "gpt-5.4-mini"
+    # 사용자가 고르는 AI 품질(빠름·균형·정밀)별 모델. 서버 기본 모델(openai_chat_model)로 가는 호출만 바꾼다.
+    model_tier_low: str = "gpt-5.6-luna"
+    model_tier_medium: str = "gpt-5.6-terra"
+    model_tier_high: str = "gpt-6-astra"
     openai_request_timeout_seconds: float = 120.0
     openai_max_retries: int = 2
 
