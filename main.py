@@ -28,6 +28,8 @@ from openai import AsyncOpenAI
 
 from common.exception_handler import register_exception_handlers
 from common.logging_middleware import RequestIdFilter, RequestIdMiddleware
+from common import usage as usage_tracking
+from common.usage_middleware import UsageMiddleware
 from config.settings import settings
 from phase1.document_ingestion import DocumentIngestionService
 from phase1.embedding_service import EmbeddingService
@@ -241,14 +243,17 @@ kafka_consumer_service = KafkaConsumerService(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    usage_tracking.install()
     # Kafka는 백그라운드 비동기 연결 — 앱 기동 차단 없음 (Java fail-fast: false 동일)
-    kafka_producer_service.start()
-    kafka_consumer_service.start()
+    if settings.kafka_enabled:
+        kafka_producer_service.start()
+        kafka_consumer_service.start()
 
     yield
 
-    await kafka_consumer_service.stop()
-    await kafka_producer_service.stop()
+    if settings.kafka_enabled:
+        await kafka_consumer_service.stop()
+        await kafka_producer_service.stop()
     await reranker.close()
     await embedding_service.close()
     await openai_client.close()
@@ -262,6 +267,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(UsageMiddleware)
 app.add_middleware(RequestIdMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -305,7 +311,7 @@ async def readiness():
     """DB와 Kafka가 실제로 요청을 처리할 수 있을 때만 ready를 반환한다."""
     try:
         await asyncio.to_thread(_check_database)
-        kafka_ready = kafka_producer_service.ready and kafka_consumer_service.ready
+        kafka_ready = (not settings.kafka_enabled) or (kafka_producer_service.ready and kafka_consumer_service.ready)
     except Exception as exc:
         logger.warning("Readiness 검사 실패: %s", exc)
         kafka_ready = False

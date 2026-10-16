@@ -221,15 +221,20 @@ async def _run_pipeline_inner(
                     },
                     "phaseReached": "PHASE3",
                     "partialResult": _artifact_snapshot(validated),
+                    "usage": _usage_summary(),
                 },
             )
             return
 
         # Phase 4
         progress_svc.send(pipeline_id, "PHASE4", "결과 저장 중...", 95)
-        published_pipeline_id = await kafka_svc.publish(validated, pipeline_id)
-        if published_pipeline_id != pipeline_id:
-            raise RuntimeError("Kafka 발행 pipelineId가 요청 pipelineId와 일치하지 않습니다")
+        from config.settings import settings
+        if settings.kafka_enabled:
+            published_pipeline_id = await kafka_svc.publish(validated, pipeline_id)
+            if published_pipeline_id != pipeline_id:
+                raise RuntimeError("Kafka 발행 pipelineId가 요청 pipelineId와 일치하지 않습니다")
+        else:
+            logger.warning("Kafka 꺼짐 — 결과 발행을 건너뜀 | pipelineId: %s", pipeline_id)
         logger.info("파이프라인 완료 | pipelineId: %s", pipeline_id)
 
         feature_spec = _parse_json(validated.feature_spec_document)
@@ -290,6 +295,7 @@ async def _run_pipeline_inner(
                 "usedFormDataOnly": validated.rag_context_fallback,
             },
         }
+        _attach_usage(result)
         progress_svc.complete(pipeline_id, result)
 
     except Exception as e:
@@ -303,8 +309,20 @@ async def _run_pipeline_inner(
                 "errorType": error_type,
                 "errorDetail": repr(e),
                 "partialResult": _artifact_snapshot(latest_state),
+                "usage": _usage_summary(),
             },
         )
+
+
+def _usage_summary() -> list[dict]:
+    """이 파이프라인에서 쓴 AI 사용량. 백엔드가 사용량 추적을 요청하지 않았으면 빈 목록."""
+    from common.usage import current_collector
+    collector = current_collector.get()
+    return collector.summary() if collector is not None else []
+
+
+def _attach_usage(result: dict) -> None:
+    result["usage"] = _usage_summary()
 
 
 def _parse_json(value: str | None) -> dict | list:

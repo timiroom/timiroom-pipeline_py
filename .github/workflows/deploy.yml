@@ -49,6 +49,7 @@ jobs:
           PIPELINE_COHERE_API_KEY: ${{ secrets.PIPELINE_COHERE_API_KEY }}
           PIPELINE_EXAONE_API_KEY: ${{ secrets.PIPELINE_EXAONE_API_KEY }}
           PIPELINE_EXAONE_ENDPOINT_ID: ${{ secrets.PIPELINE_EXAONE_ENDPOINT_ID }}
+          PIPELINE_INTERNAL_API_TOKEN: ${{ secrets.PIPELINE_INTERNAL_API_TOKEN }}
         run: |
           for required in \
             PIPELINE_DB_URL \
@@ -72,6 +73,7 @@ jobs:
             "COHERE_API_KEY=$PIPELINE_COHERE_API_KEY" \
             "EXAONE_API_KEY=$PIPELINE_EXAONE_API_KEY" \
             "EXAONE_ENDPOINT_ID=$PIPELINE_EXAONE_ENDPOINT_ID" \
+            "INTERNAL_API_TOKEN=$PIPELINE_INTERNAL_API_TOKEN" \
             > temp-secrets.env
           test -s temp-secrets.env
           kubectl create secret generic rag-pipeline-secrets -n timiroom \

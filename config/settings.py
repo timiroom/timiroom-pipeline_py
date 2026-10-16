@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     openai_request_timeout_seconds: float = 120.0
     openai_max_retries: int = 2
 
+    # ── 사용량·보호 ───────────────────────────────────────────────
+    # 비어 있으면 검사하지 않는다(로컬). 운영에서는 백엔드와 같은 값을 넣어 브라우저 직접 호출을 막는다.
+    internal_api_token: str = ""
+    # 스트리밍 응답 끝에 usage 청크를 달라고 요청한다. 지원하지 않는 호환 서버면 끈다.
+    usage_stream_include_usage: bool = True
+    # 사용자 키 주소에 http://localhost를 허용한다(로컬 시험용).
+    byok_allow_local_http: bool = False
+
     # ── Phase 2 ───────────────────────────────────────────────────
     phase2_llm_max_concurrency: int = 8
     phase2_timeout_seconds: float = 900.0
@@ -45,6 +53,8 @@ class Settings(BaseSettings):
     rag_document_table: str = "document_chunks"
 
     # ── Kafka ─────────────────────────────────────────────────────
+    # 로컬에서 운영 Kafka와 같은 소비자 그룹을 쓰지 않도록 끌 수 있다. 끄면 결과 발행을 건너뛴다.
+    kafka_enabled: bool = True
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic_pipeline_result: str = "rag.pipeline.result"
     kafka_topic_dead_letter: str = "rag.pipeline.result.DLT"

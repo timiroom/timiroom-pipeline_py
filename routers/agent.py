@@ -16,6 +16,8 @@ from fastapi.responses import StreamingResponse
 from openai import InternalServerError, APITimeoutError, APIConnectionError
 from pydantic import BaseModel
 
+from common.usage import current_collector
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
@@ -84,6 +86,10 @@ async def chat_stream(request: AgentRequest):
         except Exception as e:
             logger.error("OpenAI 스트리밍 오류: %s", e, exc_info=True)
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        # 스트리밍은 헤더로 사용량을 돌려줄 수 없어, 백엔드가 요청했을 때만 마지막에 한 번 보낸다.
+        collector = current_collector.get()
+        if collector is not None:
+            yield f"data: {json.dumps({'usage': collector.summary()})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
