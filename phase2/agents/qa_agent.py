@@ -1255,7 +1255,8 @@ class QaAgent:
             ({"token_hash", "expires_at"} <= names or {"refresh_token", "expires_at"} <= names)
             for names in columns.values()
         )
-        if ("/auth/refresh" in auth_paths or "/auth/logout" in auth_paths) and not has_refresh_store:
+        # 로그아웃만 있으면 세션·무상태 토큰으로도 충분하다. 저장 구조는 refresh token을 발급할 때만 요구한다.
+        if "/auth/refresh" in auth_paths and not has_refresh_store:
             db_issues.append("Refresh Token API가 있지만 만료·회수 가능한 토큰 저장 구조가 없음")
         # Delivery infrastructure is deployment-specific. A product may use web
         # push, e-mail, SMS, or an external provider without persisting a device
