@@ -20,6 +20,7 @@
 출력이 원본과 같은 모양이라 검증(타입·필수키 일치)만으로 안전성을 확보할 수 있다.
 """
 import asyncio
+import contextvars
 import difflib
 import json
 import logging
@@ -78,6 +79,39 @@ _HISTORY_TURN_CHARS = 800
 
 # 라벨 키를 지정하지 않은(또는 맞지 않는) 중첩 객체에 쓰는 렌더링 기본값
 _GENERIC_LABEL_KEYS = ("name", "metric", "milestone", "title", "persona")
+
+# 연결 문서는 참고용 요약만 싣는다. 문서 본문이 이미 크므로 합쳐서 이 길이를 넘기지 않는다.
+_MAX_RELATED_CHARS = 12000
+_RELATED_DOC_LABELS = {"prd": "PRD", "features": "기능 명세", "api": "API 명세", "erd": "ERD"}
+
+# 이번 요청에 딸린 연결 문서 요약. 프롬프트를 만드는 모든 단계가 같은 값을 보도록
+# 인자로 일일이 넘기지 않고 요청 범위의 컨텍스트에 둔다(asyncio.gather 하위 작업에도 복사된다).
+_related_context: contextvars.ContextVar[str] = contextvars.ContextVar("related_context", default="")
+
+
+def _related_block(related: dict[str, str] | None, current: str) -> str:
+    if not related:
+        return ""
+    parts, used = [], 0
+    for key, text in related.items():
+        if key == current or not isinstance(text, str) or not text.strip():
+            continue
+        label = _RELATED_DOC_LABELS.get(key, key)
+        room = _MAX_RELATED_CHARS - used
+        if room <= 200:
+            break
+        body = text.strip()[:room]
+        parts.append(f"[{label}]\n{body}")
+        used += len(body)
+    if not parts:
+        return ""
+    return (
+        "\n\n## 참고용 연결 문서 (읽기 전용)\n"
+        "아래는 같은 프로젝트의 다른 문서 요약입니다. 질문에 답할 때 근거로 쓰고, "
+        "수정안을 만들 때는 이 문서들과 이름·필드·경로가 어긋나지 않게 맞추세요. "
+        "이 문서들 자체를 고치는 내용은 수정안에 넣지 말고, 함께 바꿔야 할 점이 있으면 답변 문장으로 알려 주세요.\n\n"
+        + "\n\n".join(parts)
+    )
 
 
 def _chat_model() -> str:
@@ -718,7 +752,7 @@ def _messages(system: str, prompt: str, history: list[dict] | None = None) -> li
     재작성 단계가 무엇을 가리키는지 몰라 헛돈다. 다만 문서 본문이 이미 크므로
     턴 수와 턴당 길이를 모두 잘라서 싣는다.
     """
-    messages = [{"role": "system", "content": system}]
+    messages = [{"role": "system", "content": system + _related_context.get()}]
     for turn in (history or [])[-_MAX_HISTORY_TURNS:]:
         content = turn["content"]
         if len(content) > _HISTORY_TURN_CHARS:
@@ -777,7 +811,7 @@ _CLASSIFY_PROMPT = """## 문서 종류: {doc_label}
 
 ## 판단 기준
 - intent가 "edit"인 경우: 문서 내용을 바꾸거나, 추가하거나, 지워달라는 요청
-- intent가 "chat"인 경우: 문서에 대한 질문, 의견, 설명 요청 (문서를 바꾸지 않음)
+- intent가 "chat"인 경우: 문서에 대한 질문, 의견, 설명 요청 (문서를 바꾸지 않음). 다른 문서와의 관계를 묻는 질문도 chat입니다.
 - targets에는 실제로 내용이 바뀌어야 하는 섹션 키만 넣으세요. 최대 {max_targets}개.
 - 반드시 위 '섹션 목록'에 있는 키만 사용하세요. 없는 키를 지어내지 마세요.
 - 애매하면 가장 관련이 깊은 섹션 하나만 고르세요.
@@ -791,7 +825,7 @@ reply는 항상 한국어 존댓말로 작성하세요."""
 
 
 _QUESTION_SYSTEM = """당신은 소프트웨어 명세를 검토하는 시니어 PM 겸 아키텍트입니다.
-사용자의 질문에 현재 문서의 실제 내용만 근거로 답하세요.
+사용자의 질문에 현재 문서와, 함께 주어진 연결 문서의 실제 내용만 근거로 답하세요.
 
 JSON 하나만 출력하세요. 설명·마크다운 코드블록 금지."""
 
@@ -805,6 +839,7 @@ _QUESTION_PROMPT = """## 문서 종류: {doc_label}
 
 ## 답변 규칙
 - 현재 문서에서 확인되는 사실과 개선 의견을 구분하세요.
+- 다른 문서(API·ERD·기능 명세·PRD)에 걸친 질문이면 연결 문서를 근거로 답하고, 어느 문서의 내용인지 밝히세요.
 - 문서에 없는 내용을 이미 존재하는 것처럼 말하지 마세요.
 - 질문에 직접 답하고, 필요한 경우 확인할 섹션 이름을 함께 적으세요.
 - 문서 수정은 수행하지 않습니다.
@@ -1607,6 +1642,7 @@ class DocumentEditRequest(BaseModel):
     document: dict = Field(default_factory=dict, description="현재 문서 JSON")
     instruction: str = Field(min_length=1, description="사용자의 수정 요청")
     history: list[ChatTurn] = Field(default_factory=list, description="직전 대화 (최근 것부터 소수)")
+    related: dict[str, str] = Field(default_factory=dict, description="같은 프로젝트의 다른 문서 요약 (prd|features|api|erd → 텍스트)")
 
 
 @router.post("/{doc_type}/edit")
@@ -1636,6 +1672,8 @@ async def edit_document(doc_type: str, req: DocumentEditRequest) -> dict:
     # 함수 첫 줄에 두면 잘못된 doc_type이나 크기 초과 요청 하나가 앱 전역(DB·Kafka·리랭커)
     # 초기화를 끌고 들어온다 — 거절할 요청이 무거운 부팅을 트리거할 이유가 없다.
     from main import openai_client
+
+    _related_context.set(_related_block(req.related, doc_type))
 
     # history는 최근 몇 턴까지만 — 문서 본문이 이미 크므로 대화까지 길어지면 컨텍스트가 넘친다
     history = [
