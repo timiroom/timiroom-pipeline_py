@@ -508,6 +508,29 @@ def _remap_keys(d: dict, alias: dict) -> dict:
     return out
 
 
+# 모델이 프롬프트의 내부 용어를 본문에 그대로 옮겨 적는 경우가 있다.
+# 예: "... 돕는다. (API: Registry apiContract 없음, DB: Registry tables 없음, foreignKeys 없음)"
+# 사용자에게 보이는 문서이므로 이런 괄호 메모는 지운다.
+_INTERNAL_NOTE_RE = re.compile(r"\s*[(\[][^()\[\]]*(?:Registry|apiContract|dbContract|foreignKeys|featureId)[^()\[\]]*[)\]]")
+
+
+def strip_internal_notes(text):
+    if not isinstance(text, str):
+        return text
+    return _INTERNAL_NOTE_RE.sub("", text).strip()
+
+
+def _clean_core_feature(item):
+    if not isinstance(item, dict):
+        return item
+    out = dict(item)
+    if "description" in out:
+        out["description"] = strip_internal_notes(out["description"])
+    if isinstance(out.get("requirements"), list):
+        out["requirements"] = [strip_internal_notes(r) for r in out["requirements"]]
+    return out
+
+
 def _normalize_prd_keys(doc: dict) -> dict:
     """PRD 문서 전체의 키를 표준 스키마 키로 정규화 (최상위 + 리스트 항목 내부)."""
     if not isinstance(doc, dict):
@@ -521,6 +544,8 @@ def _normalize_prd_keys(doc: dict) -> dict:
         val = doc.get(field)
         if isinstance(val, list):
             doc[field] = [_remap_keys(it, item_alias) if isinstance(it, dict) else it for it in val]
+    if isinstance(doc.get("coreFeatures"), list):
+        doc["coreFeatures"] = [_clean_core_feature(it) for it in doc["coreFeatures"]]
     return doc
 
 
