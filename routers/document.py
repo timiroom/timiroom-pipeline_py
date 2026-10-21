@@ -81,7 +81,7 @@ _HISTORY_TURN_CHARS = 800
 _GENERIC_LABEL_KEYS = ("name", "metric", "milestone", "title", "persona")
 
 # 연결 문서는 참고용 요약만 싣는다. 문서 본문이 이미 크므로 합쳐서 이 길이를 넘기지 않는다.
-_MAX_RELATED_CHARS = 12000
+_MAX_RELATED_CHARS = 16000
 _RELATED_DOC_LABELS = {"prd": "PRD", "features": "기능 명세", "api": "API 명세", "erd": "ERD"}
 
 # 이번 요청에 딸린 연결 문서 요약. 프롬프트를 만드는 모든 단계가 같은 값을 보도록
@@ -752,13 +752,15 @@ def _messages(system: str, prompt: str, history: list[dict] | None = None) -> li
     재작성 단계가 무엇을 가리키는지 몰라 헛돈다. 다만 문서 본문이 이미 크므로
     턴 수와 턴당 길이를 모두 잘라서 싣는다.
     """
-    messages = [{"role": "system", "content": system + _related_context.get()}]
+    messages = [{"role": "system", "content": system}]
     for turn in (history or [])[-_MAX_HISTORY_TURNS:]:
         content = turn["content"]
         if len(content) > _HISTORY_TURN_CHARS:
             content = content[:_HISTORY_TURN_CHARS] + "…"
         messages.append({"role": turn["role"], "content": content})
-    messages.append({"role": "user", "content": prompt})
+    # 연결 문서는 이번 질문 바로 앞에 싣는다. 모델 중계가 시스템 프롬프트를 바꾸거나 줄여도 빠지지 않게.
+    related = _related_context.get()
+    messages.append({"role": "user", "content": f"{related.lstrip()}\n\n---\n\n{prompt}" if related else prompt})
     return messages
 
 
