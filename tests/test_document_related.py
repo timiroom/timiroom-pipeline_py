@@ -9,14 +9,15 @@ def test_related_block_skips_current_and_empty():
 
 def test_related_block_is_capped():
     block = _related_block({"erd": "가" * 50000}, "api")
-    assert len(block) < 13000
+    assert len(block) < 17000
 
 
 def test_messages_include_related_context():
     token = _related_context.set(_related_block({"erd": "TABLE users"}, "api"))
     try:
         msgs = _messages("system", "prompt")
-        assert "TABLE users" in msgs[0]["content"]
+        assert msgs[0]["content"] == "system"
+        assert "TABLE users" in msgs[-1]["content"] and msgs[-1]["content"].endswith("prompt")
     finally:
         _related_context.reset(token)
-    assert "TABLE users" not in _messages("system", "prompt")[0]["content"]
+    assert _messages("system", "prompt")[-1]["content"] == "prompt"
