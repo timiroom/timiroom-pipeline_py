@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from openai import InternalServerError, APITimeoutError, APIConnectionError
 from pydantic import BaseModel
 
+from common.ai_errors import describe
 from common.usage import current_collector
 
 logger = logging.getLogger(__name__)
@@ -84,8 +85,10 @@ async def chat_stream(request: AgentRequest):
                 if text:
                     yield f"data: {json.dumps({'delta': text})}\n\n"
         except Exception as e:
-            logger.error("OpenAI 스트리밍 오류: %s", e, exc_info=True)
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            ai = describe(e)
+            logger.error("OpenAI 스트리밍 오류: %s", e, exc_info=ai is None)
+            payload = {"error": ai.message, "code": ai.code} if ai else {"error": "AI 응답을 받지 못했습니다. 잠시 후 다시 시도해 주세요."}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         # 스트리밍은 헤더로 사용량을 돌려줄 수 없어, 백엔드가 요청했을 때만 마지막에 한 번 보낸다.
         collector = current_collector.get()
         if collector is not None:
@@ -108,8 +111,10 @@ async def chat(request: AgentRequest) -> AgentResponse:
         content = await _call_openai(_build_messages(request))
         return AgentResponse(content=content)
     except Exception as e:
+        if describe(e) is not None:
+            raise  # 공통 처리기가 한국어 안내로 바꾼다
         logger.error("OpenAI 호출 실패: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="AI 응답을 받지 못했습니다. 잠시 후 다시 시도해 주세요.")
 
 
 # ── 연결 확인 ─────────────────────────────────────────────────────
@@ -121,7 +126,9 @@ async def test() -> dict:
         return {"ok": True}
     except Exception as e:
         logger.error("OpenAI 연결 테스트 실패: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        if describe(e) is not None:
+            raise
+        raise HTTPException(status_code=500, detail="AI 연결을 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.")
 
 
 async def _call_openai(messages: list[dict], max_tokens: int = _MAX_TOKENS) -> str:

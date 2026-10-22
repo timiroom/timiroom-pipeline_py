@@ -9,6 +9,7 @@ from fastapi import APIRouter
 from openai import InternalServerError, APITimeoutError, APIConnectionError
 from pydantic import BaseModel, Field
 
+from common.ai_errors import describe
 from common.api_response import ok
 from phase1.models import FormData, MoSCoW, PlatformType
 from phase2.json_utils import try_parse_json
@@ -1064,5 +1065,9 @@ async def message(req: ChatRequest) -> dict:
         })
 
     except Exception as e:
-        logger.error("OpenAI 호출 실패: %s", e, exc_info=True)
-        return ok({"message": "잠시 후 다시 시도해 주세요.", "isComplete": False, "suggestions": [], "formData": None})
+        ai = describe(e)
+        logger.error("OpenAI 호출 실패: %s", e, exc_info=ai is None)
+        if ai is not None and ai.status < 500 and ai.status != 429:
+            raise  # 키 오류처럼 다시 보내도 안 되는 문제는 공통 처리기가 원인을 알린다
+        message = ai.message if ai else "잠시 후 다시 시도해 주세요."
+        return ok({"message": message, "isComplete": False, "suggestions": [], "formData": None})
