@@ -18,6 +18,7 @@ from phase2.json_utils import try_parse_json
 from phase2.openapi_spec import build_openapi_document
 from phase2.sse_service import PipelineProgressService
 from phase2.state import PipelineState
+from common.ai_errors import describe
 
 logger = logging.getLogger(__name__)
 
@@ -433,11 +434,11 @@ class OrchestrationGraph:
                                 return domain, result
                             except Exception as exc:
                                 label = "DBA" if domain == "db" else "API"
-                                blocker = (
-                                    f"TARGETED_REPAIR_BLOCKER: {label} targeted resync 실패 "
-                                    f"({type(exc).__name__}: {str(exc) or type(exc).__name__})"
-                                )
-                                logger.error(blocker)
+                                ai = describe(exc)
+                                # AI 제공사 원문(영어, 키 일부)은 문서 검토 기록에 남기지 않는다
+                                reason = ai.message if ai else f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"
+                                blocker = f"TARGETED_REPAIR_BLOCKER: {label} targeted resync 실패 ({reason})"
+                                logger.error("%s | 원인: %s", blocker, exc)
                                 if domain == "db":
                                     return domain, base_state.copy(
                                         prd_feedback_from_dba=blocker,
