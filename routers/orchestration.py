@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
+from common.ai_errors import describe
 from common.api_response import ok
 from common.logging_middleware import pipeline_id_var
 from phase1.form_to_query import FormToQueryService
@@ -301,13 +302,16 @@ async def _run_pipeline_inner(
     except Exception as e:
         logger.error("파이프라인 실패 | %s", e, exc_info=True)
         error_type = type(e).__name__
-        error_message = str(e).strip() or error_type
+        ai = describe(e)
+        # AI 제공사 오류는 원문(영어, 키 일부가 섞일 수 있음) 대신 한국어 안내와 코드를 보낸다
+        error_message = ai.message if ai else (str(e).strip() or error_type)
         progress_svc.error(
             pipeline_id,
             error_message,
             details={
                 "errorType": error_type,
-                "errorDetail": repr(e),
+                "errorCode": ai.code if ai else None,
+                "errorDetail": None if ai else repr(e),
                 "partialResult": _artifact_snapshot(latest_state),
                 "usage": _usage_summary(),
             },

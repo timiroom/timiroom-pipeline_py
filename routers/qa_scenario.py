@@ -141,7 +141,7 @@ async def _ask(system_prompt: str, context: str) -> tuple[str, str]:
         except (InternalServerError, APITimeoutError, APIConnectionError, RateLimitError) as e:
             logger.warning("QA 시나리오 에이전트 일시 오류 (attempt %d): %s", attempt + 1, e)
             if attempt == 2:
-                raise HTTPException(status_code=503, detail="AI 서버가 잠시 바쁩니다. 잠시 후 다시 시도해 주세요.") from e
+                raise  # 공통 처리기가 AI_BUSY·AI_TIMEOUT 같은 코드와 안내로 바꾼다
             await asyncio.sleep(3 * (attempt + 1))
     return "", model
 

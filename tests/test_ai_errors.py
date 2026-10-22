@@ -71,3 +71,23 @@ def test_handler_returns_korean_message_and_code_instead_of_500():
     assert response.status_code == 429
     body = response.json()
     assert body["code"] == "AI_BUSY" and "다시 시도" in body["message"] and "sk-" not in response.text
+
+
+def test_generation_failure_sends_korean_message_and_code_to_progress(byok):
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from phase1.models import FormData
+    from routers import orchestration
+
+    progress = MagicMock()
+    form_to_query = MagicMock()
+    form_to_query.synthesize.side_effect = _status(openai.AuthenticationError, 401, {})
+    asyncio.run(orchestration._run_pipeline_inner(
+        "pid-1", FormData.model_construct(project_name="p", platform="web", tech_stack=[], problem_definition="x", target_users="y"),
+        [], MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), progress, form_to_query, skip_phase1=True,
+    ))
+    _, message = progress.error.call_args.args
+    details = progress.error.call_args.kwargs["details"]
+    assert details["errorCode"] == "AI_KEY_INVALID" and "내 AI 키" in message
+    assert details["errorDetail"] is None and "sk-" not in message
