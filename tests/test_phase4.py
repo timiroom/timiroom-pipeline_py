@@ -219,6 +219,59 @@ def test_consumer_ingests_whole_event_in_one_batch():
     }
 
 
+def test_consumer_accepts_already_stored_duplicate_event():
+    class Ingestion:
+        async def ingest_event(self, _documents):
+            return 0
+
+    asyncio.run(KafkaConsumerService("kafka:9092", "results", "group", Ingestion())._process(_event()))
+
+
+def test_store_records_reports_actual_insert_count():
+    class Cursor:
+        rowcount = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args):
+            self.calls += 1
+            self.rowcount = 1 if self.calls == 1 else 0
+
+    class Connection:
+        def __init__(self):
+            self.cursor_value = Cursor()
+
+        def cursor(self):
+            return self.cursor_value
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    service = object.__new__(DocumentIngestionService)
+    service._document_table = "document_chunks"
+    service._get_conn = Connection
+    service._tokenize_text = lambda text: text
+    records = [
+        ("첫 문장", {"pipeline_id": "p", "type": "prd", "chunk_index": 0}),
+        ("둘째 문장", {"pipeline_id": "p", "type": "prd", "chunk_index": 1}),
+    ]
+
+    assert service._store_records_to_db(records, [[0.1], [0.2]]) == 1
+
+
 def test_source_key_is_scoped_by_pipeline_type_and_chunk():
     text = "동일한 문장"
     key_a = DocumentIngestionService._source_key(
@@ -272,6 +325,7 @@ def test_document_batch_rolls_back_on_any_insert_failure():
     service = object.__new__(DocumentIngestionService)
     service._document_table = "document_chunks"
     service._get_conn = lambda: connection
+    service._tokenize_text = lambda text: text
     records = [
         ("첫 문장", {"pipeline_id": "p", "type": "prd", "chunk_index": 0}),
         ("둘째 문장", {"pipeline_id": "p", "type": "prd", "chunk_index": 1}),

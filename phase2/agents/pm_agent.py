@@ -1,16 +1,16 @@
-import asyncio
 import json
 import logging
 import re
 
-from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, InternalServerError
 
-from phase2.json_utils import try_parse_json, has_suspicious_script
-from phase2.feature_registry import build_feature_registry, normalize_feature_registry
-from phase2.llm_runtime import LlmRuntime
-from phase2.state import PipelineState
 from phase2.agent_contract import normalize_feature_contract
+from phase2.feature_registry import build_feature_registry, normalize_feature_registry
+from phase2.json_utils import has_suspicious_script, try_parse_json
+from phase2.llm_runtime import LlmRuntime
 from phase2.quality_rules import contamination_reasons, dedupe_labels, self_check_passed
+from phase2.repair_scope import repair_targets, scope_prompt, valid_base
+from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ PM_PROMPT = """당신은 시니어 소프트웨어 아키텍트이자 PM입니�
 아래 요구사항을 분석하여 JSON 형식으로만 응답하세요.
 응답 형식:
 {{
-  "projectPlan": {{"overview":"프로젝트 목적", "goals":[], "scope":{{"in":[],"out":[]}}, "targetUsers":[], "priorities":{{"must":[],"should":[],"could":[]}}}},
+  "projectPlan": {{"overview":"프로젝트 목적", "goals":[], "scope":{{"in":[],"out":[]}}, "targetUsers":[], "priorities":{{"must":[],"should":[],"could":[],"wont":[]}}}},
   "dbaInstruction": "PRD와 Feature Spec이 구현 계약을 만들 때 참고할 데이터 설계 원칙",
   "apiInstruction": "PRD와 Feature Spec이 구현 계약을 만들 때 참고할 API 설계 원칙"
 }}
@@ -216,10 +216,9 @@ PM_PROMPT = """당신은 시니어 소프트웨어 아키텍트이자 PM입니�
 - PM에서는 실행 가능한 featureList나 API/DB registry를 만들지 마세요. Phase 1의 기능 입력은 PRD가 핵심 기능을 도출할 때 참고하는 원자료로만 유지합니다.
 - PRD Agent가 projectPlan, 목표, 범위, 사용자 여정, Phase 1 요구사항을 종합해 coreFeatures를 정의하고, Feature Spec Agent가 최종 기능 ID와 계약을 만듭니다.
 - dbaInstruction/apiInstruction에는 기능 목록을 재생성하지 말고 범위, 권한 모델, 데이터 보존, API 설계 원칙처럼 후속 에이전트가 참고할 결정만 작성하세요.
-- dbaInstruction: 필요한 테이블명, 주요 관계(1:N, N:M), 중요 컬럼이나 제약조건 명시 (2문장 이상)
-- dbaInstruction에는 기능별 테이블·컬럼·PK/FK·제약조건 매핑을 포함하고 모든 *_id 참조의 실제 REFERENCES 대상을 명시하세요.
-- apiInstruction에는 기능별 HTTP method/path 매핑을 포함하고, 서로 다른 행동을 한 endpoint 설명으로 합치지 마세요.
-- 조직·동호회·팀 소속을 전제로 하면 단일 조직인지 다중 조직인지 결정하고, 다중 조직이면 조직과 membership 테이블을 설계 지시에 포함하세요.
+- dbaInstruction에는 데이터 소유권, 보존 기간, 무결성 및 동시성 원칙을 작성하세요. 테이블명·컬럼·PK/FK 같은 물리 계약을 확정하지 마세요.
+- apiInstruction에는 인증·인가, 실패 처리, 사용자 흐름의 원칙만 작성하세요. HTTP method/path와 DTO는 Feature Spec Agent가 확정합니다.
+- 조직·동호회·팀 소속을 전제로 하면 단일/다중 조직 범위와 접근 격리 원칙만 정하고 물리 저장 구조는 확정하지 마세요.
 - JSON 외 다른 텍스트는 절대 포함하지 마세요
 
 요구사항:
@@ -245,7 +244,7 @@ class PmAgent:
         # 폼에서 추출된 기능 목록을 프롬프트에 명시하여 PM 에이전트가 빠뜨리지 않도록 힌트 제공
         form_features = state.feature_list or []
         form_features_hint = (
-            "\n\n[폼에서 입력된 기능 목록 — 반드시 포함하고 더 상세히 확장하세요]\n"
+            "\n\n[폼의 사용자 요구 원자료 — 목표와 범위에 반영하되 기능 카드나 계약으로 분해하지 마세요]\n"
             + "\n".join(f"- {f}" for f in form_features)
         ) if form_features else ""
 
@@ -260,7 +259,8 @@ class PmAgent:
         for attempt in range(1):
             try:
                 async def request():
-                    return await self._client.chat.completions.create(
+                    client = self._client.with_options(max_retries=0) if hasattr(self._client, "with_options") else self._client
+                    return await client.chat.completions.create(
                         model=self._model,
                         temperature=_TEMPERATURE,
                         top_p=_TOP_P,
@@ -274,11 +274,14 @@ class PmAgent:
 
                 response = await self._runtime.call(request) if self._runtime else await request()
             except (InternalServerError, APITimeoutError, APIConnectionError, TimeoutError) as e:
-                logger.warning("PM API 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
-                if attempt < 2:
-                    await asyncio.sleep(5 * (attempt + 1))
-                    continue
-                break
+                logger.warning("PM transport failure: %s", type(e).__name__)
+                return state.copy(
+                    generation_blockers=[*state.generation_blockers, "PM_TRANSPORT: project plan unavailable"],
+                    failed_stage="PM", last_completed_stage=state.last_completed_stage,
+                    skipped_stages=["PRD", "FEATURE_SPEC", "DBA_API", "QA", "PHASE3", "PHASE4"],
+                    qa_approved=False,
+                    status_message="PM 계획 생성 연결 실패",
+                )
             raw = response.choices[0].message.content or ""
             if dump:
                 dump.log_raw("PM", attempt + 1, raw)
@@ -293,6 +296,13 @@ class PmAgent:
         raw_registry = state.feature_registry
         project_plan = data.get("projectPlan", {}) if isinstance(data, dict) else {}
         project_plan = project_plan if isinstance(project_plan, dict) else {}
+        if not project_plan:
+            return state.copy(
+                generation_blockers=[*state.generation_blockers, "PM_PLAN_REQUIRED: non-empty projectPlan required"],
+                failed_stage="PM", last_completed_stage=state.last_completed_stage,
+                skipped_stages=["PRD", "FEATURE_SPEC", "DBA_API", "QA", "PHASE3", "PHASE4"],
+                qa_approved=False, status_message="PM 계획 응답 형식 실패",
+            )
 
         if feature_list:
             # 손상된 이름은 먼저 복구를 시도하고(대개 괄호 안 부연만 깨져 있다),
@@ -331,23 +341,27 @@ class PmAgent:
 
         feature_registry = normalize_feature_registry(raw_registry, feature_list)
 
-        logger.info("PM 에이전트 완료 — %d 기능 도출", len(feature_list))
+        logger.info("PM 계획 정리 완료 — Phase 1 요구사항 %d개 보존", len(feature_list))
         return state.copy(
             feature_list=feature_list,
             feature_registry=feature_registry,
             project_plan=project_plan,
             dba_instruction=dba_instruction or "DB 설계 진행",
             api_instruction=api_instruction or "REST API 설계 진행",
-            status_message="PM 에이전트 완료 — 기능 목록 도출",
+            status_message="PM 에이전트 완료 — 목표·범위·우선순위 정리",
         )
 
     async def repair(self, state: PipelineState, feedback: str, dump=None) -> PipelineState:
         """현재 기능 목록에 대한 delta 작업만 적용한다."""
         features = list(state.feature_list or [])
+        baseline = {"features": features}
+        allowed = repair_targets(state, feedback, "pm", baseline)
+        if not allowed:
+            return state.copy(targeted_repair_results={**state.targeted_repair_results, "pm": "rejected_scope"})
         prompt = TARGETED_REPAIR_PROMPT.format(
             feedback=str(feedback or "")[:8000],
             features="\n".join(f"{i}. {feature}" for i, feature in enumerate(features)),
-        )
+        ) + scope_prompt(baseline, allowed)
         try:
             async def request():
                 return await self._client.chat.completions.create(
@@ -364,23 +378,31 @@ class PmAgent:
             if dump:
                 dump.log_raw("PM_TARGETED_REPAIR", 1, raw)
             data = try_parse_json(raw)
+            if not valid_base(data, baseline):
+                return state.copy(targeted_repair_results={**state.targeted_repair_results, "pm": "rejected_revision"})
             patches = data.get("patches") if isinstance(data, dict) else None
             if not isinstance(patches, list):
                 logger.warning("PM targeted repair — patches 없음, 원본 유지")
                 return state
 
+            replacements = {}
+            removed = set()
+            additions = []
             for patch in patches:
                 if not isinstance(patch, dict):
                     continue
                 op = patch.get("op")
                 index = patch.get("index")
+                if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(features) or features[index] not in allowed:
+                    continue
                 if op == "replace" and isinstance(index, int) and 0 <= index < len(features):
                     if isinstance(patch.get("value"), str) and patch["value"].strip():
-                        features[index] = patch["value"].strip()
+                        replacements[index] = patch["value"].strip()
                 elif op == "remove" and isinstance(index, int) and 0 <= index < len(features):
-                    features.pop(index)
+                    removed.add(index)
                 elif op == "append" and isinstance(patch.get("value"), str) and patch["value"].strip():
-                    features.append(patch["value"].strip())
+                    additions.append(patch["value"].strip())
+            features = [replacements.get(index, value) for index, value in enumerate(features) if index not in removed] + additions
 
             clean = []
             seen = set()
@@ -393,11 +415,8 @@ class PmAgent:
                 "feature_list": clean,
                 "feature_registry": normalize_feature_registry(state.feature_registry, clean),
                 "status_message": "PM 에이전트 완료 — 지적 기능만 수정",
+                "targeted_repair_results": {**state.targeted_repair_results, "pm": "applied" if clean != state.feature_list else "noop"},
             }
-            if isinstance(data.get("dbaInstruction"), str) and data["dbaInstruction"].strip():
-                kwargs["dba_instruction"] = data["dbaInstruction"].strip()
-            if isinstance(data.get("apiInstruction"), str) and data["apiInstruction"].strip():
-                kwargs["api_instruction"] = data["apiInstruction"].strip()
             return state.copy(**kwargs)
         except Exception as e:
             logger.warning("PM targeted repair 실패 — 원본 유지: %s", e)

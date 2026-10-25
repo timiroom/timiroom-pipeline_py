@@ -4,7 +4,12 @@ import random
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
-from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 
 T = TypeVar("T")
 
@@ -36,12 +41,15 @@ class LlmRuntime:
         self._busy_retries = busy_retries
         self._busy_backoff_seconds = busy_backoff_seconds
 
-    async def call(self, factory: Callable[[], Awaitable[T]]) -> T:
+    async def call(self, factory: Callable[[], Awaitable[T]], *, timeout_seconds: float | None = None) -> T:
+        timeout = self._request_timeout_seconds if timeout_seconds is None else timeout_seconds
+        if timeout <= 0:
+            raise ValueError("timeout_seconds must be > 0")
         attempt = 0
         while True:
             try:
                 async with self._semaphore:
-                    async with asyncio.timeout(self._request_timeout_seconds):
+                    async with asyncio.timeout(timeout):
                         return await factory()
             except _RETRYABLE as exc:
                 if attempt >= self._busy_retries:

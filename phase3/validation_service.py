@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 from phase2.agent_contract import IssueSeverity, classify_issue
 from phase2.openapi_spec import build_openapi_document
@@ -29,115 +30,85 @@ class ValidationService:
         return normalized
 
     def validate(self, state: PipelineState) -> PipelineState:
-        logger.info("=== Phase 3 검증 시작 === (retry: %d)", state.retry_count)
-
-        result = self._validator.validate(
-            feature_list=state.feature_list,
-            db_schema=state.db_schema,
-            api_spec=state.api_spec,
-            prd_document=state.prd_document,
-            feature_registry=state.feature_registry,
-            feature_specs=state.feature_specs,
+        from phase2.validation_contract import (
+            artifact_revision,
+            dedupe_issues,
+            issue_detail,
         )
-
-        normalized_api = result.normalized_api_spec or state.api_spec
+        if state.failed_stage == "FEATURE_SPEC" and state.generation_blockers:
+            # Missing downstream artifacts are consequences, not independent
+            # repair targets. The producer already exhausted its own budget.
+            diagnostic = next((item for item in reversed(state.generation_diagnostics) if item.get("issues")), {})
+            refs = {item["index"]: item for item in diagnostic.get("featureRefs") or [] if isinstance(item, dict) and "index" in item}
+            details = []
+            for message in dict.fromkeys(diagnostic.get("issues") or state.generation_blockers):
+                pointer = re.search(r"/(?:features|tables|schemas)(?:/[A-Za-z0-9_~.-]+)*", message)
+                index = re.search(r"/features/(\d+)", message)
+                feature = refs.get(int(index[1]), {}) if index else {}
+                fid = feature.get("featureId") or feature.get("sourceFeatureId") or ""
+                details.append({**issue_detail(message.split(":", 1)[0], "feature_spec", message,
+                                               pointer=pointer[0] if pointer else "", featureId=fid, artifactKey=fid or "feature_spec"),
+                                "repairable": False, "failedStage": "FEATURE_SPEC"})
+            messages = [item["message"] for item in details]
+            return state.copy(
+                validated=False, qa_approved=False, qa_blocker_details=details,
+                qa_issue_details=details, qa_repair_issues=[],
+                qa_api_blockers=[], qa_db_blockers=[], qa_prd_blockers=messages,
+                validation_error_codes=["FEATURE_SPEC_CONTRACT_BLOCKER"],
+                validation_repair_targets=[], validation_blockers=messages,
+                validation_unresolved_blockers=messages, last_validation_error="\n".join(messages),
+                status_message="기능명세 생성 실패 — API/DBA는 실행되지 않았습니다",
+            )
+        result = self._validator.validate(
+            feature_list=state.feature_list, db_schema=state.db_schema, api_spec=state.api_spec,
+            prd_document=state.prd_document, feature_registry=state.feature_registry, feature_specs=state.feature_specs,
+        )
         normalized = state.copy(
             db_schema=result.normalized_db_schema or state.db_schema,
-            api_spec=normalized_api,
-            openapi_spec=json.dumps(
-                build_openapi_document(normalized_api, state.project_name), ensure_ascii=False,
-            ),
+            api_spec=result.normalized_api_spec or state.api_spec,
             prd_document=result.normalized_prd_document or state.prd_document,
-            validation_error_codes=result.error_codes,
-            validation_repair_targets=result.repair_targets,
         )
-
-        # SchemaValidator가 만든 table/column/endpoint 단위 target을 QA가
-        # 만든 blocker detail과 합쳐 targeted repair 입력으로 보존한다.
-        blocker_details = [
-            detail for detail in (state.qa_blocker_details or [])
-            if isinstance(detail, dict)
-        ]
-        for detail in result.blocker_details:
-            if not isinstance(detail, dict):
-                continue
-            identity = (
-                detail.get("code"),
-                detail.get("artifactKey"),
-                detail.get("message"),
-            )
-            if not any(
-                (item.get("code"), item.get("artifactKey"), item.get("message")) == identity
-                for item in blocker_details
-            ):
-                blocker_details.append(detail)
-        normalized = normalized.copy(qa_blocker_details=blocker_details)
-
-        blocking_details = [
-            item for item in state.qa_issue_details
-            if isinstance(item, dict) and str(item.get("severity", "")).upper() in {"ERROR", "BLOCKER"}
-        ]
-        detail_errors = [
-            f"QA {str(item['severity']).upper()}: {item.get('reason', '')}"
-            for item in blocking_details
-        ]
-        domain_errors = {}
+        revision = artifact_revision(normalized.db_schema, normalized.api_spec, normalized.prd_document, normalized.feature_registry)
+        details = list(result.blocker_details)
+        if not details and result.errors:
+            details = [issue_detail(result.error_codes[index] if index < len(result.error_codes) else "VALIDATION_ERROR",
+                                    result.repair_targets[0] if result.repair_targets else "prd", message)
+                       for index, message in enumerate(result.errors)]
+        for message in state.generation_blockers:
+            domain = "db" if message.startswith("DBA_") else "api" if message.startswith("API_") else "prd"
+            details.append(issue_detail(message.split(":", 1)[0], domain, message))
+        # Compatibility for external/manual QA. Revision-bound pipeline QA is
+        # always recomputed above, never copied from a previous snapshot.
+        if not state.qa_validation_revision:
+            for domain in ("db", "api", "prd"):
+                warnings = set(getattr(state, f"qa_{domain}_warnings"))
+                for message in getattr(state, f"qa_{domain}_blockers") or getattr(state, f"qa_{domain}_issues"):
+                    if message not in warnings and classify_issue(message) != IssueSeverity.WARNING:
+                        details.append(issue_detail("MANUAL_QA", domain, message))
+            for detail in state.qa_issue_details:
+                if detail.get("severity") in {"ERROR", "BLOCKER"}:
+                    domain = {"DBA": "db", "API": "api", "PRD": "prd"}.get(detail.get("agent"), "prd")
+                    details.append(issue_detail("MANUAL_QA", domain, f"QA {detail['severity']}: {detail.get('reason', '')}"))
+        details = dedupe_issues([{**detail, "revision": revision} for detail in details])
+        blockers = [detail for detail in details if detail.get("severity") not in {"WARNING", "INFO"}]
+        messages = self._canonical_blockers([detail.get("message", "") for detail in blockers])
+        previous = self._canonical_blockers(state.validation_unresolved_blockers or state.validation_blockers)
+        resolved = self._canonical_blockers([*state.validation_resolved_blockers, *(value for value in previous if value not in messages)])
+        targets = sorted({detail.get("repairTarget") or detail.get("domain") for detail in blockers
+                          if detail.get("repairable", True)})
+        fields = {}
         for domain in ("db", "api", "prd"):
-            blockers = getattr(state, f"qa_{domain}_blockers")
-            warnings = set(getattr(state, f"qa_{domain}_warnings"))
-            domain_errors[domain] = list(blockers) or [
-                issue for issue in getattr(state, f"qa_{domain}_issues")
-                if issue not in warnings and classify_issue(issue) != IssueSeverity.WARNING
-            ]
-        qa_errors = [issue for issues in domain_errors.values() for issue in issues]
-        current_blockers = self._canonical_blockers(qa_errors + detail_errors + list(result.errors))
-        previous_blockers = self._canonical_blockers(
-            state.validation_unresolved_blockers or state.validation_blockers
+            domain_details = [detail for detail in details if detail.get("domain") == domain]
+            fields[f"qa_{domain}_issues"] = [detail["message"] for detail in domain_details]
+            fields[f"qa_{domain}_blockers"] = [detail["message"] for detail in domain_details if detail.get("severity") not in {"WARNING", "INFO"}]
+            fields[f"qa_{domain}_warnings"] = [detail["message"] for detail in domain_details if detail.get("severity") == "WARNING"]
+        return normalized.copy(
+            **fields, openapi_spec=json.dumps(build_openapi_document(normalized.api_spec, state.project_name), ensure_ascii=False),
+            validated=not blockers, qa_approved=not blockers, qa_validation_revision=revision,
+            qa_blocker_details=blockers, qa_issue_details=details, qa_repair_issues=blockers,
+            validation_error_codes=sorted({detail["code"] for detail in blockers}),
+            validation_repair_targets=targets, validation_blockers=messages,
+            validation_unresolved_blockers=messages, validation_resolved_blockers=resolved,
+            last_validation_error="\n".join(messages),
+            status_message="Phase 3 완료 — 검증 통과" if not blockers else "Phase 3 검증 실패 — 현재 계약 blocker",
         )
-        resolved_now = [item for item in previous_blockers if item not in current_blockers]
-        resolved_blockers = self._canonical_blockers(
-            list(state.validation_resolved_blockers) + resolved_now
-        )
-        normalized = normalized.copy(
-            validation_blockers=current_blockers,
-            validation_unresolved_blockers=current_blockers,
-            validation_resolved_blockers=resolved_blockers,
-        )
-
-        if state.qa_approved is False or blocking_details:
-            qa_text = "\n".join(f"QA: {item}" for item in current_blockers)
-            qa_targets = set(result.repair_targets)
-            domain_by_agent = {"DBA": "db", "API": "api", "PRD": "prd"}
-            qa_targets.update(
-                domain_by_agent[str(item.get("agent", "")).upper()]
-                for item in blocking_details
-                if str(item.get("agent", "")).upper() in domain_by_agent
-            )
-            qa_targets.update(domain for domain, issues in domain_errors.items() if issues)
-            logger.warning("Phase 2 QA hard gate 실패 — Phase 3 통과를 허용하지 않습니다")
-            return normalized.copy(
-                validated=False,
-                last_validation_error=(qa_text or "Phase 2 QA 미승인"),
-                validation_repair_targets=sorted(qa_targets),
-                status_message="Phase 2 QA 실패 — 자동 발행 차단",
-            )
-
-        if result.success:
-            logger.info("=== Phase 3 검증 통과 ===")
-            return normalized.copy(
-                validated=True,
-                last_validation_error="",
-                validation_error_codes=[],
-                validation_repair_targets=[],
-                validation_blockers=[],
-                validation_unresolved_blockers=[],
-                status_message="Phase 3 완료 — 검증 통과",
-            )
-        else:
-            error_text = "\n".join(current_blockers)
-            logger.warning("=== Phase 3 검증 실패 === 오류: %s", error_text)
-            return normalized.copy(
-                validated=False,
-                last_validation_error=error_text,
-                status_message="Phase 3 검증 실패 — 재시도 필요",
-            )

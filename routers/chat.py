@@ -6,7 +6,7 @@ import time
 import unicodedata
 
 from fastapi import APIRouter
-from openai import InternalServerError, APITimeoutError, APIConnectionError
+from openai import APIConnectionError, APITimeoutError, InternalServerError
 from pydantic import BaseModel, Field
 
 from common.ai_errors import describe
@@ -551,14 +551,27 @@ def _validate_stage_answer(stage: int, text: str) -> tuple[bool, str, str]:
         if len(valid_features) < 3:
             return False, value, f"핵심 기능이 {len(valid_features)}개만 확인됐습니다. 서로 다른 기능을 쉼표로 구분해 3개 이상 알려주세요."
         value = ", ".join(valid_features)
+        _, details = _feature_list_and_details(text)
+        if details:
+            value += ". " + details
 
     return True, value, ""
+
+
+def _feature_list_and_details(text: str) -> tuple[str, str]:
+    """Keep an explicit explanatory sentence out of comma-separated feature names."""
+    match = re.search(r"[.!?。]\s*((?:상태|권한|조건|제약|세부사항|세부 사항|입력값|입력 값|출력값|출력 값)(?:는|은)\s*.+)", text or "")
+    return (text[:match.start()].strip(), match.group(1).strip()) if match else (text or "", "")
 
 
 def _split_features(text: str) -> list[str]:
     """사용자 입력 한 문장에서 중복 없는 기능명을 추출한다."""
     out, seen = [], set()
-    for value in re.split(r"[,，;/|\n·]+", text or ""):
+    feature_list, _ = _feature_list_and_details(text)
+    # Explicit feature boundaries take precedence over conjunctions inside a
+    # feature such as create·update·delete or school·major·price filters.
+    separator = r"[,，;/|\n]+" if re.search(r"[,，;/|\n]", feature_list) else r"·+"
+    for value in re.split(separator, feature_list):
         name = re.sub(r"^\s*\d+[.)]\s*", "", value).strip(" -•")
         key = _normalize(name)
         if not key or key in seen:
@@ -566,6 +579,17 @@ def _split_features(text: str) -> list[str]:
         seen.add(key)
         out.append(name)
     return out
+
+
+def _platform_from_answer(text: str) -> str:
+    upper = text.upper()
+    web = "WEB" in upper or "웹" in text or "브라우저" in text
+    app = "APP" in upper or "앱" in text
+    if web and app:
+        return "WEB_APP"
+    if web:
+        return "WEB"
+    return "APP" if app or "모바일" in text else "WEB"
 
 
 def _has_unfilled_template(text: str) -> bool:
@@ -848,12 +872,11 @@ async def _synthesize_form_data(messages: list[ChatMessageDto], client) -> dict 
 
     idea = state["idea"]
     platform_text, pain, solution, ideal, persona, feature_text = state["answers"]
-    platform = "WEB_APP" if ("WEB_APP" in platform_text.upper() or ("웹" in platform_text and "앱" in platform_text)) else (
-        "APP" if ("APP" in platform_text.upper() or "앱" in platform_text or "모바일" in platform_text) else "WEB"
-    )
+    platform = _platform_from_answer(platform_text)
     project_name = _project_name_answer(state)
 
     features = _split_features(feature_text)
+    _, feature_details = _feature_list_and_details(feature_text)
     if len(features) < 3:
         logger.warning("FormData 조립 거부 — 핵심 기능 부족(%d/3)", len(features))
         return None
@@ -872,6 +895,7 @@ async def _synthesize_form_data(messages: list[ChatMessageDto], client) -> dict 
         "projectDescription": (
             f"사용자가 말한 ‘{pain}’라는 현재의 어려움을 줄이고, "
             f"‘{ideal}’라는 목표를 지원하는 서비스입니다."
+            + (f" 세부 기능 요구사항: {feature_details}" if feature_details else "")
         ),
         "platform": platform,
         "techStack": [],

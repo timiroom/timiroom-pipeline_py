@@ -52,75 +52,60 @@ class SearchAgent:
         logger.info("Search 에이전트 시작 — 시장 데이터 수집")
         try:
             domain = await self._extract_domain(state.user_query)
-            market_data = await self._collect_all(state.user_query, domain)
+            market_data, statuses = await self._collect_report(state.user_query, domain)
             logger.info("Search 에이전트 완료 — %d자 수집", len(market_data))
             result = state.copy(
                 market_research=market_data,
+                market_research_status=statuses,
                 status_message="Search 에이전트 완료 — 시장 데이터 수집",
             )
             if dump:
                 dump.log_raw("SEARCH", 1, market_data)
             return result
         except Exception as e:
-            logger.error("Search 에이전트 실패: %s", e)
+            logger.error("Search 에이전트 실패: %s", type(e).__name__)
             return state.copy(
-                market_research=f"시장 데이터 수집 실패: {e}",
+                market_research="외부 시장 근거 확인 불가. 외부 통계를 추정하지 말고 제품 목표는 내부 목표로 구분하세요.",
+                market_research_status=[{"status": "failed", "errorType": type(e).__name__}],
                 status_message="Search 에이전트 실패",
             )
 
     async def _collect_all(self, user_query: str, domain: str) -> str:
-        queries = [
-            f"""한국 {domain} 시장을 웹에서 조사해 아래 형식으로 정리하세요.
+        text, _ = await self._collect_report(user_query, domain)
+        return text
 
-[시장규모] 수치 + 출처(기관명, 연도)
-[성장률] 수치 + 출처
-[경쟁사매출] 각 사별 실제 매출액 또는 사용자 수 + 출처
-[경쟁사목록] 해당 도메인({domain})의 한국 실제 서비스명 5개 이상 나열
-반드시 한국 서비스명만 사용. Shopify, Magento, WooCommerce 등 글로벌 플랫폼 금지.
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스 사용자들의 불편 데이터를 웹에서 조사해 정리하세요.
-
-[Pain Point 1~5] 내용 + 퍼센트 수치 + 출처
-반드시 한국 기관 출처만 사용.
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스에 적용되는 최신 법규를 웹에서 조사해 정리하세요.
-
-[개인정보보호법] 조항 번호 + 핵심 내용
-[전자상거래법] 조항 번호 + 핵심 내용
-[전자금융거래법] 조항 번호 + 핵심 내용
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스의 기술 트렌드를 웹에서 조사해 정리하세요.
-
-[권장기술스택] 각 레이어별 권장 기술 + 선택 이유
-[성능벤치마크] 업계 평균 응답속도, 동시접속 수치 + 출처
-[아키텍처] 업계 표준 아키텍처 패턴
-
-서비스 요구사항: {user_query}""",
-
-            f"""한국 {domain} 서비스의 사용자/비즈니스 데이터를 웹에서 조사해 정리하세요.
-
-[사용자통계] 연령별 이용률 + 출처
-[전환율] 업계 평균 수치 + 출처
-[재구매율] 수치 + 출처
-[모바일비중] 수치 + 출처
-
-서비스 요구사항: {user_query}""",
+    async def _collect_report(self, user_query: str, domain: str) -> tuple[str, list[dict]]:
+        topics = [
+            "적용 가능한 시장 규모와 직접 경쟁 서비스. 국내 자료를 우선하되 필요하면 해외 사례를 구분하세요.",
+            "대상 사용자의 실제 불편과 조사 근거. 퍼센트 자료가 없으면 정성적 근거로 구분하세요.",
+            "실제 서비스 범위에 적용되는 법규와 적용 이유. 결제·거래가 없으면 금융·전자상거래 법규를 강제하지 마세요.",
+            "사용자 흐름에 관련된 기술 선택과 실제 확인 가능한 성능 자료. 업계 평균을 임의로 만들지 마세요.",
+            "대상 사용자와 서비스 이용 통계. 해당 업무에 의미 없는 전환율·재구매율은 제외하세요.",
         ]
+        common = (
+            f"한국 {domain} 서비스에 관해 웹 근거를 조사하세요. 요구사항: {user_query}\n"
+            "확인된 주장마다 원문 URL·출처명·연도를 붙이세요. 자료 수나 통계 개수를 채우지 마세요. "
+            "적용 불가와 확인 불가를 구분하고, 근거 없는 수치·매출·조항·경쟁사를 생성하지 마세요.\n조사 항목: "
+        )
+        queries = [common + topic for topic in topics]
 
         tasks = [self._query(q) for q in queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        parts = []
+        parts, statuses = [], []
         for i, result in enumerate(results):
-            text = result if isinstance(result, str) else f"수집 실패: {result}"
-            parts.append(f"=== {LABELS[i]} ===\n{_polish_market_research_text(text)}")
-        return "\n\n".join(parts)
+            if isinstance(result, BaseException):
+                statuses.append({"section": LABELS[i], "status": "failed", "errorType": type(result).__name__})
+                parts.append(f"=== {LABELS[i]} ===\n확인 불가 — 수집 실패. 외부 근거로 사용하지 마세요.")
+                continue
+            text = str(result or "").strip()
+            urls = sorted(set(re.findall(r"https?://[^\s<>\[\]]+", text)))
+            sourced = bool(urls) and self._web_search_enabled
+            statuses.append({"section": LABELS[i], "status": "sourced" if sourced else "unavailable", "sourceUrls": urls if sourced else []})
+            # A URL is traceability, not a claim that every sentence was independently verified.
+            body = text if sourced else "확인 불가 — 추적 가능한 외부 근거 없음. 수치를 추정하지 마세요."
+            parts.append(f"=== {LABELS[i]} ===\n{body}")
+        return "\n\n".join(parts), statuses
 
     async def _query(self, prompt: str) -> str:
         if self._web_search_enabled:
@@ -211,7 +196,7 @@ class SearchAgent:
             logger.info("도메인 추출: [%s]", domain)
             return domain
         except Exception as e:
-            logger.warning("도메인 추출 실패: %s", e)
+            logger.warning("도메인 추출 실패: %s", type(e).__name__)
             return user_query
 
 

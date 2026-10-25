@@ -114,6 +114,12 @@ async def progress(pipeline_id: str):
     )
 
 
+@router.get("/storage/{pipeline_id}")
+async def storage_status(pipeline_id: uuid.UUID):
+    _, _, _, _, kafka_svc, _, _ = _services()
+    return ok(await kafka_svc.storage_status(str(pipeline_id)))
+
+
 async def _run_pipeline(
     pipeline_id: str,
     form_data: FormData,
@@ -184,7 +190,8 @@ async def _run_pipeline_inner(
         logger.debug("Phase 2 완료 | retryCount: %d", phase2_state.retry_count)
 
         # Phase 3
-        progress_svc.send(pipeline_id, "PHASE3", "결과 검증 중...", 85)
+        if not phase2_state.failed_stage:
+            progress_svc.send(pipeline_id, "PHASE3", "결과 검증 중...", 85)
         validated = val_svc.validate(phase2_state)
         latest_state = validated
         if not validated.validated:
@@ -220,7 +227,10 @@ async def _run_pipeline_inner(
                             "prd": validated.qa_prd_warnings,
                         },
                     },
-                    "phaseReached": "PHASE3",
+                    "phaseReached": validated.failed_stage or "PHASE3",
+                    "validationStage": "PHASE3",
+                    **_stage_details(validated),
+                    "failedStage": validated.failed_stage or "PHASE3",
                     "partialResult": _artifact_snapshot(validated),
                     "usage": _usage_summary(),
                 },
@@ -230,20 +240,41 @@ async def _run_pipeline_inner(
         # Phase 4
         progress_svc.send(pipeline_id, "PHASE4", "결과 저장 중...", 95)
         from config.settings import settings
-        if settings.kafka_enabled:
-            published_pipeline_id = await kafka_svc.publish(validated, pipeline_id)
-            if published_pipeline_id != pipeline_id:
-                raise RuntimeError("Kafka 발행 pipelineId가 요청 pipelineId와 일치하지 않습니다")
-        else:
-            logger.warning("Kafka 꺼짐 — 결과 발행을 건너뜀 | pipelineId: %s", pipeline_id)
+        if not settings.kafka_enabled:
+            progress_svc.error(pipeline_id, "생성은 완료됐지만 Kafka가 비활성화되어 결과를 저장하지 않았습니다.", details={
+                "failedStage": "PHASE4", "lastCompletedStage": "PHASE3", "skippedStages": [],
+                "storage": {"status": "skipped", "kafkaPublished": False, "reason": "KAFKA_DISABLED"},
+                "retrySafe": True, "partialResult": _artifact_snapshot(validated),
+            })
+            return
+        published_pipeline_id = await kafka_svc.publish(validated, pipeline_id)
+        if published_pipeline_id != pipeline_id:
+            raise RuntimeError("Kafka 발행 pipelineId가 요청 pipelineId와 일치하지 않습니다")
+        progress_svc.send(pipeline_id, "STORAGE_CONFIRMATION", "Kafka 발행 완료 · DB 저장 확인 중...", 97)
+        try:
+            storage = await kafka_svc.confirm_storage(validated, pipeline_id)
+        except Exception as exc:
+            logger.warning("DB 저장 확인 실패 — 발행은 완료됨: %s", type(exc).__name__)
+            storage = {"status": "pending", "kafkaPublished": True, "reason": "STORAGE_VERIFICATION_UNAVAILABLE"}
+        if storage.get("status") != "stored":
+            progress_svc.error(pipeline_id, "Kafka 발행은 완료됐지만 DB 저장 확인이 대기 중입니다. 재생성하지 마세요.", details={
+                "failedStage": "STORAGE_CONFIRMATION", "lastCompletedStage": "KAFKA_PUBLISHED",
+                "skippedStages": [], "storage": storage, "retrySafe": False,
+                "partialResult": _artifact_snapshot(validated),
+            })
+            return
         logger.info("파이프라인 완료 | pipelineId: %s", pipeline_id)
 
         feature_spec = _parse_json(validated.feature_spec_document)
-        spec_features = feature_spec.get("features", []) if isinstance(feature_spec, dict) else []
-        core_count = sum(1 for item in spec_features if isinstance(item, dict) and item.get("source") == "prd_core")
-        supporting_count = sum(1 for item in spec_features if isinstance(item, dict) and item.get("source") == "supporting")
+        summary_features = [item for item in validated.feature_registry if isinstance(item, dict)]
+        core_count = sum(1 for item in summary_features if str(item.get("priority") or "").upper() == "P0")
+        supporting_count = len(summary_features) - core_count
         result = {
             "projectName": validated.project_name,
+            "storage": storage,
+            "completionStatus": "STORED",
+            "artifactQuality": validated.artifact_quality,
+            "generationDiagnostics": validated.generation_diagnostics,
             # 내부 Phase/ Kafka 계약은 문자열 feature_list를 유지하지만,
             # 저장되는 FEATURE_LIST 아티팩트는 Feature Spec 상세 객체를
             # 우선 사용해야 프론트가 설명·요구사항·계약을 잃지 않는다.
@@ -259,7 +290,7 @@ async def _run_pipeline_inner(
             "featureSummary": {
                 "coreCount": core_count,
                 "supportingCount": supporting_count,
-                "totalCount": len(spec_features),
+                "totalCount": len(summary_features),
             },
             "prdDocument": _parse_json(validated.prd_document),
             "dbSchema": _parse_json(validated.db_schema),
@@ -312,6 +343,7 @@ async def _run_pipeline_inner(
                 "errorType": error_type,
                 "errorCode": ai.code if ai else None,
                 "errorDetail": None if ai else repr(e),
+                **_stage_details(latest_state),
                 "partialResult": _artifact_snapshot(latest_state),
                 "usage": _usage_summary(),
             },
@@ -347,6 +379,8 @@ def _artifact_snapshot(state: PipelineState | None) -> dict:
         "projectName": state.project_name,
         "projectPlan": state.project_plan,
         "featureNames": state.feature_list,
+        "featureList": state.feature_registry,
+        "retryCount": state.retry_count,
         "featureRegistry": state.feature_registry,
         "featureRegistryHash": state.feature_registry_hash,
         "featureSpecDocument": _parse_json(state.feature_spec_document),
@@ -355,11 +389,22 @@ def _artifact_snapshot(state: PipelineState | None) -> dict:
         "apiSpec": _parse_json(state.api_spec),
         "openApiSpec": _parse_json(state.openapi_spec),
         "marketResearch": state.market_research,
+        "artifactQuality": state.artifact_quality,
+        "generationDiagnostics": state.generation_diagnostics,
         "rag": {
             "chunksRetrieved": state.rag_chunks_retrieved,
             "usedFormDataOnly": state.rag_context_fallback,
         },
     }
+
+
+def _stage_details(state: PipelineState | None) -> dict:
+    if state is None:
+        return {}
+    return {**({"failedStage": state.failed_stage} if state.failed_stage else {}),
+            "lastCompletedStage": state.last_completed_stage,
+            "skippedStages": state.skipped_stages,
+            "generationDiagnostics": state.generation_diagnostics}
 
 
 def _validate_form(form: FormData) -> None:

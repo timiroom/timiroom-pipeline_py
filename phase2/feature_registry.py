@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
@@ -10,6 +11,7 @@ from phase2.agent_contract import (
     endpoint_feature_ids,
     normalize_api_path,
 )
+from phase2.feature_scope import artifact_required
 
 _ACTION_TERMS = (
     ("생성", "create"), ("등록", "create"), ("조회", "read"), ("검색", "read"),
@@ -68,15 +70,49 @@ def _actions(name: str) -> list[str]:
     return found or ["manage"]
 
 
+def canonical_feature_id(item: dict) -> str:
+    """Preserve semantic IDs and replace positional IDs from physical contracts."""
+    current = str(item.get("featureId") or item.get("id") or "").strip()
+    generic = re.match(r"^(?:feature[_.-]?\d+|supporting(?:\.|$)|intent\.)", current)
+    if current and not generic and re.fullmatch(r"[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+", current):
+        return current
+    contracts = item.get("apiContract") or item.get("api") or []
+    actions = item.get("actions") or _actions(str(item.get("name") or ""))
+    action = str(actions[0] if actions else "manage").lower()
+    ignored = {"api", "v1", "v2", "validate", "validation", "uploads", "transitions", "search"}
+    ignored.update(str(value) for value in actions)
+    resource = ""
+    for contract in contracts if isinstance(contracts, list) else []:
+        if not isinstance(contract, dict):
+            continue
+        parts = [part for part in str(contract.get("path") or "").split("/")
+                 if part and not part.startswith("{") and part not in ignored]
+        if parts:
+            resource = parts[-1].replace("-", "_")
+            break
+    db = item.get("dbContract") or item.get("db") or {}
+    if not resource and isinstance(db, dict):
+        refs = _normalize_table_refs(db.get("tables"))
+        resource = next((name for name in refs if not re.match(r"feature_\d+", name)), "")
+    digest = hashlib.sha256(str(item.get("name") or "").encode("utf-8")).hexdigest()[:10]
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", resource) or re.match(r"^(?:feature[_-]?\d+|supporting|intent)", resource):
+        # Before Feature Spec supplies English resource contracts, use a stable
+        # internal identity rather than an order-dependent feature_001 counter.
+        return f"intent.{digest}.{action}"
+    action = re.sub(r"[^a-z0-9_]+", "_", action).strip("_") or "manage"
+    return f"{resource}.{action}"
+
+
 def build_feature_registry(features: list[str] | None) -> list[dict[str, Any]]:
     """문자열 기능 목록을 deterministic registry로 변환한다."""
     registry = []
-    for index, name in enumerate(features or [], 1):
+    for name in features or []:
         if not isinstance(name, str) or not name.strip():
             continue
+        feature_id = canonical_feature_id({"name": name, "actions": _actions(name)})
         registry.append({
-            "id": f"feature_{index:03d}",
-            "featureId": f"feature_{index:03d}",
+            "id": feature_id,
+            "featureId": feature_id,
             "name": name.strip(),
             "actions": _actions(name),
             "apiContract": [],
@@ -108,11 +144,12 @@ def normalize_feature_registry(
     for index, item in enumerate(fallback):
         candidate = by_name.get(item["name"], {})
         value = {**item, **candidate}
-        value["id"] = str(value.get("featureId") or value.get("id") or item["id"]).strip()
+        value["id"] = canonical_feature_id(value)
         if not re.match(r"^[a-z][a-z0-9_.-]{1,80}$", value["id"]):
             value["id"] = item["id"]
         if value["id"] in used_ids:
-            value["id"] = item["id"]
+            digest = hashlib.sha256(item["name"].encode("utf-8")).hexdigest()[:8]
+            value["id"] = f"{value['id']}_{digest}"
         suffix = 2
         base_id = value["id"]
         while value["id"] in used_ids:
@@ -128,6 +165,7 @@ def normalize_feature_registry(
         db = value.get("dbContract", value.get("db"))
         db = db if isinstance(db, dict) else {}
         value["dbContract"] = {
+            **db,
             "tables": _normalize_table_refs(db.get("tables")),
             "foreignKeys": db.get("foreignKeys") if isinstance(db.get("foreignKeys"), list) else [],
         }
@@ -144,9 +182,9 @@ def normalize_feature_registry(
                 continue
             value = dict(item)
             value["name"] = name
-            value["id"] = str(value.get("featureId") or value.get("id") or f"feature_{len(normalized) + 1:03d}").strip()
+            value["id"] = canonical_feature_id(value)
             if not re.match(r"^[a-z][a-z0-9_.-]{1,80}$", value["id"]) or value["id"] in used_ids:
-                value["id"] = f"feature_{len(normalized) + 1:03d}"
+                value["id"] = canonical_feature_id({**value, "featureId": "", "id": ""})
                 suffix = 2
                 base_id = value["id"]
                 while value["id"] in used_ids:
@@ -160,6 +198,7 @@ def normalize_feature_registry(
             db = value.get("dbContract", value.get("db"))
             db = db if isinstance(db, dict) else {}
             value["dbContract"] = {
+                **db,
                 "tables": _normalize_table_refs(db.get("tables")),
                 "foreignKeys": db.get("foreignKeys") if isinstance(db.get("foreignKeys"), list) else [],
             }
@@ -168,6 +207,15 @@ def normalize_feature_registry(
             normalized.append(value)
             known_names.add(name)
             used_ids.add(value["id"])
+    id_map = {
+        str(original.get("featureId") or original.get("id") or ""): item["featureId"]
+        for item in normalized for original in source
+        if isinstance(original, dict) and original.get("name") == item["name"]
+    }
+    for item in normalized:
+        parent = item.get("parentFeatureId")
+        if parent in id_map:
+            item["parentFeatureId"] = id_map[parent]
     # 여러 기능이 같은 사용자 작업을 공유할 수 있다. 예를 들어 목록 조회는
     # 검색·필터·페이지네이션 기능을 동시에 구현한다. Registry에서 한 소유자만
     # 남기면 지식 그래프가 끊기므로 중복 route 계약을 그대로 보존하고 API
@@ -193,15 +241,11 @@ def missing_db_contract_features(
         str(table.get("name") or "").strip().casefold()
         for table in tables or [] if isinstance(table, dict) and table.get("name")
     }
-    table_feature_ids = {
-        str(feature_id).strip()
-        for table in tables or [] if isinstance(table, dict)
-        for feature_id in (table.get("featureIds") or [])
-        if str(feature_id).strip()
-    }
     missing: list[str] = []
     for item in registry or []:
         if not isinstance(item, dict):
+            continue
+        if not artifact_required(item, "db"):
             continue
         contract = item.get("dbContract") or item.get("db") or {}
         if not isinstance(contract, dict):
@@ -210,9 +254,7 @@ def missing_db_contract_features(
         if not required:
             continue
         feature_id = str(item.get("featureId") or item.get("id") or "").strip()
-        if feature_id and feature_id in table_feature_ids:
-            continue
-        if all(name.casefold() not in table_names for name in required):
+        if any(name.casefold() not in table_names for name in required):
             missing.append(feature_id or str(item.get("name") or "unknown"))
     return missing
 
@@ -239,6 +281,8 @@ def missing_api_contract_features(
     missing: list[str] = []
     for item in registry or []:
         if not isinstance(item, dict):
+            continue
+        if not artifact_required(item, "api"):
             continue
         feature_id = str(item.get("featureId") or item.get("id") or "").strip()
         contracts = item.get("apiContract") or item.get("api") or []

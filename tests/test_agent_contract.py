@@ -666,9 +666,11 @@ def test_prd_core_features_follow_required_features_confirmed_after_prd():
     synced = json.loads(sync_core_features_with_registry(state).prd_document)
 
     assert synced["goals"] == ["목표"]
-    assert synced["coreFeatures"][0] == original
+    assert synced["coreFeatures"][0]["description"] == original["description"]
+    assert synced["coreFeatures"][0]["requirements"] == original["requirements"]
+    assert synced["coreFeatures"][0]["featureId"] != "feature_001"
     assert [(item["featureId"], item["name"]) for item in synced["coreFeatures"]] == [
-        ("feature_001", "할 일 등록"), ("profile.manage", "회원정보 수정"),
+        (synced["coreFeatures"][0]["featureId"], "할 일 등록"), ("profile.manage", "회원정보 수정"),
     ]
     assert sync_core_features_with_registry(state.copy(prd_document="")).prd_document == ""
 

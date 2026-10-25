@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 
 from phase2.agent_contract import route_contract_table, semantic_relevance
 
-
 _CONTAMINATION_PATTERNS = (
     (re.compile(r"\bXVG\b", re.I), "XVG token"),
     (re.compile(r"DELIV(?:ER|THELIVER)ABLES?", re.I), "prompt label leak"),
@@ -36,7 +35,6 @@ _CONTAMINATION_PATTERNS = (
     (re.compile(r"(?:찔끔|대충\s*처리|아무튼)"), "informal/noise fragment"),
     (re.compile(r"(?:확인해|처리해|관리해|하려고|하고\s*싶어)\s*[.]$"), "incomplete informal Korean ending"),
     (re.compile(r"(?:관리|설계|구현|제공|완료)\s*[.](?:\s+(?=[가-힣])|\s*$)"), "nominal Korean sentence ending"),
-    (re.compile(r"(?<![A-Za-z])mvp(?![A-Za-z])"), "lowercase acronym style leak"),
     (re.compile(r"(?:이|가)\s*(?:기록|저장|관리|처리|구현)\s*[.]$"), "incomplete Korean predicate"),
     (re.compile(r"(?:SELF_CHECK\s*:\s*(?:PASS|FAIL)|이전\s*시도에서|출처\s*규칙\s*:|최종\s*작성\s*예시|지시가\s*있으나|조건을\s*충족한\s*상태)", re.I), "retry/prompt text leak"),
     (re.compile(r"\[(?:문제\s*정의|타겟\s*유저|기능\s*정의)\]", re.I), "interview context leak"),
@@ -64,18 +62,28 @@ def flatten_text(value) -> str:
     return str(value or "")
 
 
-def _string_values(value):
+def _string_values(value, skip_keys=frozenset()):
     if isinstance(value, str):
         yield value
     elif isinstance(value, dict):
-        for item in value.values():
-            yield from _string_values(item)
+        for key, item in value.items():
+            if key not in skip_keys:
+                yield from _string_values(item, skip_keys)
     elif isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
         for item in value:
-            yield from _string_values(item)
+            yield from _string_values(item, skip_keys)
 
 
-def contamination_reasons(value) -> list[str]:
+def contamination_reasons(value, *, technical=False) -> list[str]:
+    def prose(value):
+        if isinstance(value, dict):
+            return {key: prose(item) for key, item in value.items()
+                    if key not in {"segmentId", "featureId", "featureIds", "sourceFeatureId", "parentFeatureId", "featureRegistryHash"}}
+        if isinstance(value, list):
+            return [prose(item) for item in value]
+        return value
+
+    value = prose(value)
     text = flatten_text(value)
     reasons = [label for pattern, label in _CONTAMINATION_PATTERNS if pattern.search(text)]
     # A truncated Korean token followed by an unrelated CamelCase/long English
@@ -86,13 +94,14 @@ def contamination_reasons(value) -> list[str]:
         "node", "express", "rabbitmq", "cloudflare", "prometheus", "grafana",
         "web", "ui", "mvp", "qa", "pwa", "json", "sql", "fastapi", "python",
         "typescript", "kafka", "cdn", "opentelemetry", "bearer", "token", "unique",
+        "nestjs", "nextjs", "sentry", "bullmq", "zustand", "prisma", "vite", "minio",
     }
     mixed = [
         token
-        for item in _string_values(value)
+        for item in _string_values(value, {"techStack"})
         for token in re.findall(r"[\uac00-\ud7a3]{1,4}\s+([A-Za-z][A-Za-z0-9_]{4,})\b", item)
     ]
-    if any("_" not in token and token.lower() not in allowed for token in mixed):
+    if not technical and any("_" not in token and token.lower() not in allowed for token in mixed):
         reasons.append("mixed-language splice")
     if " / " in text and "KOSIS 실제 통계값" not in text:
         reasons.append("inline delimiter leak")
@@ -138,7 +147,7 @@ def kpi_basis_issues(item: dict, market_data: str = "") -> list[str]:
 _REQUIREMENT_FIELD_CONCEPTS = (
     ("name", re.compile(r"(?:이름|명칭|상품명|장비명|반려동물명)"), {"name", "title"}),
     ("species", re.compile(r"(?:동물\s*)?종류|품종"), {"species", "animal_type", "breed"}),
-    ("birth_date", re.compile(r"(?:생년월일|출생일|생일)"), {"birth_date", "date_of_birth", "born_at"}),
+    ("birth_date", re.compile(r"(?:생년월일|출생일|(?<![가-힣])생일)"), {"birth_date", "date_of_birth", "born_at"}),
     ("gender", re.compile(r"(?:성별)"), {"gender", "sex"}),
     ("image_url", re.compile(r"(?:사진|이미지)"), {"image_url", "photo_url", "image", "photo"}),
     ("title", re.compile(r"(?:제목|강의명|상품명|장비명|티켓명|이름을?\s*(?:입력|등록|저장))"), {"title", "name"}),

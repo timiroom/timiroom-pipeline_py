@@ -7,7 +7,24 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, InternalServerError
 
-from phase2.agents.api_agent import _canonical_api_path, _normalize_endpoints
+from phase2.agent_contract import (
+    IssueSeverity,
+    canonical_api_method,
+    classify_issue,
+    endpoint_feature_ids,
+    endpoint_feature_table,
+    feature_relation_kind,
+    path_input_fields,
+    requires_auth,
+    server_managed_fields,
+)
+from phase2.agents.api_agent import (
+    _canonical_api_path,
+    _endpoint_quality_issues,
+    _feature_methods,
+    _feature_resource_slug,
+    _normalize_endpoints,
+)
 from phase2.agents.dba_agent import (
     USER_REFERENCE_STEMS,
     _build_name_lookup,
@@ -23,6 +40,7 @@ from phase2.agents.dba_agent import (
     sanitize_tables,
 )
 from phase2.agents.prd_agent import reconcile_core_features
+from phase2.contract_quality import declared_operation
 from phase2.feature_coverage import strictly_uncovered_features
 from phase2.feature_registry import (
     missing_db_contract_features,
@@ -31,20 +49,23 @@ from phase2.feature_registry import (
 from phase2.feature_scope import backend_features
 from phase2.json_utils import try_parse_json
 from phase2.llm_runtime import LlmRuntime
-from phase2.state import PipelineState
-
-from phase2.agents.dba_agent import _build_name_lookup, _fk_target
-from phase2.agents.api_agent import _endpoint_quality_issues, _feature_methods, _feature_resource_slug
-from phase2.agent_contract import (
-    IssueSeverity,
-    canonical_api_method,
-    classify_issue,
-    endpoint_feature_ids,
-    endpoint_feature_table,
-    feature_relation_kind,
-    requires_auth,
+from phase2.operation_contract import cross_contract_issues, operation_schema_issues
+from phase2.prd_policy import (
+    kpi_issues,
+    kpi_signature,
+    persona_coverage_issues,
+    persona_issues,
+    persona_signature,
 )
-from phase2.quality_rules import contamination_reasons, has_placeholder, kpi_basis_issues, near_duplicate, relevance_score, required_field_concepts, scoped_unique_columns
+from phase2.quality_rules import (
+    contamination_reasons,
+    has_placeholder,
+    near_duplicate,
+    relevance_score,
+    required_field_concepts,
+    scoped_unique_columns,
+)
+from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
@@ -222,12 +243,11 @@ _PRESENCE_PENALTY = 0.0
 REVIEW_SYSTEM = "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."
 
 _LENIENCY_NOTE = """
-결함 판단 기준 (엄하게 적용하지 말 것):
-- 사소한 필드명 차이 (camelCase vs snake_case)는 결함이 아닙니다
-- 일부 필드가 빠져도 핵심 기능이 동작하면 통과입니다
-- 전체적인 설계 방향이 올바르면 세부 불일치는 무시하세요
-- 연체료 계산, 예약 우선순위 등 비즈니스 로직은 서버 내부에서 처리되므로
-  별도 API 엔드포인트가 없어도 정상입니다"""
+결함 판단 기준:
+- camelCase DTO와 snake_case 저장 필드는 올바른 명시 매핑이 있으면 결함이 아닙니다.
+- 명시 계약의 필수 필드·경로·FK 누락은 기능이 대략 동작해도 결함입니다.
+- 계약 밖 기능이나 개수 목표를 새로 요구하지 마세요.
+- 내부 비즈니스 로직은 계약이 별도 API를 요구하지 않는 한 독립 endpoint가 필요하지 않습니다."""
 
 DB_REVIEW_PROMPT = """당신은 시니어 DBA입니다.
 아래 DB 스키마가 API 스펙·기능 목록과 정합성이 있는지 정확히 검증하고,
@@ -248,18 +268,18 @@ DB_REVIEW_PROMPT = """당신은 시니어 DBA입니다.
 1. DB 스키마에 핵심 테이블과 컬럼이 존재하는가?
 2. API 스펙의 각 엔드포인트가 필요로 하는 DB 테이블과 컬럼이 존재하는가?
 3. DB 테이블 간 외래키 관계가 올바르게 설계되어 있는가?
-4. API 필드명과 DB 컬럼명이 일치하는가?
+4. API DTO와 DB 컬럼이 명시적 fieldMappings로 연결되는가? 이름이 다르다는 이유만으로 DTO를 바꾸지 마세요.
 5. 컬럼 제약조건이 기능과 모순되지 않는가? — 사용자가 수동/선택 입력할 수 있어야 하는 필드에
    NOT_NULL·UNIQUE가 걸려 입력이 막히면 결함이다. (예: "바코드 없는 재료도 수동 등록" 기능이 있으면
    barcode 컬럼은 NOT_NULL·UNIQUE이면 안 됨 → NULL 허용으로 수정)
 6. MVP에서 제외(excluded)된 기능만을 위해 존재하는 테이블이 포함돼 있지 않은가? (있으면 과설계 — 지적)
 {leniency}
 
-문제가 있으면 DB 스키마 전체를 수정해 fixed에 담고, 문제가 없으면 원본 그대로 fixed에 담으세요.
-fixed의 구조는 원본과 동일하게 유지하세요 (tables는 배열, 각 원소는 {{"name":..., "description":..., "columns":[...], "indexes":[...]}}, 각 컬럼은 "컬럼명 타입 제약조건" 문자열).
+문제 있는 테이블/관계만 patches에 담으세요. 전체 fixed 재출력은 금지하며 문제가 없으면 patches={{}}입니다.
+tables는 배열이며 컬럼은 원본의 구조화된 column 객체 형식을 보존하세요. 계약 밖 테이블을 추가하지 마세요.
 
 JSON:
-{{"issues": ["결함 설명"], "fixed": {{"tables": {{...}}, "relationships": [...]}}}}
+{{"issues": ["결함 설명"], "patches": {{"tables": [], "relationships": []}}}}
 """
 
 API_REVIEW_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
@@ -283,14 +303,14 @@ API_REVIEW_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
 검수 기준:
 1. 기능 목록의 모든 기능에 해당하는 API 엔드포인트가 존재하는가?
 2. PRD의 coreFeatures 각 항목에 대응하는 API 엔드포인트가 존재하는가?
-3. DB 스키마와 필드명/테이블명이 어긋나지 않는가?
+3. DTO와 저장 필드가 fieldMappings로 연결되는가? 계약의 이름·타입을 보존하는가?
 {leniency}
 
-문제가 있으면 API 스펙 전체를 수정해 fixed에 담고, 문제가 없으면 원본 그대로 fixed에 담으세요.
-fixed의 구조는 원본과 동일하게 유지하세요 ({{"endpoints": [...], "authentication": "..."}}).
+문제가 있는 method/path endpoint만 patches.endpoints에 담으세요. 전체 fixed 재출력은 금지하며 문제가 없으면 patches={{}}입니다.
+원본의 구조화 스키마와 featureIds를 보존하고 계약 밖 endpoint는 추가하지 마세요.
 
 JSON:
-{{"issues": ["결함 설명"], "fixed": {{"endpoints": [...], "authentication": "..."}}}}
+{{"issues": ["결함 설명"], "patches": {{"endpoints": []}}}}
 """
 
 PRD_REVIEW_PROMPT = """당신은 10년 경력의 시니어 PM입니다.
@@ -313,16 +333,16 @@ PRD_REVIEW_PROMPT = """당신은 10년 경력의 시니어 PM입니다.
 {completeness_hint}
 
 검수 기준:
-1. PRD의 coreFeatures가 기능 목록과 일치하는가? (누락·불일치 항목)
+1. PRD coreFeatures와 source=prd_core 기능이 sourceFeatureId로 추적되는가? supporting 기능을 core 누락으로 지적하지 마세요.
 2. PRD의 coreFeatures 각 항목에 대응하는 DB 테이블이 존재하는가?
 3. PRD의 goals/kpi가 실제 설계된 기능과 현실적으로 연결되는가?
 {leniency}
 
-정합성 문제가 있으면 PRD 문서 전체를 수정해 fixed에 담고, 문제가 없으면 원본 그대로 fixed에 담으세요.
-fixed의 구조(키 목록)는 원본과 동일하게 유지하세요.
+문제가 있는 최상위 섹션만 patches에 담고 문제가 없으면 patches={{}}입니다.
+전체 fixed 재출력은 금지하며 기존 구조·핵심 기능 ID와 범위를 보존하세요.
 
 JSON:
-{{"issues": ["결함 설명"], "fixed": {{...PRD 문서 전체...}}}}
+{{"issues": ["결함 설명"], "patches": {{}}}}
 """
 
 _REVIEW_PROMPTS = {"db": DB_REVIEW_PROMPT, "api": API_REVIEW_PROMPT, "prd": PRD_REVIEW_PROMPT}
@@ -606,91 +626,44 @@ class QaAgent:
         )
 
     def _execute_lightweight_gate(self, state: PipelineState) -> PipelineState:
-        """Phase2 QA는 산출물 생성 완료 여부만 확인하고, 엄격한 판단은 Phase3로 넘긴다."""
-        db_draft, api_draft, prd_draft = state.db_schema, state.api_spec, state.prd_document
-        db_parsed = try_parse_json(db_draft)
-        api_parsed = try_parse_json(api_draft)
-        prd_parsed = try_parse_json(prd_draft)
-
-        contract_db, contract_api, contract_prd = self._check_registry_contracts(
-            normalize_feature_registry(
-                state.feature_registry, state.feature_list, preserve_extra=True,
-            ),
-            try_parse_json(db_draft), try_parse_json(api_draft), try_parse_json(prd_draft),
+        """QA and Phase3 consume the same fresh, revision-bound checker."""
+        from phase2.validation_contract import (
+            artifact_revision,
+            dedupe_issues,
+            issue_detail,
         )
-
-        db_issues = self._check_db_completeness(
-            try_parse_json(db_draft), state.feature_list, state.feature_registry,
+        from phase3.schema_validator import SchemaValidator
+        result = SchemaValidator().validate(
+            state.feature_list, state.db_schema, state.api_spec, state.prd_document,
+            state.feature_registry, state.feature_specs,
         )
-        api_issues = self._check_api_completeness(try_parse_json(api_draft), state.feature_list)
-        prd_issues = self._check_prd_completeness(try_parse_json(prd_draft), len(state.feature_list), state.market_research or "")
-        cross_db, cross_api, cross_prd = self._check_cross_artifacts(
-            try_parse_json(db_draft), try_parse_json(api_draft), try_parse_json(prd_draft),
-        )
-        semantic_db, semantic_api, semantic_prd = self._check_cross_document_semantics(
-            try_parse_json(prd_draft), try_parse_json(db_draft), try_parse_json(api_draft),
-            state.feature_list, state.context_prompt or "",
-        )
-        cross_db.extend(semantic_db)
-        cross_api.extend(semantic_api)
-        cross_prd.extend(semantic_prd)
-        db_issues.extend(x for x in cross_db if x not in db_issues)
-        api_issues.extend(x for x in cross_api if x not in api_issues)
-        prd_issues.extend(x for x in cross_prd if x not in prd_issues)
-        db_issues.extend(x for x in contract_db if x not in db_issues)
-        api_issues.extend(x for x in contract_api if x not in api_issues)
-        prd_issues.extend(x for x in contract_prd if x not in prd_issues)
-        db_issues.extend(x for x in state.qa_db_blockers if x not in db_issues)
-        api_issues.extend(x for x in state.qa_api_blockers if x not in api_issues)
-        prd_issues.extend(x for x in state.qa_prd_blockers if x not in prd_issues)
-        db_issues.extend(x for x in self._check_domain_scope(db_parsed, prd_parsed) if x not in db_issues)
-        db_issues.extend(x for x in self._check_duplicate_domains(db_parsed) if x not in db_issues)
-        total_issues = len(db_issues) + len(api_issues) + len(prd_issues)
-        score = max(0.0, 1.0 - min(total_issues, 4) * 0.1)
-        # Lightweight gate의 모든 이슈는 결정론적 검사에서 나온 계약 결함이다.
-        classified = self._classify_issues(
-            db_issues, api_issues, prd_issues,
-            deterministic=set(db_issues + api_issues + prd_issues),
-        )
-        generation_db = [item for item in state.generation_blockers if str(item).startswith("DBA_")]
-        generation_api = [item for item in state.generation_blockers if str(item).startswith("API_")]
-        generation_other = [item for item in state.generation_blockers if item not in generation_db + generation_api]
-        classified["db_blockers"] = list(dict.fromkeys(generation_db + classified["db_blockers"]))
-        classified["api_blockers"] = list(dict.fromkeys(generation_api + classified["api_blockers"]))
-        classified["prd_blockers"] = list(dict.fromkeys(generation_other + classified["prd_blockers"]))
-        blockers = classified["db_blockers"] + classified["api_blockers"] + classified["prd_blockers"]
-        approved = not blockers and not state.generation_blockers
-
-        logger.info(
-            "QA 경량 게이트 완료 — DB:%d결함, API:%d결함, PRD:%d결함 (qualityScore=%.2f, Phase3 이관)",
-            len(db_issues),
-            len(api_issues),
-            len(prd_issues),
-            score,
-        )
-
+        revision = artifact_revision(state.db_schema, state.api_spec, state.prd_document, state.feature_registry)
+        details = list(result.blocker_details)
+        if not state.feature_registry:
+            # Legacy clients have no contract registry. Preserve their semantic
+            # findings as manual QA; canonical pipelines use the checker above.
+            db, api, prd = map(try_parse_json, (state.db_schema, state.api_spec, state.prd_document))
+            from phase2.artifact_shapes import shape_issues
+            if all(isinstance(item, dict) for item in (db, api, prd)) and not any(
+                shape_issues(domain, value) for domain, value in (("db", db), ("api", api), ("prd", prd))
+            ):
+                for domain, messages in zip(("db", "api", "prd"), self._check_cross_document_semantics(prd, db, api, state.feature_list), strict=True):
+                    details.extend(issue_detail("LEGACY_SEMANTIC", domain, message, revision=revision) for message in messages)
+        for message in state.generation_blockers:
+            domain = "db" if message.startswith("DBA_") else "api" if message.startswith("API_") else "prd"
+            details.append(issue_detail(message.split(":", 1)[0], domain, message, revision=revision))
+        details = dedupe_issues(details)
+        blockers = [item for item in details if item.get("severity") != "WARNING"]
+        kwargs = {}
+        for domain in ("db", "api", "prd"):
+            domain_details = [item for item in details if item.get("domain") == domain]
+            kwargs[f"qa_{domain}_issues"] = [item["message"] for item in domain_details]
+            kwargs[f"qa_{domain}_blockers"] = [item["message"] for item in domain_details if item.get("severity") != "WARNING"]
+            kwargs[f"qa_{domain}_warnings"] = [item["message"] for item in domain_details if item.get("severity") == "WARNING"]
         return state.copy(
-            db_schema=db_draft,
-            api_spec=api_draft,
-            prd_document=prd_draft,
-            qa_quality_score=score,
-            qa_approved=approved,
-            qa_db_issues=db_issues,
-            qa_api_issues=api_issues,
-            qa_prd_issues=prd_issues,
-            qa_db_blockers=classified["db_blockers"],
-            qa_api_blockers=classified["api_blockers"],
-            qa_prd_blockers=classified["prd_blockers"],
-            qa_db_warnings=classified["db_warnings"],
-            qa_api_warnings=classified["api_warnings"],
-            qa_prd_warnings=classified["prd_warnings"],
-            qa_blocker_details=self._build_blocker_details(classified),
-            qa_issue_details=self._structured_issues(db_issues, api_issues, prd_issues),
-            qa_repair_issues=[
-                issue for issue in self._structured_issues(db_issues, api_issues, prd_issues)
-                if issue["severity"] in {IssueSeverity.ERROR.value, IssueSeverity.BLOCKER.value}
-            ],
-            last_validation_error="",
+            **kwargs, qa_validation_revision=revision if state.feature_registry else "", qa_quality_score=1.0 / (1 + len(blockers)),
+            qa_approved=not blockers, qa_blocker_details=blockers,
+            qa_issue_details=details, qa_repair_issues=blockers, last_validation_error="",
             status_message="QA 경량 게이트 완료 — Phase 3 구조 검증으로 이관",
         )
 
@@ -831,6 +804,8 @@ class QaAgent:
         table_text = " ".join(json.dumps(t, ensure_ascii=False) for t in (db or {}).get("tables", []))
         core = [f for f in (prd or {}).get("coreFeatures", []) if isinstance(f, dict)]
         core_ids = {str(f.get("featureId") or "").strip() for f in core}
+        for code, domain, detail in cross_contract_issues(registry or [], db or {}, api or {}, prd or {}):
+            {"db": db_issues, "api": api_issues, "prd": prd_issues}[domain].append(f"{code}: {detail}")
         for item in registry or []:
             fid = str(item.get("featureId") or item.get("id") or "").strip()
             name = str(item.get("name") or fid)
@@ -1018,8 +993,9 @@ class QaAgent:
                 })
         return result
 
+    @staticmethod
     def _check_cross_document_semantics(
-        self, prd, db, api, feature_list: list[str], requirement_text: str = "",
+        prd, db, api, feature_list: list[str], requirement_text: str = "",
     ):
         """Validate ownership, references and behavior across PRD, ERD and API."""
         db_issues: list[str] = []
@@ -1121,6 +1097,10 @@ class QaAgent:
                     )
         for feature in prd.get("coreFeatures") or []:
             if not isinstance(feature, dict):
+                continue
+            if (feature.get("dbContract") or {}).get("fields"):
+                # Canonical field/FK coverage is checked by cross_contract_issues.
+                # Keyword guesses must not invent status/content/image columns.
                 continue
             feature_name = str(feature.get("name") or "")
             content = f"{feature.get('description', '')} {' '.join(feature.get('requirements') or [])}"
@@ -1248,6 +1228,11 @@ class QaAgent:
             for endpoint in endpoint_list:
                 if str(endpoint.get("path") or "").startswith("/api/v1/auth/"):
                     continue
+                contracts = [declared_operation(feature, endpoint) for feature in core_features]
+                if any(contract is not None and isinstance(contract.get("authRequired"), bool) for contract in contracts):
+                    # Operation contract drift is checked separately. A login
+                    # requirement for writes does not make every read private.
+                    continue
                 if not bool(endpoint.get("authRequired")):
                     api_issues.append(f"PRD 인증 요구와 authRequired 불일치: {endpoint.get('method')} {endpoint.get('path')}")
         auth_paths = " ".join(str(ep.get("path") or "") for ep in endpoint_list)
@@ -1258,6 +1243,21 @@ class QaAgent:
         # 로그아웃만 있으면 세션·무상태 토큰으로도 충분하다. 저장 구조는 refresh token을 발급할 때만 요구한다.
         if "/auth/refresh" in auth_paths and not has_refresh_store:
             db_issues.append("Refresh Token API가 있지만 만료·회수 가능한 토큰 저장 구조가 없음")
+        # Logout alone does not imply a persisted token. An explicitly declared
+        # bearer-session contract does, and must reference its actual store.
+        bearer_stores = {
+            str(policy.get("sessionTable") or "") for endpoint in endpoint_list
+            if isinstance(policy := endpoint.get("sessionPolicy"), dict)
+            and policy.get("strategy") == "bearer_session"
+        }
+        for name in sorted(bearer_stores):
+            valid = {"expires_at", "revoked_at"} <= columns.get(name, set()) and any(
+                column.get("name") == "id" and str(column.get("type") or "").lower() == "uuid"
+                and "PRIMARY_KEY" in str(column.get("constraints") or "").upper()
+                for column in tables.get(name, {}).get("columns") or [] if isinstance(column, dict)
+            )
+            if not valid:
+                db_issues.append(f"명시된 Bearer Session의 만료·회수 가능한 UUID 토큰 저장 구조가 없음: {name}")
         # Delivery infrastructure is deployment-specific. A product may use web
         # push, e-mail, SMS, or an external provider without persisting a device
         # token in this service, so QA must not force a push-device schema.
@@ -1269,9 +1269,22 @@ class QaAgent:
                 name,
             ))
 
+        def _has_principal_path(table_name: str) -> bool:
+            pending, visited = list(refs.get(table_name, set())), {table_name}
+            while pending:
+                target = pending.pop()
+                if target in visited:
+                    continue
+                if target in principal_tables:
+                    return True
+                visited.add(target)
+                pending.extend(refs.get(target, set()) - visited)
+            return False
+
         has_preferences = any(
-            "user_id" in names and any(_is_preference_column(name) for name in names)
-            for names in columns.values()
+            ("user_id" in names or _has_principal_path(table_name))
+            and any(_is_preference_column(name) for name in names)
+            for table_name, names in columns.items()
         )
         if preference_required and not has_preferences:
             db_issues.append("알림 설정 요구사항이 있지만 사용자별 수신 설정 구조가 없음")
@@ -1300,10 +1313,15 @@ class QaAgent:
                 ):
                     api_issues.append(f"로그인 API 식별자·자격증명 계약 누락: {path}")
                 continue
-            if method == "GET" and "{" not in path and not path.endswith("/me"):
+            list_operation = endpoint.get("action") in {"list", "search"} or "목록" in str(endpoint.get("description") or "")
+            if not endpoint.get("action") and not endpoint.get("responseSchema"):
+                list_operation = list_operation or path.removeprefix("/api/v1/").replace("-", "_") in tables
+            if method == "GET" and "{" not in path and not path.endswith("/me") and list_operation:
                 if "404" in str(endpoint.get("errorCodes") or ""):
                     api_issues.append(f"목록 API가 빈 결과에 404를 명시: {path}")
-                if "[]" not in str(endpoint.get("successResponse") or ""):
+                from phase2.operation_contract import _schema_nodes
+                structured_array = any(node.get("type") == "array" for node in _schema_nodes(endpoint.get("responseSchema"), api.get("schemas")))
+                if not structured_array and "[]" not in str(endpoint.get("successResponse") or ""):
                     api_issues.append(f"목록 API의 빈 배열 계약 누락: {path}")
             slug = path.removeprefix("/api/v1/").split("/", 1)[0].replace("-", "_")
             mapped_name, mapped_table = _endpoint_table(endpoint, tables, db.get("featureMappings"))
@@ -1313,15 +1331,17 @@ class QaAgent:
                 request_text = json.dumps(request_body, ensure_ascii=False) if isinstance(request_body, dict) else str(request_body or "")
                 if re.search(r"\bpayload\s*:\s*object\b|기능(?:별)?\s*입력", request_text, re.I):
                     api_issues.append(f"API 요청 계약이 구체 필드 없이 payload로만 정의됨: {method} {path}")
-                if mapped_table:
+                if isinstance(endpoint.get("requestSchema"), dict) or isinstance(endpoint.get("effects"), list) and endpoint["effects"]:
+                    api_issues.extend(operation_schema_issues(endpoint, tables))
+                elif mapped_table:
                     request_fields = _request_field_names(request_body)
                     endpoint_feature = str(
                         endpoint.get("featureName") or endpoint.get("description") or ""
                     ).split(":", 1)[0]
                     association_contract = feature_relation_kind(endpoint_feature) == "association"
-                    server_managed = {"id", "created_at", "updated_at", "password_hash", "credential_hash"}
-                    if not association_contract:
-                        server_managed.add("user_id")
+                    server_managed = server_managed_fields(
+                        mapped_table.get("columns") or [], association=association_contract,
+                    )
                     db_fields = columns.get(mapped_name, set()) - server_managed
                     unknown = request_fields - db_fields
                     if unknown:
@@ -1337,7 +1357,7 @@ class QaAgent:
                             and "NOT_NULL" in str(column.get("constraints") or "").upper()
                             and "DEFAULT" not in str(column.get("constraints") or "").upper()
                         }
-                        missing = required - request_fields
+                        missing = required - request_fields - path_input_fields(endpoint, mapped_table.get("columns") or [])
                         if missing:
                             api_issues.append(
                                 f"API POST 필수 필드가 ERD보다 부족함: {path} {sorted(missing)}"
@@ -1557,11 +1577,11 @@ class QaAgent:
                     return ""
         return ""
 
-    # PRD 프롬프트(prd_agent.SECTION_PROMPTS)가 스스로 요구하는 최소 개수 기준
+    # Require actual usable items, not seven metrics or three fictional people.
     _PRD_MIN_COUNTS = (
-        ("userPersonas", 3),
+        ("userPersonas", 1),
         ("releaseSchedule", 6),
-        ("kpi", 7),
+        ("kpi", 1),
     )
 
     def _check_prd_completeness(
@@ -1586,23 +1606,21 @@ class QaAgent:
             if n < minimum:
                 issues.append(f"{field}가 {n}개뿐 — 최소 {minimum}개 필요")
 
-        if contamination_reasons(prd_doc):
-            issues.append(f"PRD 오염 문자열 감지: {contamination_reasons(prd_doc)}")
-        if has_placeholder(prd_doc):
+        content = {key: value for key, value in prd_doc.items() if key != "qualityMetadata" and not key.startswith("_quality")}
+        if contamination_reasons(content):
+            issues.append(f"PRD 오염 문자열 감지: {contamination_reasons(content)}")
+        if has_placeholder(content):
             issues.append("PRD에 placeholder·미정·수동 보완 값이 남아 있음")
 
         goals = [str(x) for x in prd_doc.get("goals") or []]
         if any(near_duplicate(goals[i], goals[j], 0.6) for i in range(len(goals)) for j in range(i)):
             issues.append("goals에 의미상 중복 목표가 있음")
-        metrics = [str(x.get("metric") or "") for x in prd_doc.get("kpi") or [] if isinstance(x, dict)]
-        if any(near_duplicate(metrics[i], metrics[j], 0.6) for i in range(len(metrics)) for j in range(i)):
-            issues.append("KPI 지표가 의미상 중복됨")
+        metrics = [kpi_signature(item) for item in prd_doc.get("kpi") or [] if isinstance(item, dict)]
+        if len(metrics) != len(set(metrics)):
+            issues.append("KPI 측정 정의가 중복됨")
         for item in prd_doc.get("kpi") or []:
-            if isinstance(item, dict) and "→" not in str(item.get("target") or ""):
-                issues.append(f"KPI target 형식 오류: {item.get('metric')}")
-            elif isinstance(item, dict):
-                for reason in kpi_basis_issues(item, market_data):
-                    issues.append(f"KPI 근거 검증 실패: {item.get('metric')} — {reason}")
+            for reason in kpi_issues(item, market_data=market_data, require_measurement=True):
+                issues.append(f"KPI 검증 실패: {item.get('metric') if isinstance(item, dict) else ''} — {reason}")
 
         scope = prd_doc.get("mvpScope") if isinstance(prd_doc.get("mvpScope"), dict) else {}
         excluded = set(scope.get("excluded") or [])
@@ -1630,11 +1648,13 @@ class QaAgent:
                 issues.append(f"상세 기능 데이터 명세 누락: {feature}")
 
         signatures = []
+        issues.extend(persona_coverage_issues(prd_doc))
         for item in prd_doc.get("userPersonas") or []:
             if isinstance(item, dict):
-                sig = f"{item.get('age', '')} {item.get('job', '')}"
+                issues.extend(persona_issues(item))
+                sig = persona_signature(item)
                 if sig in signatures:
-                    issues.append("Persona 연령·직업 조합이 중복되어 세그먼트 구분이 약함")
+                    issues.append("Persona 역할·목표·사용 여정이 중복됨")
                     break
                 signatures.append(sig)
 

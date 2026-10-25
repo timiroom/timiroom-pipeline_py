@@ -7,6 +7,7 @@ from phase2.agents.api_agent import (
     _feature_resource_slug,
 )
 from phase2.agents.dba_agent import (
+    _repair_indexes,
     ensure_domain_columns,
     reconcile_fk_types,
     sanitize_tables,
@@ -22,6 +23,14 @@ from phase2.quality_rules import (
 )
 
 
+def test_tech_stack_allows_technical_names_without_disabling_content_leak_checks():
+    tech = {"techStack": {"backend": "백엔드는 SpringBoot를 사용합니다. 배포에는 Kubernetes를 사용합니다."}}
+    assert not contamination_reasons(tech)
+    assert not contamination_reasons("백엔드는 SpringBoot를 사용합니다.", technical=True)
+    assert contamination_reasons({"techStack": {"backend": "uttered response in Korean per instruction guidelines"}})
+    assert contamination_reasons({"background": "메모와 스프레 SharePoint 등에 흩어져 있습니다"})
+
+
 def test_shared_contamination_gate_rejects_observed_model_leaks():
     assert contamination_reasons("장 XVG 냉장 효과 데이터")
     assert contamination_reasons("ipv4 DELIVTHELIVERABLES: API")
@@ -32,6 +41,15 @@ def test_shared_contamination_gate_rejects_observed_model_leaks():
         "Many users struggle to monitor refrigerator inventory efficiently and need reliable daily notifications."
     )
     assert contamination_reasons("[문제 정의] 현재 문제")
+
+
+def test_index_repair_preserves_order_and_null_position_while_correcting_only_identifier():
+    value = {"name": "entries", "columns": [{"name": "created_at"}], "indexes": [
+        "CREATE INDEX idx_entries_time ON entries(created_at DESC NULLS LAST)",
+        "CREATE INDEX idx_entries_typo ON entries(created_a ASC NULLS FIRST)"]}
+    _repair_indexes(value)
+    assert value["indexes"] == ["CREATE INDEX idx_entries_time ON entries(created_at DESC NULLS LAST)",
+                                 "CREATE INDEX idx_entries_typo ON entries(created_at ASC NULLS FIRST)"]
 
 
 def test_contamination_gate_rejects_instruction_fragments_inside_prd_values():
@@ -56,7 +74,7 @@ def test_contamination_gate_rejects_instruction_fragments_inside_prd_values():
     assert contamination_reasons("찔끔 기능을 추가합니다")
     assert contamination_reasons("매일 상태를 확인해.")
     assert contamination_reasons("기능을 설계. 사용자가 검수합니다.")
-    assert contamination_reasons("mvp에 필수 포함합니다")
+    assert not contamination_reasons("mvp에 필수 포함합니다")
 
 
 def test_kpi_basis_requires_verified_numeric_evidence_or_internal_goal():
@@ -278,7 +296,7 @@ def test_dba_does_not_invent_fields_from_table_name_or_description():
     assert "notification_type" not in names
 
 
-def test_dba_removes_fk_columns_without_a_real_target():
+def test_dba_preserves_unresolved_fk_columns_for_explicit_validation():
     tables = [
         {"name": "users", "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}]},
         {"name": "notifications", "columns": [
@@ -290,18 +308,19 @@ def test_dba_removes_fk_columns_without_a_real_target():
     result = reconcile_fk_types(tables)
     columns = {column["name"] for column in result[1]["columns"]}
     assert "user_id" in columns
-    assert "notifying_item_id" not in columns
+    assert "notifying_item_id" in columns
 
 
-def test_api_manager_aligns_contract_fields_to_erd():
+def test_api_manager_keeps_unmapped_legacy_input_visible_for_qa():
     db = '{"tables":[{"name":"consumption_records","columns":[' \
          '{"name":"id","type":"BIGINT"},{"name":"user_id","type":"BIGINT"},' \
          '{"name":"ingredient_id","type":"BIGINT"},{"name":"quantity_used","type":"DECIMAL(10,2)"}]}]}'
     endpoints = [{"method": "POST", "path": "/api/v1/consumption-records", "description": "소비 기록",
                   "authRequired": True, "requestBody": "food_id: bigint", "successResponse": "ok", "errorCodes": "500"}]
     result = _align_endpoints_to_db(endpoints, db)[0]
-    assert "ingredient_id" in result["requestBody"]
-    assert "food_id" not in result["requestBody"]
+    # Renaming an input is not a safe repair without an explicit DTO mapping.
+    assert "food_id" in result["requestBody"]
+    assert "ingredient_id" not in result["requestBody"]
     assert "user_id" not in result["requestBody"]
 
 
@@ -319,9 +338,10 @@ def test_prd_manager_replaces_placeholders_and_resolves_p0_mvp_conflict():
         "mvpScope": {"included": feature_list[:3], "excluded": feature_list[3:], "rationale": "범위"},
     }
     result = PrdAgent._audit_sections(sections, feature_list, "서비스")
-    assert len(result["kpi"]) == 7
+    assert result["kpi"] == []
+    assert any(item["section"] == "kpi" for item in result["_qualityDiagnostics"])
     assert all("미정" not in str(item) for item in result["kpi"])
-    assert result["coreFeatures"][-1]["priority"] == "P2"
+    assert result["coreFeatures"][-1]["releaseScope"] == "excluded"
     assert "소비 기록" in result["coreFeatures"][2]["description"]
     assert "차감" not in result["coreFeatures"][2]["description"]
 
@@ -343,8 +363,9 @@ def test_prd_manager_removes_unlinked_external_kpi_basis():
                  "measurementMethod": "가입 완료 이벤트 집계", "frequency": "월간"}],
     }
     result = PrdAgent._audit_sections(sections, ["재료 추가"], "서비스")
-    first = next(item for item in result["kpi"] if item["metric"] == "신규 가입자 수")
-    assert "보고서" not in first["basis"]
+    assert result["kpi"] == []
+    reasons = str(result["_qualityDiagnostics"])
+    assert "외부 KPI 근거에 원문 URL 없음" in reasons
 
 
 def test_prd_manager_drops_kpi_for_unapproved_feature_expansion():

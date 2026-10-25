@@ -634,11 +634,11 @@ def test_reconcile_removes_root_to_event_reverse_fk_and_keeps_assignment_actor()
     task_names = {column["name"] for column in by_name["tasks"]["columns"]}
     assignment = {column["name"]: column for column in by_name["assigned_personnel"]["columns"]}
     completed = {column["name"] for column in by_name["completed_statuses"]["columns"]}
-    assert not ({"status_id"} <= task_names and {"task_id"} <= completed)
+    assert {"status_id"} <= task_names and {"task_id"} <= completed
     assert "personnel_id" not in assignment
 
 
-def test_reconcile_removes_completion_status_naming_variant_reverse_fk():
+def test_reconcile_preserves_explicit_completion_status_references():
     tables = [
         _table("tasks", [
             ("id", "BIGINT", "PRIMARY_KEY"),
@@ -655,7 +655,7 @@ def test_reconcile_removes_completion_status_naming_variant_reverse_fk():
     by_name = {table["name"]: table for table in repaired}
     task_columns = {column["name"] for column in by_name["tasks"]["columns"]}
 
-    assert not (
+    assert (
         "completion_status_id" in task_columns
         and "tasks (1:N) completion_statuses" in _synthesize_relationships(repaired)
     )
@@ -682,7 +682,7 @@ def test_actor_principal_is_not_invented_from_table_name():
     assert "assigned_personnel (1:N) tasks" in relationships
 
 
-def test_reconcile_breaks_explicit_root_assignment_cycle():
+def test_reconcile_preserves_explicit_bidirectional_references():
     tables = [
         _table("tasks", [
             ("id", "BIGINT", "PRIMARY_KEY"),
@@ -701,13 +701,13 @@ def test_reconcile_breaks_explicit_root_assignment_cycle():
     task_columns = {column["name"]: column for column in by_name["tasks"]["columns"]}
     relationships = _synthesize_relationships(repaired)
 
-    assert "assigned_personnel_id" not in task_columns
+    assert "assigned_personnel_id" in task_columns
     assignment_columns = {
         column["name"]: column for column in by_name["assigned_personnel"]["columns"]
     }
     assert "REFERENCES users(id)" in assignment_columns["assigned_user_id"]["constraints"]
     assert "tasks (1:N) assigned_personnel" in relationships
-    assert "assigned_personnel (1:N) tasks" not in relationships
+    assert "assigned_personnel (1:N) tasks" in relationships
 
 
 def test_reconcile_does_not_create_missing_actor_principals():
@@ -1113,7 +1113,7 @@ def test_event_api_ignores_other_event_targets_when_building_atomic_rule():
     assert "잔량 부족" not in endpoint["errorCodes"]
 
 
-def test_event_api_prefers_root_over_stateful_assignment_for_atomic_rule():
+def test_event_api_uses_declared_state_effect_not_fk_based_root_guess():
     schema = json.dumps({"tables": [
         _table("tasks", [
             ("id", "BIGINT", "PRIMARY_KEY"),
@@ -1137,6 +1137,9 @@ def test_event_api_prefers_root_over_stateful_assignment_for_atomic_rule():
             "path": "/api/v1/completed-status-records/{id}",
             "description": "완료 상태 기록 변경",
             "authRequired": True,
+            "effects": [{"kind": "state_transition", "table": "tasks", "column": "status",
+                         "from": "pending" if method == "PATCH" else "completed",
+                         "to": "completed" if method == "PATCH" else "pending"}],
         }
         for method in ("PATCH", "DELETE")
     ], schema)

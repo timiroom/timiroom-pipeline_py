@@ -26,7 +26,7 @@ def test_manager_review_canonicalizes_version_without_losing_registry_identity(p
     assert endpoints[0]["action"] == "login"
 
 
-def test_manager_aligns_fields_with_declared_table_and_preserves_explicit_route():
+def test_manager_preserves_route_and_unmapped_dto_for_qa_instead_of_erasing_it():
     registry = [{
         "featureId": "document.create", "name": "Document create", "actions": ["create"],
         "apiContract": [{"method": "POST", "path": "/api/v1/documents", "action": "create"}],
@@ -49,7 +49,8 @@ def test_manager_aligns_fields_with_declared_table_and_preserves_explicit_route(
     assert endpoint["featureId"] == "document.create"
     assert endpoint["action"] == "create"
     assert "title: string" in endpoint["requestBody"]
-    assert "wrong" not in endpoint["requestBody"]
+    # Unknown DTO fields require an explicit mapping or QA repair, not silent deletion.
+    assert "wrong: integer" in endpoint["requestBody"]
 
 
 def test_dba_manager_normalizes_postgresql_before_emitting_schema():
@@ -70,7 +71,7 @@ def test_dba_manager_normalizes_postgresql_before_emitting_schema():
     assert {"title", "due_date"} <= set(columns)
 
 
-def test_feature_spec_publishes_semantics_from_final_registry_without_changing_owner():
+def test_feature_spec_failure_preserves_owner_without_publishing_fallback():
     from phase2.agents.feature_spec_agent import FeatureSpecAgent
     from phase2.state import PipelineState
     state = PipelineState(
@@ -83,15 +84,16 @@ def test_feature_spec_publishes_semantics_from_final_registry_without_changing_o
         }],
         prd_document=json.dumps({"coreFeatures": [{"name": "문서 등록", "requirements": ["문서를 저장한다"]}]}, ensure_ascii=False),
     )
-    # Missing client invokes the documented deterministic fallback, with no provider call.
+    # Missing client must not invent a replacement contract.
     result = asyncio.run(FeatureSpecAgent(object(), "test").execute(state))
-    spec = result.feature_specs[0]
+    spec = result.feature_registry[0]
     assert spec["featureId"] == "document.create"
     assert spec["ownership"]["ownerEntity"] == "members"
     assert spec["ownership"]["ownerKey"] == "member_id"
-    assert spec["apiContract"][0]["path"] == "/api/v1/documents"
+    assert spec["apiContract"][0]["path"] == "/api/v0/documents"
     assert spec == result.feature_registry[0]
-    assert json.loads(result.feature_spec_document)["features"][0] == spec
+    assert not result.feature_spec_document
+    assert result.generation_blockers
 
 
 @pytest.mark.parametrize("feature_name", ["상품 목록 조회", "상품 재고 수량 조회"])

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import operator
@@ -17,20 +18,40 @@ from phase2.agent_contract import (
     feature_methods,
     feature_relation_kind,
     normalize_api_path,
+    path_input_fields,
     requires_auth,
+    server_managed_fields,
 )
+from phase2.artifact_shapes import shape_issues
 from phase2.feature_coverage import (
     strictly_uncovered_features,
     uncovered_features,
     undercovered_features,
 )
 from phase2.feature_registry import normalize_feature_registry, registry_text
-from phase2.feature_scope import backend_features
+from phase2.feature_scope import artifact_features, backend_features
 from phase2.json_utils import has_suspicious_script, try_parse_json
 from phase2.llm_runtime import LlmRuntime
 from phase2.openapi_spec import build_openapi_document, validate_openapi_document
+from phase2.operation_contract import (
+    auxiliary_only_contract,
+    bind_operation_contract,
+    operation_registry,
+)
 from phase2.quality_rules import contamination_reasons, has_placeholder, relevance_score
+from phase2.repair_scope import (
+    endpoint_key,
+    preserve_unscoped,
+    repair_targets,
+    scope_prompt,
+    valid_base,
+)
 from phase2.state import PipelineState
+from phase2.workflow_contract import (
+    authentication_contract,
+    workflow_contract_issues,
+    workflow_metadata,
+)
 
 # EXAONE이 가끔 오타로 내는 필드명 -> 정규화
 _ENDPOINT_KEY_ALIASES = {
@@ -59,8 +80,7 @@ _AUTH_ENDPOINT_COUNT = 4  # 회원가입/로그인/토큰갱신/로그아웃
 _MAX_ENDPOINT_SOFT_CAP = 36
 
 _AUTHENTICATION_DESC = (
-    "JWT Bearer 토큰 방식. 로그인 시 발급받은 accessToken을 "
-    "Authorization: Bearer <token> 헤더로 전송한다."
+    "인증 여부와 토큰·쿠키 전달 방식은 Registry의 sessionPolicy 및 endpoint 계약을 따른다."
 )
 
 WORKER_SYSTEM = "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."
@@ -106,10 +126,10 @@ PLAN_PROMPT = """당신은 시니어 백엔드 아키텍트입니다.
 - Registry의 featureId를 각 endpoint skeleton에 반드시 그대로 넣고 action도 기록하세요. 같은 method/path가 여러 기능 계약에 공유되면 featureIds 배열에 모든 featureId를 기록하세요.
 - Registry의 각 apiContract 항목은 누락 없이 1:1로 계획에 반영하세요. Registry에 계약이 있으면 새 해석보다 method/path/featureId/action 계약을 우선하세요.
 - 모든 plan 항목은 featureId와 action을 가져야 하며, featureId 없는 endpoint는 출력하지 마세요. 계약을 만족시키는 endpoint가 부족하면 다른 기능과 합치지 말고 누락된 endpoint를 추가하세요.
-- 상태 변경 endpoint는 정상 상태 전이, 선행 조건, 권한, 중복·기간·정원 초과 오류를 반영
+- 상태 변경 endpoint는 해당 도메인의 상태 전이와 선행 조건, 권한 오류를 반영하고 정원·기간 제한은 요구사항에 명시된 경우에만 포함
 - 목록 조회 엔드포인트는 페이지네이션이 필요함을 description에 명시
-- 담당 기능은 {feature_count}개입니다. 권장 엔드포인트 수는 {min_endpoints}개 이상, {max_endpoints}개 이하입니다
-- {max_endpoints}개를 넘기지 마세요. 초과가 필요하면 낮은 우선순위 CRUD/조회 파생 API를 합치거나 제외하세요
+- 담당 기능은 {feature_count}개입니다. legacy 개수 참고 범위는 {min_endpoints}~{max_endpoints}개이며 명시 계약보다 우선하지 않습니다.
+- apiContract가 있으면 그 method/path 집합을 그대로 소비하세요. cap을 이유로 계약을 합치거나 제외하지 말고, 임의 파생 endpoint도 추가하지 마세요. 개수 참고 범위는 계약 없는 입력에만 적용합니다.
 - 담당 기능 밖의 엔드포인트는 만들지 마세요 (다른 담당자가 설계합니다)
 - 출력 직전에 담당 기능을 하나씩 대조하세요. 각 기능에 최소 1개의 endpoint가 있어야 하며,
   기능명에 독립 행동이 여러 개 포함되면 각 행동의 endpoint가 모두 있어야 합니다.
@@ -305,8 +325,6 @@ def _align_endpoints_to_db(
             auth_ep = _deterministic_endpoint(ep)
             if path.endswith("/refresh"):
                 auth_ep["transactionRules"] = "기존 Refresh Token의 해시·만료·회수 상태를 검증한 뒤 새 토큰으로 원자적으로 교체한다."
-            elif path.endswith("/logout"):
-                auth_ep["transactionRules"] = "전달된 Refresh Token 해시의 revoked_at을 기록하고 이후 재사용을 거부한다."
             key = (auth_ep["method"], auth_ep["path"])
             if key not in seen:
                 seen.add(key)
@@ -320,7 +338,10 @@ def _align_endpoints_to_db(
                 seen.add(key)
                 aligned.append(own_ep)
             continue
-        slug = path.removeprefix("/api/v1/").split("/", 1)[0]
+        resource_parts = [part for part in path.removeprefix("/api/v1/").split("/")
+                          if part and not part.startswith("{")
+                          and part not in {"validate", "uploads", "transitions", "search"}]
+        slug = resource_parts[-1] if resource_parts else ""
         declared_table = tables.get(declared_table_name or "")
         table = declared_table or tables.get(slug.replace("-", "_"))
         feature_label = str(ep.get("featureName") or ep.get("description") or "").split(":", 1)[0].strip()
@@ -442,11 +463,11 @@ def _align_endpoints_to_db(
         # never invented from a technology suggestion in the PRD.
         endpoint_feature = str(ep.get("featureName") or ep.get("description") or "").split(":", 1)[0]
         association_contract = feature_relation_kind(endpoint_feature) == "association"
+        managed_fields = server_managed_fields(columns, association=association_contract)
         # A stored credential hash is derived on the server; a client never submits it.
         writable = [
             c for c in business
-            if c["name"] not in {"password_hash", "credential_hash"}
-            and (c["name"] != "user_id" or association_contract)
+            if c["name"] not in managed_fields
         ]
         method = str(ep.get("method") or "GET").upper()
         if method in {"PATCH", "PUT", "DELETE"} and "{" not in path:
@@ -454,24 +475,52 @@ def _align_endpoints_to_db(
             ep["path"] = path
         if method in _BODYLESS_METHODS:
             ep["requestBody"] = "없음"
-        else:
-            selected = writable
-            ep["requestBody"] = ", ".join(
-                f"{c['name']}: {_api_type(c.get('type'))} — {table['name']} 필드" for c in selected
+        elif not isinstance(ep.get("requestSchema"), dict):
+            path_fields = path_input_fields(ep, columns)
+            selected = [column for column in writable if column["name"] not in path_fields]
+            original_body = str(ep.get("requestBody") or "")
+            allowed = {column["name"] for column in selected}
+            # Keep operation-specific DTOs. Database fields are only a fallback
+            # for absent contracts, and never make server-managed values writable.
+            parts = re.split(r",\s*(?=[A-Za-z_][A-Za-z0-9_]*\s*:)", original_body)
+            blocked = {column["name"] for column in columns} - allowed
+            # Legacy drafts have no explicit mapping: known columns belonging
+            # only to another table remain invalid. Non-storage DTO inputs
+            # (files, validation tokens, etc.) are retained for QA to inspect.
+            other_columns = set().union(*(_column_names(value) for value in tables.values())) - {column["name"] for column in columns}
+            clean_parts = [part for part in parts if (match := re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", part))
+                           and not re.match(r"\s*payload\s*:\s*object\b", part, re.IGNORECASE)
+                           and match.group(1) not in blocked | other_columns and match.group(1) not in path_fields]
+            ep["requestBody"] = ", ".join(clean_parts) or ", ".join(
+                f"{c['name']}: {_api_type(c.get('type'))} — 입력값" for c in selected
             ) or "payload: object — 기능 입력"
-        if method == "GET":
-            is_collection = "{" not in path
+            if method == "POST" and ep.get("action") not in {"validate", "transition", "confirm", "cancel"}:
+                supplied = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:", ep["requestBody"]))
+                required = [column for column in selected
+                            if "NOT_NULL" in str(column.get("constraints") or "").upper()
+                            and "DEFAULT" not in str(column.get("constraints") or "").upper()
+                            and column["name"] not in supplied]
+                if required:
+                    ep["requestBody"] += ", " + ", ".join(
+                        f"{column['name']}: {_api_type(column.get('type'))} — 필수 입력값" for column in required
+                    )
+        if isinstance(ep.get("responseSchema"), dict):
+            pass
+        elif method == "GET":
+            is_collection = not path.rstrip("/").endswith("}") or ep.get("action") in {"list", "search"}
             if is_collection:
-                ep["successResponse"] = f"items: array<{table['name']}> — 조회 결과가 없으면 [], total: integer — 전체 개수"
+                ep["successResponse"] = f"items: array<{table['name']}> — 조회 결과가 없으면 [], total: integer — 전체 개수, page: integer — 현재 페이지, size: integer — 페이지 크기"
             else:
-                ep["successResponse"] = f"item: {table['name']} — 단일 조회 결과"
+                ep.setdefault("successResponse", f"item: {table['name']} — 단일 조회 결과")
         elif method == "DELETE":
             ep["successResponse"] = "success: boolean — 삭제 성공 여부, deletedId: integer — 삭제된 ID"
         elif method == "PATCH":
             ep["successResponse"] = "id: integer — 수정된 ID, updated_at: string — 수정 시각"
         else:
-            ep["successResponse"] = "id: integer — 생성된 ID, created_at: string — 생성 시각"
-        collection_get = method == "GET" and "{" not in path
+            if ep.get("action") in {"transition", "validate"}:
+                ep["successResponse"] = "id: integer — 처리 대상 ID, status: string — 처리 후 상태"
+            else:
+                ep.setdefault("successResponse", "id: integer — 생성된 ID, created_at: string — 생성 시각")
         ep["errorCodes"] = _error_contract(
             bool(ep.get("authRequired")), target_required="{" in path,
         )
@@ -491,65 +540,21 @@ def _align_endpoints_to_db(
                 f"{table['name']} 대상 존재와 참조 무결성을 확인한 뒤 삭제를 단일 DB 트랜잭션으로 처리한다.",
             )
 
-        table_name = str(table.get("name") or "")
-        table_columns_set = _column_names(table)
-        occurrence_fields = {
-            "occurred_at", "recorded_at", "event_at", "completed_at", "processed_at",
-            "started_at", "ended_at", "effective_at",
-        }
-        event_like = bool(_referenced_tables(table)) and (
-            bool(table_columns_set & occurrence_fields)
-            or any(re.search(r"(?:^delta_|_delta$|_change$|_used$|^previous_|^new_)", name)
-                   for name in table_columns_set)
-            or (
-                len(_referenced_tables(table)) >= 2
-                and bool(table_columns_set & {"status", "state"})
-                and any(
-                    _column_names(tables[target]) & {"status", "state"}
-                    for target in _referenced_tables(table) if target in tables
-                )
-            )
-        )
-        if event_like:
-            aggregate_targets = [
-                target for target in _referenced_tables(table)
-                if (target in tables
-                    and (_column_names(tables[target]) & _STATE_FIELD_NAMES))
-            ]
-            # An event can reference both a root aggregate and a stateful child
-            # assignment. Prefer the ancestor referenced by another candidate.
-            if len(aggregate_targets) > 1:
-                root_targets = [
-                    candidate for candidate in aggregate_targets
-                    if any(
-                        candidate in _referenced_tables(tables[other])
-                        for other in aggregate_targets
-                        if other != candidate
-                    )
-                ]
-                if len(root_targets) == 1:
-                    aggregate_targets = root_targets
-            if len(aggregate_targets) == 1 and method in {"POST", "PATCH", "DELETE"}:
-                aggregate_name = aggregate_targets[0]
-                if method == "POST":
-                    rule = f"{table_name} 생성과 {aggregate_name} 상태 반영을 단일 DB 트랜잭션으로 처리하고 허용되지 않은 상태는 409로 거부한다."
-                elif method == "PATCH":
-                    rule = f"기존 기록의 {aggregate_name} 반영분을 먼저 되돌린 뒤 변경값을 다시 반영하며 전체를 단일 트랜잭션으로 처리한다."
-                else:
-                    rule = f"삭제 전 기록이 반영한 {aggregate_name} 상태를 역보정한 뒤 기록을 삭제하며 전체를 단일 트랜잭션으로 처리한다."
-                ep["transactionRules"] = rule
-                ep["errorCodes"] = ep["errorCodes"].replace("500 —", "409 — 상태 또는 선행 업무 충돌, 500 —")
-        unique_indexes = [str(index) for index in table.get("indexes") or [] if re.search(r"CREATE\s+UNIQUE\s+INDEX", str(index), re.I)]
-        stateful_targets = [
-            target for target in _referenced_tables(table)
-            if target in tables and (_column_names(tables[target]) & _STATE_FIELD_NAMES)
+        # A reference is not a state transition. Use the exact declared field
+        # and transition; do not invent reversal semantics from FK topology.
+        state_effects = [
+            effect for effect in ep.get("effects") or []
+            if isinstance(effect, dict) and effect.get("kind") == "state_transition"
+            and effect.get("table") in tables and effect.get("column")
+            and effect.get("from") is not None and effect.get("to") is not None
         ]
-        if method in {"POST", "PATCH", "DELETE"} and (unique_indexes or stateful_targets):
+        unique_indexes = [str(index) for index in table.get("indexes") or [] if re.search(r"CREATE\s+UNIQUE\s+INDEX", str(index), re.I)]
+        if method in {"POST", "PATCH", "DELETE"} and (unique_indexes or state_effects):
             rules = []
             if unique_indexes:
                 rules.append("동일한 주체와 대상의 중복 요청을 UNIQUE 제약으로 차단하고 충돌 시 409를 반환한다")
-            if stateful_targets:
-                rules.append(f"참조 엔티티 {stateful_targets[0]}의 존재와 현재 상태를 확인한 뒤 단일 트랜잭션으로 처리한다")
+            for effect in state_effects:
+                rules.append(f"{effect['table']}.{effect['column']}의 허용 전이 {effect['from']} → {effect['to']}를 검증하고 같은 트랜잭션에 반영한다")
             existing_rule = str(ep.get("transactionRules") or "").strip()
             existing_sentences = {
                 sentence.strip().rstrip(".") for sentence in re.split(r"[.;]", existing_rule) if sentence.strip()
@@ -563,6 +568,17 @@ def _align_endpoints_to_db(
             if "409" not in ep["errorCodes"]:
                 ep["errorCodes"] = ep["errorCodes"].replace("500 —", "409 — 업무 상태 또는 중복 충돌, 500 —")
         _normalize_parameters(ep)
+        for parameter in ep.get("parameters") or []:
+            if parameter.get("in") != "path":
+                continue
+            stem = re.sub(r"(?<!^)(?=[A-Z])", "_", str(parameter.get("name") or "")).lower().removesuffix("_id")
+            candidates = [candidate for name, candidate in tables.items()
+                          if name == stem or name == stem + "s" or (stem == "id" and name == table["name"])]
+            if len(candidates) == 1:
+                pk = next((column for column in candidates[0].get("columns", [])
+                           if "PRIMARY_KEY" in str(column.get("constraints", ""))), None)
+                if pk:
+                    parameter["type"] = _api_type(pk.get("type"))
         key = (method, str(ep.get("path") or ""))
         if key not in seen:
             seen.add(key)
@@ -806,12 +822,21 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
 설계 규칙:
 - requestBody와 successResponse는 반드시 문자열로 작성 (객체 금지).
   각 필드를 "필드명: 타입 — 설명" 형태로 쉼표로 이어서 나열한다.
+- 위 문자열은 화면 요약입니다. requestSchema/responseSchema(JSON Schema)도 작성하고 properties/required/enum/format/items와 중첩 객체를 구조화하세요. 본문 없는 작업은 requestSchema를 생략하세요.
+- Registry의 requestSchema/responseSchema/contentType/successStatus/fieldMappings/effects/sessionPolicy는 그대로 소비하세요. DTO를 DB 행 전체로 교체하거나 서버 생성 필드를 사용자 필수 입력으로 만들지 마세요.
+- fieldMappings는 field/table/column/source 배열입니다. source는 body/path/query/header/cookie/response/auth/server/derived로 실제 출처를 구분하세요. request는 기존 계약의 본문 출처 호환값이며 path 입력을 body/request로 바꾸지 마세요. 파일은 multipart/form-data + binary 또는 계약된 업로드 URL 완료 흐름을 사용하세요.
+- fieldMappings 객체마다 field 하나와 실제 column 하나만 연결하세요. 쉼표로 여러 컬럼을 묶지 마세요. 루트 배열 응답은 field="[].id", items 속성 안의 배열 응답만 field="items[].id"를 사용하며 source="response"로 매핑하세요.
+- contentType과 successStatus는 실제 동작에 맞게 작성하세요. 모든 POST가 201은 아니며 204는 본문이 없습니다. 요구된 안내·연관 데이터는 responseSchema에 포함하세요.
+- transactionRules는 선언된 effects/상태 전이만 반영하세요. FK나 status 컬럼만으로 부모 상태 역보정을 만들지 마세요. 인증 발급·회수는 공통 sessionPolicy와 일치해야 합니다.
+- sessionPolicy.transport/tokenFormat/tokenField와 responseHeaders/allowedRoles를 그대로 보존하세요. bearer_session을 JWT라고 단정하거나 쿠키 계약을 Bearer로 바꾸지 마세요. statePolicies/intervalPolicies의 초기 상태·점유 상태·잠금 및 시간대 변경 정책을 transactionRules와 조회 필터에서 동일하게 사용하세요.
+- readDependencies에 선언된 조회 계약과 responseField는 필수입니다. 목록/상세 조회를 soft cap이나 같은 기능이라는 이유로 누락하지 마세요. 취소 allowed state는 명시된 모든 state_transition effect와 일치해야 합니다.
+- effects는 설명 문자열 배열이 아니라 {{"table":"실제 테이블","column":"실제 컬럼","kind":"update","from":"이전 상태","to":"다음 상태"}} 객체 배열입니다. Registry에 effects가 없으면 []로 작성하고, 설명은 transactionRules에 작성하세요. 임의 상태 변경을 만들지 마세요.
 - 쿼리 파라미터·경로 파라미터는 requestBody가 아니라 parameters 배열에 넣는다.
   GET·DELETE처럼 본문이 없는 메서드의 requestBody는 정확히 "없음" 이라고만 쓴다.
-- 목록 조회 엔드포인트라면 parameters에 page, size를 반드시 포함하고,
-  정렬·필터가 필요하면 그것도 파라미터로 추가한다
+- 목록 조회의 페이지네이션·정렬·필터는 계약의 parameters를 그대로 소비하세요. cursor 계약에 page/size를 추가하지 마세요.
 - 경로에 {{id}} 같은 자리표시자가 있으면 parameters에 in="path"로 반드시 포함
-- successResponse는 DB 스키마의 실제 컬럼명과 어긋나지 않게 작성
+- 외부 DTO 필드명은 requestSchema/responseSchema 계약을 보존하세요. camelCase DTO와 snake_case 저장 컬럼은 fieldMappings로 연결하고 계산 결과에 임의 저장 컬럼을 만들지 마세요.
+- requestBody/successResponse 문자열은 구조화 스키마의 화면 요약이며 별도의 설계 원천이 아닙니다.
 - errorCodes는 "코드 — 설명" 형식으로 2개 이상 작성
 - transactionRules에는 쓰기 작업의 원자적 변경 범위와 실패 시 롤백 규칙을 명시한다.
 - 위 지시문의 예시 문구("없으면 없음", "필드명" 등)를 값에 그대로 옮겨 쓰지 말 것 — 실제 내용만
@@ -830,6 +855,7 @@ ENDPOINT_SPEC_PROMPT = """당신은 시니어 백엔드 개발자입니다.
   ],
   "requestBody": "본문이 없으면 없음",
   "successResponse": "반환 필드들",
+  "effects": [],
   "errorCodes": "401 — 인증 실패, 404 — 리소스 없음",
   "transactionRules": "이 작업의 원자적 변경 범위와 실패 처리"
 }}
@@ -877,6 +903,60 @@ PRD 자체에 문제가 없으면 prdIssues는 빈 문자열로 두세요.
 """
 
 
+def reconcile_auth_session_contracts(endpoints: list[dict], registry: list[dict]) -> list[dict]:
+    """Keep token issuance/revocation consistent without inventing refresh APIs."""
+    refresh = any(normalize_api_path(ep.get("path")).endswith("/auth/refresh") for ep in endpoints)
+    policies = [item.get("sessionPolicy") for item in registry if isinstance(item.get("sessionPolicy"), dict)]
+    policy = policies[0] if policies else {"strategy": "refresh_token" if refresh else "bearer_session"}
+    for endpoint in endpoints:
+        path = normalize_api_path(endpoint.get("path"))
+        if not path.startswith("/api/v1/auth/"):
+            # Worker-authored transport metadata is not a second contract.
+            # Private business routes consume the single registry policy.
+            if endpoint.get("authRequired") and policy.get("transport"):
+                endpoint["sessionPolicy"] = dict(policy)
+            continue
+        effective = endpoint.get("sessionPolicy") if isinstance(endpoint.get("sessionPolicy"), dict) else policy
+        endpoint["sessionPolicy"] = dict(effective)
+        if effective.get("transport"):
+            # Typed transport contracts are authoritative, including bodyless
+            # logout and token/header delivery. Legacy enrichment must not edit them.
+            continue
+        if path.endswith(("/login", "/refresh")) and effective.get("strategy") == "refresh_token":
+            if isinstance(endpoint.get("responseSchema"), dict):
+                schema = endpoint["responseSchema"]
+                properties = schema.setdefault("properties", {})
+                if not {"refreshToken", "refresh_token"}.intersection(properties):
+                    properties["refreshToken"] = {"type": "string", "description": "회수 가능한 갱신 토큰"}
+                    schema["required"] = list(dict.fromkeys([*schema.get("required", []), "refreshToken"]))
+            elif not re.search(r"refresh_?token", str(endpoint.get("successResponse")), re.I):
+                endpoint["successResponse"] = str(endpoint.get("successResponse") or "accessToken: string") + ", refreshToken: string — 갱신 토큰"
+        if path.endswith("/logout"):
+            endpoint["authRequired"] = True
+            if effective.get("strategy") == "refresh_token":
+                endpoint["requestBody"] = "refreshToken: string — 폐기할 갱신 토큰"
+                endpoint["requestSchema"] = {"type": "object", "properties": {"refreshToken": {"type": "string"}}, "required": ["refreshToken"], "additionalProperties": False}
+                endpoint["transactionRules"] = "전달된 갱신 토큰의 해시·소유권을 확인하고 세션과 토큰의 revoked_at을 원자적으로 기록한다."
+            else:
+                declared_input = any(
+                    "requestSchema" in operation
+                    and normalize_api_path(operation.get("path")) == path
+                    and canonical_api_method(operation.get("method"), path) == endpoint.get("method")
+                    for feature in registry for operation in feature.get("apiContract") or [] if isinstance(operation, dict)
+                )
+                if not declared_input:
+                    endpoint["requestBody"] = "없음"
+                    endpoint.pop("requestSchema", None)
+                endpoint["transactionRules"] = "인증 컨텍스트의 현재 세션을 식별해 revoked_at을 기록하고 해당 세션의 후속 요청을 거부한다."
+        if "password-reset" in path and (
+            "confirm" in path or re.search(r"new_?password|password\s*:", str(endpoint.get("requestBody")), re.I)
+        ):
+            rule = str(endpoint.get("transactionRules") or "").strip()
+            if "기존 세션" not in rule:
+                endpoint["transactionRules"] = rule + "; 비밀번호 변경, 재설정 토큰 사용 처리, 해당 사용자의 기존 세션 및 갱신 토큰 폐기를 한 트랜잭션으로 처리한다."
+    return endpoints
+
+
 def finalize_api_contracts(
     endpoints: list[dict], db_schema: str, prd_document: str = "",
     feature_list: list[str] | None = None, registry: list[dict] | None = None,
@@ -917,7 +997,7 @@ def finalize_api_contracts(
             for table in declared
         ]
         candidates = [name for name in declared_names if name in table_names]
-        draft = dict(endpoint)
+        draft = bind_operation_contract(dict(endpoint), spec)
         if spec.get("name"):
             draft["featureName"] = spec["name"]
         # Route vocabulary and physical table names may legitimately differ.
@@ -932,9 +1012,6 @@ def finalize_api_contracts(
             declared_table = candidates[0]
         else:
             declared_table = None
-        if explicit_route and declared_table and not identity_route:
-            resource, _, suffix = original_path.removeprefix("/api/v1/").partition("/")
-            draft["path"] = f"/api/v1/{declared_table.replace('_', '-')}" + (f"/{suffix}" if suffix else "")
         contracts = _align_endpoints_to_db(
             [draft], db_schema, prd_document, requirement_text,
             declared_table_name=declared_table,
@@ -946,8 +1023,9 @@ def finalize_api_contracts(
             for key in ("featureId", "featureIds", "action"):
                 if key in endpoint:
                     contract[key] = endpoint[key]
+            bind_operation_contract(contract, spec)
             aligned.append(contract)
-    return _normalize_endpoints(aligned)
+    return _normalize_endpoints(reconcile_auth_session_contracts(aligned, registry))
 
 
 class _ApiGraphState(TypedDict):
@@ -1000,6 +1078,9 @@ class ApiAgent:
             source_registry = normalize_feature_registry(
                 state.feature_registry, state.feature_list, preserve_extra=True,
             )
+        source_registry = artifact_features(source_registry, "api")
+        if state.feature_registry and not source_registry:
+            return state.copy(api_spec='{"endpoints":[],"featureMappings":[]}', qa_api_blockers=[])
         registry_features = [str(item.get("name")) for item in source_registry if item.get("name")]
         # Feature Spec의 모든 기능은 지식 그래프/API 계약의 노드가 된다.
         # backend_features로 범위를 줄이면 하위 supporting 기능의 Registry 계약이
@@ -1072,6 +1153,8 @@ class ApiAgent:
             endpoints, self_check_issues = api_self_check(endpoints, registry)
             endpoints = [ep for ep in endpoints if isinstance(ep, dict) and endpoint_feature_ids(ep)]
             parsed_spec["endpoints"] = _normalize_endpoints(endpoints)
+            parsed_spec.update(authentication_contract(registry))
+            parsed_spec["workflowPolicies"] = workflow_metadata(registry)
             parsed_spec["featureMappings"] = _api_feature_mappings(
                 endpoints, state.db_schema, scoped_features, registry,
             )
@@ -1113,27 +1196,33 @@ class ApiAgent:
             logger.error(blocker)
             return state.copy(
                 prd_feedback_from_api=blocker,
+                targeted_repair_results={**state.targeted_repair_results, "api": "missing_baseline"},
                 qa_api_blockers=[*state.qa_api_blockers, blocker],
                 qa_approved=False,
                 status_message="API targeted repair 차단 — 기존 산출물 없음",
             )
 
+        allowed = repair_targets(state, feedback, "api", current)
+        if not allowed:
+            return state.copy(targeted_repair_results={**state.targeted_repair_results, "api": "rejected_scope"})
         prompt = TARGETED_REPAIR_PROMPT.format(
             feedback=str(feedback or "")[:8000],
             api_spec=json.dumps(current, ensure_ascii=False),
-        )
+        ) + scope_prompt(current, allowed)
         try:
             raw = await self._call(prompt, max_tokens=7000, system=MANAGER_SYSTEM)
             if dump:
                 dump.log_raw("API_TARGETED_REPAIR", 1, raw)
             result = try_parse_json(raw, strict=True)
+            if not valid_base(result, current):
+                return state.copy(targeted_repair_results={**state.targeted_repair_results, "api": "rejected_revision"})
             patches = result.get("patches") if isinstance(result, dict) else None
             if not isinstance(patches, list) or not patches:
                 logger.warning("API targeted repair — 유효한 patches 없음, 원본 유지")
                 return state
 
             by_key = {
-                (str(ep.get("method", "GET")).upper(), str(ep.get("path", ""))): ep
+                (str(ep.get("method", "GET")).upper(), str(ep.get("path", ""))): copy.deepcopy(ep)
                 for ep in current["endpoints"] if isinstance(ep, dict)
             }
             applied = 0
@@ -1147,6 +1236,13 @@ class ApiAgent:
                     continue
                 patch["method"] = method
                 key = (method, path)
+                if endpoint_key(patch) not in allowed:
+                    continue
+                if patch.pop("op", None) == "remove":
+                    if key in by_key:
+                        del by_key[key]
+                        applied += 1
+                    continue
                 if key in by_key and not str(patch.get("transactionRules") or "").strip():
                     patch.pop("transactionRules", None)
                 by_key[key] = {**by_key[key], **patch} if key in by_key else patch
@@ -1171,8 +1267,11 @@ class ApiAgent:
             )
             endpoints = _annotate_feature_ids(endpoints, registry)
             endpoints, self_check_issues = api_self_check(endpoints, registry)
+            endpoints = preserve_unscoped(current["endpoints"], _normalize_endpoints(endpoints), allowed, endpoint_key)
             repaired = {
-                **current, "endpoints": _normalize_endpoints(endpoints),
+                **current, "endpoints": endpoints,
+                **authentication_contract(registry),
+                "workflowPolicies": workflow_metadata(registry),
                 "featureMappings": _api_feature_mappings(
                     endpoints, state.db_schema, scoped_features, registry,
                 ),
@@ -1185,6 +1284,7 @@ class ApiAgent:
             logger.info("API targeted repair — %d개 endpoint만 패치", applied)
             return state.copy(
                 api_spec=json.dumps(repaired, ensure_ascii=False),
+                targeted_repair_results={**state.targeted_repair_results, "api": "applied" if repaired != current else "noop"},
                 openapi_spec=json.dumps(openapi_document, ensure_ascii=False),
                 prd_feedback_from_api="",
                 # API domain repair가 성공하면 이전 API blocker는 제거한다.
@@ -1209,6 +1309,11 @@ class ApiAgent:
         좁히면 요구 개수가 배치당 8~10개로 내려가 실제로 채워진다."""
         min_endpoints = len(batch) * _ENDPOINTS_PER_FEATURE + (_AUTH_ENDPOINT_COUNT if with_auth else 0)
         max_endpoints = _endpoint_soft_cap(len(batch), include_auth=with_auth)
+        batch_registry = [item for item in _registry_items(ctx.get("feature_registry", "[]"))
+                          if item.get("name") in batch or item.get("featureId") in batch]
+        declared_count = len(_ensure_contract_endpoints([], batch_registry))
+        max_endpoints = max(max_endpoints, declared_count)
+        min_endpoints = max(min_endpoints, declared_count)
         prompt = PLAN_PROMPT.format(
             instruction=ctx["instruction"],
             context=ctx["context"],
@@ -1270,8 +1375,17 @@ class ApiAgent:
     async def _manager_plan_node(self, state: dict) -> dict:
         ctx = state["ctx"]
         feature_list = ctx["feature_list"] or []
+        registry_items = _registry_items(ctx.get("feature_registry", "[]"))
+        declared_plan = _ensure_contract_endpoints([], registry_items)
+        covered_names = {str(item.get("name")) for item in registry_items
+                         if item.get("apiContract") or (item.get("applicability") or {}).get("api") is False}
+        if registry_items and set(feature_list) <= covered_names:
+            # Planning is a projection of the approved contract, not another LLM design.
+            plan = _annotate_feature_ids(declared_plan, registry_items)
+            logger.info("API manager_plan — Registry 계약 %d개 직접 소비 (추가 계획 호출 없음)", len(plan))
+            return {"plan": plan, "authentication": authentication_contract(registry_items)["authentication"], "generation_blocker": ""}
         min_endpoints = max(4, len(feature_list) * _ENDPOINTS_PER_FEATURE)
-        max_endpoints = _endpoint_soft_cap(len(feature_list), include_auth=True)
+        max_endpoints = max(_endpoint_soft_cap(len(feature_list), include_auth=True), len(declared_plan))
 
         # 기능을 배치로 쪼개 병렬 설계 — 배치당 요구 개수가 작아야 EXAONE이 실제로 채운다
         batches = [
@@ -1376,13 +1490,13 @@ class ApiAgent:
             path=path,
             description=description,
             auth_required=str(auth_required).lower(),
-            context=context,
+            context=str(context) + "\n[Canonical operation]\n" + json.dumps(skeleton, ensure_ascii=False),
         )
 
         label = f"API_ENDPOINT_{method}_{path}"
         data = None
         for attempt in range(1):
-            raw = await self._call(prompt, max_tokens=1200, system=WORKER_SYSTEM)
+            raw = await self._call(prompt, max_tokens=2200, system=WORKER_SYSTEM)
             if dump:
                 dump.log_raw(label, attempt + 1, raw)
             data = try_parse_json(raw, strict=True)
@@ -1425,6 +1539,7 @@ class ApiAgent:
             if not data.get("errorCodes"):
                 data["errorCodes"] = "500 — 서버 오류"
 
+        data = bind_operation_contract(data, {"apiContract": [skeleton]})
         return {"endpoints": [data]}
 
     async def _manager_review_node(self, state: dict) -> dict:
@@ -1448,7 +1563,7 @@ class ApiAgent:
         )
         return {
             "api_spec": json.dumps(
-                {"endpoints": endpoints, "authentication": authentication},
+                {"endpoints": endpoints, "authentication": authentication, **authentication_contract(registry_items)},
                 ensure_ascii=False,
             ),
             "prd_issues": "",
@@ -1638,7 +1753,10 @@ def api_self_check(
     endpoint는 검사 전에 기존 정규화 규칙을 적용하므로 호출자는 이 결과를
     최종 API 문서로 그대로 사용할 수 있다.
     """
-    registry_items = [item for item in registry or [] if isinstance(item, dict)]
+    invalid = shape_issues("api", {"endpoints": endpoints or []})
+    if invalid:
+        return endpoints or [], [f"ARTIFACT_SHAPE_INVALID: {item['pointer']} {item['message']}" for item in invalid]
+    registry_items = artifact_features([item for item in registry or [] if isinstance(item, dict)], "api")
     raw_keys = [
         (
             str(item.get("method") or "GET").upper(),
@@ -1669,6 +1787,25 @@ def api_self_check(
             for contract in (item.get("apiContract") or item.get("api") or [])
             if isinstance(contract, dict) and str(contract.get("path") or "").strip()
         }
+        actions = {str(action).strip().lower() for action in item.get("actions") or []}
+        required_methods = set()
+        if actions & {"create", "register", "signup", "apply", "notify"}:
+            required_methods.add("POST")
+        if actions & {"read", "search", "list", "view"}:
+            required_methods.add("GET")
+        if actions & {"update", "edit", "change"}:
+            required_methods.add("PATCH")
+        if actions & {"delete", "remove"}:
+            required_methods.add("DELETE")
+        actual_methods = {method for method, _ in expected[feature_id]}
+        for missing_method in sorted(required_methods - actual_methods):
+            issues.append(f"API_CORE_ACTION_MISSING: {feature_id} {missing_method}")
+        primary = [
+            (method, path) for method, path in expected[feature_id]
+            if not re.search(r"/(?:retry|history|audit|status)(?:/|$)", path)
+        ]
+        if expected[feature_id] and not primary and auxiliary_only_contract(item, registry_items):
+            issues.append(f"API_AUXILIARY_ONLY_CONTRACT: {feature_id}")
 
     # Registry에 없는 endpoint와 계약 경로가 아닌 endpoint는 LLM이 추가한
     # orphan으로 간주하고 제거한다. Registry 계약 endpoint는 위의
@@ -1681,6 +1818,11 @@ def api_self_check(
         method = str(endpoint.get("method") or "GET").upper()
         path = str(endpoint.get("path") or "").strip()
         key = (method, _canonical_api_path(path))
+        if method == "GET" and re.search(
+            r"/(?:retry|approve|reject|cancel|confirm|publish|complete)(?:/|$)",
+            _canonical_api_path(path), re.IGNORECASE,
+        ):
+            issues.append(f"API_UNSAFE_GET_ACTION: {method} {path}")
         feature_ids = endpoint_feature_ids(endpoint)
         if not feature_ids:
             issues.append(f"API_FEATURE_ID_REQUIRED: {method} {path}")
@@ -1750,7 +1892,17 @@ def api_self_check(
                 bind_endpoint_features(endpoint, [*endpoint_feature_ids(endpoint), feature_id])
                 projected_by_route[route_key] = endpoint
 
-    return _normalize_endpoints(list(projected_by_route.values())), list(dict.fromkeys(issues))
+    projected = list(projected_by_route.values())
+    operations, conflicts = operation_registry(registry_items)
+    issues.extend(conflicts)
+    for endpoint in projected:
+        from phase2.operation_contract import route_key
+        contract = operations.get(route_key(endpoint))
+        if contract:
+            bind_operation_contract(endpoint, {"apiContract": [contract]})
+    projected = _normalize_endpoints(reconcile_auth_session_contracts(projected, registry_items))
+    issues.extend(workflow_contract_issues(registry_items, projected))
+    return projected, list(dict.fromkeys(issues))
 
 
 def _registry_items(raw: str | list[dict] | None) -> list[dict]:
@@ -1820,12 +1972,14 @@ def _ensure_contract_endpoints(plan: list, registry: list[dict] | None) -> list:
                 endpoint = existing[key]
                 bind_endpoint_features(endpoint, [*endpoint_feature_ids(endpoint), fid])
                 endpoint["action"] = contract.get("action") or endpoint.get("action", "manage")
+                bind_operation_contract(endpoint, item)
                 continue
             if shape_key in existing_shapes:
                 endpoint = existing_shapes[shape_key]
                 endpoint["path"] = path
                 bind_endpoint_features(endpoint, [*endpoint_feature_ids(endpoint), fid])
                 endpoint["action"] = contract.get("action") or endpoint.get("action", "manage")
+                bind_operation_contract(endpoint, item)
                 existing[key] = endpoint
                 continue
             plan.append({
@@ -1834,6 +1988,7 @@ def _ensure_contract_endpoints(plan: list, registry: list[dict] | None) -> list:
                 "authRequired": True,
             })
             existing[key] = plan[-1]
+            bind_operation_contract(plan[-1], item)
             existing_shapes[shape_key] = plan[-1]
     return plan
 
@@ -1938,29 +2093,32 @@ def _normalize_parameters(ep: dict) -> None:
     쿼리 파라미터가 requestBody 문자열에 뭉뚱그려져 있었다."""
     raw = ep.get("parameters")
     params: list[dict] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for p in raw if isinstance(raw, list) else []:
         if isinstance(p, str):
             p = {"name": p}
         if not isinstance(p, dict) or not str(p.get("name") or "").strip():
             continue
         name = str(p["name"]).strip()
-        if name in seen:
+        location = str(p.get("in") or "query").strip().lower()
+        location = location if location in {"query", "path", "header", "cookie"} else "query"
+        key = (location, name.casefold() if location == "header" else name)
+        if key in seen:
             continue
-        seen.add(name)
-        location = str(p.get("in") or "").strip().lower()
+        seen.add(key)
         params.append({
-            "in": location if location in ("query", "path", "header") else "query",
+            **copy.deepcopy(p),
+            "in": location,
             "name": name,
-            "type": str(p.get("type") or "string").strip(),
-            "required": bool(p.get("required", False)),
+            "type": str(p.get("type") or (p.get("schema") or {}).get("type") or "string").strip(),
+            "required": location == "path" or bool(p.get("required", False)),
             "description": str(p.get("description") or "").strip(),
         })
 
     for name in _PATH_PARAM_RE.findall(str(ep.get("path") or "")):
-        if name in seen:
+        if ("path", name) in seen:
             continue
-        seen.add(name)
+        seen.add(("path", name))
         params.append({
             "in": "path", "name": name,
             "type": "integer" if name.lower().endswith("id") else "string",
@@ -2037,6 +2195,12 @@ def _normalize_endpoints(endpoints: list) -> list:
         ep.setdefault("path", "/api/v1/unknown")
         ep["path"] = _output_api_path(ep["path"])
         ep["method"] = canonical_api_method(ep["method"], ep["path"])
+        # Null on a bodyless operation means no body, not a malformed schema.
+        # Keep non-null schemas so an actual forbidden body still fails QA.
+        if ep["method"] in _BODYLESS_METHODS and ep.get("requestSchema") is None:
+            ep.pop("requestSchema", None)
+        if str(ep.get("successStatus")) == "204" and ep.get("responseSchema") is None:
+            ep.pop("responseSchema", None)
         ep.setdefault("authRequired", True)
         if not str(ep.get("description") or "").strip():
             ep["description"] = f"{ep.get('method')} {ep.get('path')}"
@@ -2169,6 +2333,12 @@ def _endpoint_quality_issues(data: dict | None, raw: str, skeleton: dict, requir
     if str(data.get("path") or "") != str(skeleton.get("path") or ""):
         issues.append("담당 path 변경")
     feature = str(skeleton.get("featureName") or "")
+    auth_action = {
+        "/api/v1/auth/login": "로그인 인증", "/api/v1/auth/signup": "회원가입 계정 생성",
+        "/api/v1/auth/logout": "로그아웃", "/api/v1/auth/refresh": "토큰 갱신",
+    }.get(str(skeleton.get("path") or ""))
+    if auth_action:
+        feature = auth_action
     if feature and relevance_score(feature, str(data.get("description") or "")) < 0.2:
         issues.append("담당 기능과 description 불일치")
     method = str(data.get("method") or "GET").upper()
@@ -2211,7 +2381,7 @@ def _deterministic_endpoint(skeleton: dict) -> dict:
             result[field] = skeleton[field]
     # Deterministic canonical contracts (auth/me and already ERD-aligned repairs)
     # must survive normalization instead of falling back to payload: object.
-    for field in ("requestBody", "successResponse", "errorCodes", "transactionRules"):
+    for field in ("requestBody", "successResponse", "errorCodes", "transactionRules", "requestSchema", "responseSchema", "contentType", "successStatus", "fieldMappings", "effects", "sessionPolicy", "responses", "responseHeaders", "allowedRoles"):
         if str(skeleton.get(field) or "").strip():
             result[field] = skeleton[field]
     if not result.get("transactionRules"):

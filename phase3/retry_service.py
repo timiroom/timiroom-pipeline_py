@@ -4,7 +4,9 @@ import json
 import logging
 
 from phase2.json_utils import try_parse_json
+from phase2.repair_budget import available_targets
 from phase2.state import PipelineState
+from phase2.validation_contract import issue_identity
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ class RetryService:
                 "REGISTRY_CONTRACT_BLOCKER:",
             ))
         ]
-        if terminal_generation_blockers:
+        if terminal_generation_blockers or (state.failed_stage == "FEATURE_SPEC" and state.generation_blockers):
             logger.warning(
                 "불변 generation blocker 감지 — Phase3 repair 재시도 중단: %s",
                 terminal_generation_blockers,
@@ -55,7 +57,11 @@ class RetryService:
                 status_message="Human-in-the-Loop 필요 — 생성 blocker는 자동 재시도하지 않음",
             )
 
-        fingerprint = self._failure_fingerprint(state)
+        requested_targets = set(state.validation_repair_targets or [])
+        eligible = available_targets(state, requested_targets, self._max_targeted_repair_per_domain)
+        if eligible & {"pm", "prd"}:
+            eligible &= {"pm", "prd"}
+        fingerprint = self._failure_fingerprint(state.copy(validation_repair_targets=sorted(eligible or requested_targets)))
 
         if fingerprint in state.validation_failure_fingerprints:
             logger.warning("동일 blocker fingerprint 반복 — 추가 repair 중단")
@@ -66,13 +72,13 @@ class RetryService:
                 status_message="동일 blocker 재발 — 추가 자동 repair 중단, Phase3 blocker 확정",
             )
 
-        targets = set(state.validation_repair_targets or [])
+        targets = eligible
         exhausted = sorted(
-            target for target in targets
+            target for target in requested_targets
             if state.targeted_repair_attempts.get(target, 0)
             >= self._max_targeted_repair_per_domain
         )
-        if exhausted:
+        if exhausted and not targets:
             message = "TARGETED_REPAIR_BUDGET_EXHAUSTED: " + ", ".join(exhausted)
             logger.warning("%s", message)
             return state.copy(
@@ -89,6 +95,7 @@ class RetryService:
         # feature_list/project_name/platform 등 기존 state를 그대로 보존하고
         # context_prompt만 재시도 피드백으로 교체 — 문자열만으로 새 state를 만들면
         # Phase1/2에서 이미 구축된 정보가 전부 소실된다.
+        managed = getattr(orchestration_graph, "manages_repair_budget", False)
         retry_state = state.copy(
             context_prompt=retry_prompt,
             retry_count=current_retry,
@@ -97,7 +104,7 @@ class RetryService:
                 **state.targeted_repair_attempts,
                 **{
                     target: state.targeted_repair_attempts.get(target, 0) + 1
-                    for target in targets
+                    for target in targets if not managed
                 },
             },
         )
@@ -106,7 +113,7 @@ class RetryService:
                 retry_state,
                 repair_feedback,
                 pipeline_id,
-                repair_targets=state.validation_repair_targets,
+                repair_targets=sorted(targets),
             )
         except (asyncio.TimeoutError, TimeoutError) as exc:
             logger.error("Phase 3 선택적 복구 타임아웃 (%d/%d): %s", current_retry, self._max_retry, exc)
@@ -125,7 +132,7 @@ class RetryService:
 
         rejected = {
             target for target in targets
-            if result.targeted_repair_results.get(target) == "rejected_contract_external"
+            if not managed and result.targeted_repair_results.get(target) == "rejected_contract_external"
         }
         if rejected:
             attempts = dict(result.targeted_repair_attempts)
@@ -153,18 +160,17 @@ class RetryService:
         # 정규화된 메시지만 fingerprint에 포함해야 같은 결함의 무한 재시도를 막을 수 있다.
         codes = ",".join(sorted(set(state.validation_error_codes)))
         targets = ",".join(sorted(set(state.validation_repair_targets)))
+        identities = [issue_identity(item) for item in state.qa_blocker_details if isinstance(item, dict)
+                      and (not state.validation_repair_targets or item.get("repairTarget") in state.validation_repair_targets)]
         blockers = json.dumps(
-            state.validation_unresolved_blockers
-            or state.validation_blockers
-            or state.qa_blocker_details
-            or [],
+            sorted(set(identities)) if identities else sorted(set(state.validation_unresolved_blockers or state.validation_blockers or [])),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
         # 자연어 error message는 retry마다 표현이 달라질 수 있으므로 fingerprint에서
         # 제외한다. 동일 blocker를 같은 결함으로 인식해야 반복 repair를 정확히 감지한다.
-        payload = "\x1f".join([codes, targets, blockers])
+        payload = f"{codes}\x1f{targets}\x1f{blockers}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod

@@ -7,7 +7,6 @@ DBA/API처럼 특정 산출물만 담당하는 에이전트는 프론트엔드 �
 
 from __future__ import annotations
 
-
 # 저장/통신 모델 없이 화면 표현만 바꾸는 기능의 대표적인 표현.
 _FRONTEND_ONLY_MARKERS = (
     "반응형",
@@ -34,3 +33,19 @@ def is_frontend_only_feature(feature: object) -> bool:
 def backend_features(feature_list: list[str] | None) -> list[str]:
     """DBA/API가 설계해야 하는 기능만 반환한다. 원본 목록은 변경하지 않는다."""
     return [feature for feature in (feature_list or []) if not is_frontend_only_feature(feature)]
+
+
+def artifact_required(feature: dict, domain: str) -> bool:
+    """Explicit applicability wins; UI-only legacy names are a compatibility fallback."""
+    applicability = feature.get("applicability")
+    if isinstance(applicability, dict) and isinstance(applicability.get(domain), bool):
+        return applicability[domain]
+    if domain == "db" and str(feature.get("dataMode") or "").lower() in {"none", "external", "stateless"}:
+        return False
+    if domain in {"api", "db"} and is_frontend_only_feature(feature.get("name")):
+        return bool(feature.get("apiContract") if domain == "api" else (feature.get("dbContract") or {}).get("tables"))
+    return True
+
+
+def artifact_features(registry, domain):
+    return [feature for feature in registry if artifact_required(feature, domain)]

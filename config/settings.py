@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     phase2_dba_resync_timeout_seconds: float = 120.0
     phase2_api_resync_timeout_seconds: float = 120.0
     phase2_web_search_enabled: bool = True
+    # Prefer schema guidance, downgrade only on explicit capability errors.
+    # Local validation remains authoritative even when a gateway accepts it.
+    feature_spec_output_mode: str = "auto"
+    feature_spec_model: str = "gpt-5.4"
+    feature_spec_max_completion_tokens: int = 24000
+    feature_spec_reasoning_effort: str = "medium"
+    feature_spec_request_timeout_seconds: float = 240.0
+    # Opt-in local response diagnostics. Never exposed through progress APIs.
+    feature_spec_diagnostics_dir: str = ""
+    phase4_storage_timeout_seconds: float = 120.0
 
     # ── Upstage Solar 임베딩 ─────────────────────────────────────
     upstage_api_key: str = ""
@@ -101,6 +111,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime_limits(self) -> "Settings":
+        if self.feature_spec_output_mode not in {"auto", "json_schema", "json_object"}:
+            raise ValueError("FEATURE_SPEC_OUTPUT_MODE must be auto/json_schema/json_object")
+        if self.feature_spec_max_completion_tokens < 1024:
+            raise ValueError("FEATURE_SPEC_MAX_COMPLETION_TOKENS must be >= 1024")
+        if self.feature_spec_reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
+            raise ValueError("FEATURE_SPEC_REASONING_EFFORT must be none/low/medium/high/xhigh")
+        if self.feature_spec_request_timeout_seconds <= 0:
+            raise ValueError("FEATURE_SPEC_REQUEST_TIMEOUT_SECONDS must be > 0")
+        if self.phase4_storage_timeout_seconds <= 0:
+            raise ValueError("PHASE4_STORAGE_TIMEOUT_SECONDS must be > 0")
         if self.rag_chunk_size <= 0:
             raise ValueError("RAG_CHUNK_SIZE는 1 이상이어야 합니다")
         if self.rag_chunk_overlap < 0 or self.rag_chunk_overlap >= self.rag_chunk_size:

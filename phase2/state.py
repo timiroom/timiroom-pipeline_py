@@ -53,6 +53,7 @@ class PipelineState:
     # QA 에이전트 결과 (선택적 재시도용 카테고리별 결함 + 품질 점수)
     qa_quality_score: float = 0.0
     qa_approved: bool | None = None
+    qa_validation_revision: str = ""
     qa_db_issues: list[str] = field(default_factory=list)
     qa_api_issues: list[str] = field(default_factory=list)
     qa_prd_issues: list[str] = field(default_factory=list)
@@ -67,9 +68,15 @@ class PipelineState:
     qa_blocker_details: list[dict[str, Any]] = field(default_factory=list)
     # Upstream/LLM 생성 실패를 품질 결함과 분리해 Phase3까지 보존한다.
     generation_blockers: list[str] = field(default_factory=list)
+    generation_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    artifact_quality: dict[str, Any] = field(default_factory=dict)
+    failed_stage: str = ""
+    last_completed_stage: str = ""
+    skipped_stages: list[str] = field(default_factory=list)
 
     # Search 에이전트
     market_research: str = ""
+    market_research_status: list[dict[str, Any]] = field(default_factory=list)
 
     # PRD rollback
     prd_feedback_from_dba: str = ""

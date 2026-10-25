@@ -8,6 +8,39 @@ from phase2.state import PipelineState
 from routers import chat
 
 
+def test_chat_explicit_feature_boundaries_preserve_compound_actions_and_filters():
+    features = ["물품 등록·사진 첨부·수정·삭제 및 조회", "학교·전공·가격·판매상태별 검색과 필터",
+                "구매 요청과 판매자 수락·거절 및 취소·완료", "참여자 메시지와 내 판매·구매 내역 조회"]
+    valid, normalized, _ = chat._validate_stage_answer(5, ", ".join(features))
+    assert valid
+    assert chat._split_features(normalized) == features
+    assert chat._split_features("일정 등록·마감 알림·과목 분류") == ["일정 등록", "마감 알림", "과목 분류"]
+
+
+def test_chat_platform_distinguishes_responsive_web_from_native_app():
+    for text in ["모바일에서도 편하게 사용할 수 있는 반응형 웹사이트", "모바일 웹", "WEB", "mobile website"]:
+        assert chat._platform_from_answer(text) == "WEB"
+    for text in ["모바일 앱", "APP"]:
+        assert chat._platform_from_answer(text) == "APP"
+    for text in ["웹과 앱 둘 다", "WEB_APP"]:
+        assert chat._platform_from_answer(text) == "WEB_APP"
+
+
+def test_chat_preserves_state_details_without_creating_state_features():
+    raw = "지원 관리, 전형 상태 변경, 면접 일정 관리, 임박 일정 조회. 상태는 준비중·지원완료·최종합격이며 잘못된 상태는 수정할 수 있어요"
+    valid, normalized, _ = chat._validate_stage_answer(5, raw)
+    assert valid
+    assert chat._split_features(normalized) == ["지원 관리", "전형 상태 변경", "면접 일정 관리", "임박 일정 조회"]
+    answers = ["취업 준비 현황 관리 서비스를 만들고 싶어요", "웹사이트", "지원 마감일과 면접 일정을 자주 놓쳐요",
+               "스프레드시트에 기록해요", "지원 건을 등록하고 일정과 상태를 한눈에 확인하고 싶어요",
+               "신입 취업을 준비하는 대학생", normalized, "커리어로그"]
+    messages = [chat.ChatMessageDto(role="user", content=value) for value in answers]
+    form = asyncio.run(chat._synthesize_form_data(messages, None))
+    assert len(form["featureDefinition"]["customFeatures"]) == 4
+    assert "준비중·지원완료·최종합격" in form["projectDescription"]
+    assert "잘못된 상태는 수정할 수 있어요" in form["projectDescription"]
+
+
 def test_prd_execute_assembles_worker_text_before_pm_and_keeps_confirmed_priorities():
     class Completions:
         async def create(self, **kwargs):
@@ -28,8 +61,9 @@ def test_prd_execute_assembles_worker_text_before_pm_and_keeps_confirmed_priorit
     assert {item["name"]: item["priority"] for item in document["coreFeatures"]} == {
         "일정 등록": "P0", "마감 알림": "P0", "과목 분류": "P1", "일정 공유": "P2",
     }
-    assert len(document["kpi"]) == 7
-    assert len(document["userPersonas"]) == 3
+    assert document["kpi"] == []
+    assert document["userPersonas"] == []
+    assert {item["section"] for item in document["qualityMetadata"]["itemDiagnostics"]} >= {"kpi", "userPersonas"}
     assert len(document["releaseSchedule"]) == 6
 
 
@@ -71,7 +105,7 @@ def test_prd_worker_assembly_preserves_registry_contracts_through_bounded_runtim
     state = PipelineState(
         user_query="일정 관리 서비스", feature_list=["일정 등록"], must_features=["일정 등록"],
         feature_registry=[{
-            "featureId": "schedule_create", "name": "일정 등록", "actions": ["create"],
+            "featureId": "schedules.create", "name": "일정 등록", "actions": ["create"],
             "apiContract": [{"method": "POST", "path": "/api/v1/schedules"}],
             "dbContract": {"tables": ["schedules"], "foreignKeys": []},
         }],
@@ -82,7 +116,7 @@ def test_prd_worker_assembly_preserves_registry_contracts_through_bounded_runtim
     result = asyncio.run(agent.execute(state))
     feature = json.loads(result.prd_document)["coreFeatures"][0]
 
-    assert feature["featureId"] == "schedule_create"
+    assert feature["featureId"] == "schedules.create"
     assert feature["name"] == "일정 등록"
     assert "과제와 시험" in feature["description"]
     assert feature["actions"] == ["create"]

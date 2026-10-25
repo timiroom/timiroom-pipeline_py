@@ -70,3 +70,18 @@ async def _test_pre_subscription_progress_is_not_replayed_twice() -> None:
 
     assert sum('"step": "PHASE1_START"' in event for event in events) == 1
     assert sum('"step": "PHASE1_DONE"' in event for event in events) == 1
+
+
+def test_backend_watcher_and_browser_both_receive_terminal_and_progress():
+    async def scenario():
+        service = PipelineProgressService()
+        service.send("p", "FEATURE_SPEC", "generating", 55)
+        first = asyncio.create_task(_collect(service, "p"))
+        second = asyncio.create_task(_collect(service, "p"))
+        await asyncio.sleep(0)
+        service.error("p", "failed", {"failedStage": "FEATURE_SPEC", "skippedStages": ["DBA_API"]})
+        events = await asyncio.wait_for(asyncio.gather(first, second), 1)
+        assert events[0] == events[1]
+        assert len(events[0]) == 2
+        assert "p" not in service._queues
+    asyncio.run(scenario())

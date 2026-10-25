@@ -71,6 +71,69 @@ def test_api_self_check_removes_unknown_and_duplicate_endpoints():
     assert len([item for item in endpoints if item.get("featureId") == "market.list"]) == 1
 
 
+def test_api_self_check_rejects_auxiliary_only_and_unsafe_get_contracts():
+    registry = [{
+        "featureId": "notifications.delivery",
+        "name": "배송 상태 알림",
+        "actions": ["notify"],
+        "apiContract": [{"method": "GET", "path": "/api/v1/notifications/{id}/retry"}],
+    }]
+
+    _endpoints, issues = api_self_check([], registry)
+
+    assert "API_CORE_ACTION_MISSING: notifications.delivery POST" in issues
+    assert "API_AUXILIARY_ONLY_CONTRACT: notifications.delivery" in issues
+    assert any(issue.startswith("API_UNSAFE_GET_ACTION:") for issue in issues)
+
+
+def test_feature_spec_budget_preserves_twelve_features_and_caps_p0():
+    features = [
+        {
+            "featureId": f"feature.{index}",
+            "name": f"기능 {index}",
+            "source": "prd_core" if index <= 6 else "supporting",
+            "priority": "P0" if index <= 6 else "P1",
+            "priorityScore": 13 if index <= 6 else 10,
+        }
+        for index in range(1, 15)
+    ]
+
+    result = FeatureSpecAgent._apply_mvp_budget(features)
+
+    assert len(result) == 12
+    assert 3 <= sum(item["priority"] == "P0" for item in result) <= 5
+
+
+def test_feature_spec_merges_generic_validation_and_duplicate_auth():
+    features = [
+        {
+            "featureId": "auth.login", "name": "로그인", "source": "supporting",
+            "actions": ["login"],
+            "apiContract": [{"method": "POST", "path": "/api/v1/auth/login"}],
+            "dbContract": {"tables": ["users"], "foreignKeys": []},
+        },
+        {
+            "featureId": "supporting.account", "name": "회원가입 및 로그인", "source": "supporting",
+            "actions": ["signup", "login"],
+            "apiContract": [{"method": "POST", "path": "/api/v1/auth/signup"}],
+            "dbContract": {"tables": ["users"], "foreignKeys": []},
+        },
+        {
+            "featureId": "supporting.validation", "name": "입력 검증 및 오류 처리",
+            "source": "supporting", "parentFeatureId": "auth.login",
+            "requirements": ["입력 오류를 반환한다"],
+        },
+    ]
+
+    result = FeatureSpecAgent._merge_semantic_duplicates(features)
+
+    assert [item["featureId"] for item in result] == ["auth.login", "supporting.account"]
+    assert {item["path"] for item in result[0]["apiContract"]} == {
+        "/api/v1/auth/login",
+    }
+    assert "입력 오류를 반환한다" in result[0]["requirements"]
+
+
 def test_api_self_check_replaces_wrong_path_with_contract_endpoint():
     registry = [{
         "featureId": "market.create",
@@ -132,6 +195,7 @@ def test_refresh_api_contract_adds_atomic_db_contract():
         "table": "refresh_tokens",
         "column": "member_id",
         "references": {"table": "members", "column": "id"},
+        "nullable": False,
     } in item["dbContract"]["foreignKeys"]
 
 
@@ -185,6 +249,22 @@ def test_indexes_are_finalized_after_columns_and_fk_targets():
 
     assert not any("missing_column" in index for index in indexes)
     assert any("(user_id)" in index for index in indexes)
+
+
+def test_final_indexes_include_status_time_composite():
+    tables = [{
+        "name": "deliveries",
+        "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            {"name": "status", "type": "VARCHAR(30)", "constraints": "NOT_NULL"},
+            {"name": "scheduled_at", "type": "TIMESTAMPTZ", "constraints": "NOT_NULL"},
+        ],
+        "indexes": [],
+    }]
+
+    finalize_table_indexes(tables)
+
+    assert any("(status, scheduled_at)" in index for index in tables[0]["indexes"])
 
 
 class _Progress:
@@ -431,7 +511,7 @@ def test_feature_spec_core_contract_expands_methods_from_requirements():
     assert ("DELETE", "/api/v1/plants/{plantId}") in contracts
 
 
-def test_feature_spec_fallback_uses_prd_core_features():
+def test_feature_spec_failure_preserves_source_and_blocks_downstream():
     agent = FeatureSpecAgent(object(), "test")
     state = PipelineState(
         feature_list=["재고 등록"],
@@ -442,8 +522,9 @@ def test_feature_spec_fallback_uses_prd_core_features():
 
     result = asyncio.run(agent.execute(state))
     assert result.feature_registry[0]["featureId"] == "inventory.register"
-    assert result.feature_registry[0]["priority"] == "P0"
-    assert result.feature_spec_document
+    assert result.feature_registry == state.feature_registry
+    assert result.generation_blockers
+    assert not result.feature_spec_document
 
 
 def test_feature_registry_preserves_feature_spec_supporting_items_for_downstream_agents():
@@ -491,6 +572,33 @@ def test_dba_table_aliases_follow_registry_and_get_feature_mapping():
     assert tables[0]["name"] == "memberships"
     assert tables[0]["featureIds"] == ["membership.manage"]
     assert relationships == ["organizations (1:N) memberships"]
+
+
+def test_dba_auxiliary_table_inherits_feature_mapping_from_fk_target():
+    tables = [
+        {
+            "name": "orders", "featureIds": [],
+            "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
+        },
+        {
+            "name": "order_status_histories", "featureIds": [],
+            "columns": [
+                {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+                {
+                    "name": "order_id", "type": "BIGINT",
+                    "constraints": "FOREIGN_KEY REFERENCES orders(id)",
+                },
+            ],
+        },
+    ]
+    registry = [{
+        "featureId": "orders.track",
+        "dbContract": {"tables": ["orders"], "foreignKeys": []},
+    }]
+
+    annotate_table_feature_ids(tables, registry)
+
+    assert tables[1]["featureIds"] == ["orders.track"]
 
 
 def test_dba_manager_plan_accepts_valid_partial_plan_for_targeted_patch():
@@ -577,7 +685,7 @@ def test_reconcile_core_features_caps_excessive_p0_priorities():
 
     result = reconcile_core_features(core_features, {"included": ["핵심 기능 0", "핵심 기능 1", "핵심 기능 2"]})
 
-    assert sum(1 for item in result if item["priority"] == "P0") <= 4
+    assert sum(1 for item in result if item["priority"] == "P0") <= 5
     assert any(item["priority"] == "P1" for item in result)
 
 
@@ -702,7 +810,7 @@ def test_orchestration_enforces_phase_timeout():
         asyncio.run(graph.run(PipelineState(), "p1"))
 
 
-def test_selective_retry_only_reruns_failed_domain_and_qa():
+def test_selective_retry_does_not_fallback_to_execute():
     search = _Agent()
     pm = _Agent()
     prd = _Agent()
@@ -713,12 +821,13 @@ def test_selective_retry_only_reruns_failed_domain_and_qa():
 
     result = asyncio.run(graph.repair(PipelineState(), "DB 스키마: 관계 누락", "p1"))
 
-    assert result.db_schema == '{"tables":[]}'
+    assert result.db_schema == ""
+    assert result.generation_blockers
     assert (search.calls, pm.calls, prd.calls, api.calls) == (0, 0, 0, 0)
-    assert (dba.calls, qa.calls) == (1, 1)
+    assert (dba.calls, qa.calls) == (0, 1)
 
 
-def test_prd_repair_regenerates_prd_and_dependent_artifacts():
+def test_prd_repair_without_patch_support_blocks_full_generation():
     search = _Agent()
     pm = _Agent()
     prd = _Agent()
@@ -727,13 +836,14 @@ def test_prd_repair_regenerates_prd_and_dependent_artifacts():
     qa = _Agent()
     graph = OrchestrationGraph(search, pm, prd, dba, api, qa, _Progress())
 
-    asyncio.run(graph.repair(PipelineState(), "PRD 문서 오류", "p1", repair_targets=["prd"]))
+    result = asyncio.run(graph.repair(PipelineState(), "PRD 문서 오류", "p1", repair_targets=["prd"]))
 
     assert (search.calls, pm.calls) == (0, 0)
-    assert (prd.calls, dba.calls, api.calls, qa.calls) == (1, 1, 1, 1)
+    assert (prd.calls, dba.calls, api.calls, qa.calls) == (0, 0, 0, 1)
+    assert result.generation_blockers
 
 
-def test_pm_repair_skips_search_and_regenerates_dependent_artifacts():
+def test_pm_repair_without_patch_support_does_not_regenerate_dependencies():
     search = _Agent()
     pm = _Agent(lambda state: state.copy(feature_list=["로그인"]))
     prd = _Agent(lambda state: state.copy(prd_document="{}"))
@@ -744,9 +854,10 @@ def test_pm_repair_skips_search_and_regenerates_dependent_artifacts():
 
     result = asyncio.run(graph.repair(PipelineState(), "featureList: 기능 목록 오류", "p1", repair_targets=["pm"]))
 
-    assert result.feature_list == ["로그인"]
+    assert result.feature_list == []
+    assert result.generation_blockers
     assert search.calls == 0
-    assert (pm.calls, prd.calls, dba.calls, api.calls, qa.calls) == (1, 1, 1, 1, 1)
+    assert (pm.calls, prd.calls, dba.calls, api.calls, qa.calls) == (0, 0, 0, 0, 1)
 
 
 def test_search_agent_uses_responses_web_search():
@@ -773,7 +884,7 @@ def test_search_agent_uses_responses_web_search():
     assert "web_search_call.action.sources" in calls[0]["include"]
 
 
-def test_api_feedback_triggers_prd_rollback():
+def test_api_feedback_does_not_trigger_full_prd_regeneration_without_patch_support():
     prd = _Agent()
 
     class Api:
@@ -791,9 +902,10 @@ def test_api_feedback_triggers_prd_rollback():
 
     result = asyncio.run(graph._run_prd_with_rollback(PipelineState(), "p1"))
 
-    assert prd.calls == 2
-    assert api.calls == 2
+    assert prd.calls == 1
+    assert api.calls == 1
     assert result.rollback_count == 1
+    assert result.generation_blockers
 
 
 def test_llm_runtime_retries_busy_gateway_then_succeeds():

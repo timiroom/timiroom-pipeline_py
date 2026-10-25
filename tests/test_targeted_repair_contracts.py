@@ -57,7 +57,7 @@ def test_auth_contract_and_targeted_repair_keep_transaction_rules(action):
         {'method': 'POST', 'path': route, 'transactionRules': ''}]}))
     state = PipelineState(feature_list=[action], feature_registry=registry, db_schema=schema,
                           api_spec=json.dumps({'endpoints': [endpoint], 'metadata': 'preserved'}))
-    repaired = json.loads(asyncio.run(agent.repair(state, '응답 계약 보완')).api_spec)
+    repaired = json.loads(asyncio.run(agent.repair(state, f'POST {route} 응답 계약 보완')).api_spec)
     assert repaired['metadata'] == 'preserved'
     assert len(repaired['endpoints']) == 1
     assert repaired['endpoints'][0]['transactionRules']
