@@ -1243,6 +1243,21 @@ class QaAgent:
         # 로그아웃만 있으면 세션·무상태 토큰으로도 충분하다. 저장 구조는 refresh token을 발급할 때만 요구한다.
         if "/auth/refresh" in auth_paths and not has_refresh_store:
             db_issues.append("Refresh Token API가 있지만 만료·회수 가능한 토큰 저장 구조가 없음")
+        # Logout alone does not imply a persisted token. An explicitly declared
+        # bearer-session contract does, and must reference its actual store.
+        bearer_stores = {
+            str(policy.get("sessionTable") or "") for endpoint in endpoint_list
+            if isinstance(policy := endpoint.get("sessionPolicy"), dict)
+            and policy.get("strategy") == "bearer_session"
+        }
+        for name in sorted(bearer_stores):
+            valid = {"expires_at", "revoked_at"} <= columns.get(name, set()) and any(
+                column.get("name") == "id" and str(column.get("type") or "").lower() == "uuid"
+                and "PRIMARY_KEY" in str(column.get("constraints") or "").upper()
+                for column in tables.get(name, {}).get("columns") or [] if isinstance(column, dict)
+            )
+            if not valid:
+                db_issues.append(f"명시된 Bearer Session의 만료·회수 가능한 UUID 토큰 저장 구조가 없음: {name}")
         # Delivery infrastructure is deployment-specific. A product may use web
         # push, e-mail, SMS, or an external provider without persisting a device
         # token in this service, so QA must not force a push-device schema.
