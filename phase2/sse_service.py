@@ -17,7 +17,7 @@ class PipelineProgressService:
             raise ValueError("terminal_ttl_seconds는 0보다 커야 합니다")
         if max_terminal_events <= 0:
             raise ValueError("max_terminal_events는 0보다 커야 합니다")
-        self._queues: dict[str, asyncio.Queue] = {}
+        self._queues: dict[str, set[asyncio.Queue]] = {}
         self._buffers: dict[str, list[dict]] = {}
         # 완료/실패 이벤트는 늦게 연결된 클라이언트도 원인을 확인할 수 있도록
         # 짧은 시간 동안 별도로 보관한다. 진행 이벤트 버퍼와 분리해 대형 결과가
@@ -25,11 +25,7 @@ class PipelineProgressService:
         self._terminal_events: dict[str, dict] = {}
         self._terminal_ttl_seconds = terminal_ttl_seconds
         self._max_terminal_events = max_terminal_events
-
-    def _get_or_create_queue(self, pipeline_id: str) -> asyncio.Queue:
-        if pipeline_id not in self._queues:
-            self._queues[pipeline_id] = asyncio.Queue()
-        return self._queues[pipeline_id]
+        self._latest_progress: dict[str, dict] = {}
 
     def send(self, pipeline_id: str | None, step: str, message: str, percent: int) -> None:
         if not pipeline_id:
@@ -40,6 +36,7 @@ class PipelineProgressService:
             "percent": percent,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        self._latest_progress[pipeline_id] = data
         self._buffer(pipeline_id, "progress", data)
         self._enqueue(pipeline_id, "progress", data)
 
@@ -58,6 +55,10 @@ class PipelineProgressService:
         data = {"message": message}
         if details:
             data.update(details)
+        latest = self._latest_progress.get(pipeline_id, {})
+        if not data.get("failedStage"):
+            data["failedStage"] = latest.get("step", "PHASE1_START")
+        data["lastProgress"] = latest
         self._remember_terminal(pipeline_id, "error", data)
         self._enqueue(pipeline_id, "error", data)
         self._enqueue(pipeline_id, "__done__", {})
@@ -66,33 +67,29 @@ class PipelineProgressService:
     async def subscribe(self, pipeline_id: str):
         """FastAPI StreamingResponse 용 async generator."""
         self._cleanup_terminal_events()
-        q = self._get_or_create_queue(pipeline_id)
-
-        # send()는 구독 전 이벤트를 buffer와 queue 양쪽에 넣는다. snapshot을
-        # replay한 뒤 같은 수만큼 queue에서 제거해야 최초 이벤트가 중복되지 않는다.
-        buffered = list(self._buffers.get(pipeline_id, []))
-        for evt in buffered:
-            yield self._format(evt["type"], evt["data"])
-        for _ in buffered:
-            try:
-                q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-        # 이미 끝난 파이프라인에 늦게 연결된 구독자는 terminal event를 즉시
-        # 재생하고 대기하지 않는다. 이 경로가 Phase3 blocker 확인을 보장한다.
         terminal = self._terminal_events.get(pipeline_id)
         if terminal is not None:
             yield self._format(terminal["type"], terminal["data"])
-            self._queues.pop(pipeline_id, None)
             return
-
-        while True:
-            evt = await asyncio.wait_for(q.get(), timeout=1800)
-            if evt["type"] == "__done__":
-                self._queues.pop(pipeline_id, None)
-                break
-            yield self._format(evt["type"], evt["data"])
+        # Backend watcher and browser subscriptions must not consume each
+        # other's events. Registration and replay snapshot are atomic here.
+        q = asyncio.Queue()
+        self._queues.setdefault(pipeline_id, set()).add(q)
+        buffered = list(self._buffers.get(pipeline_id, []))
+        try:
+            for evt in buffered:
+                yield self._format(evt["type"], evt["data"])
+            while True:
+                evt = await asyncio.wait_for(q.get(), timeout=1800)
+                if evt["type"] == "__done__":
+                    break
+                yield self._format(evt["type"], evt["data"])
+        finally:
+            queues = self._queues.get(pipeline_id)
+            if queues is not None:
+                queues.discard(q)
+                if not queues:
+                    self._queues.pop(pipeline_id, None)
 
     def _format(self, event_type: str, data: dict) -> str:
         return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -101,6 +98,7 @@ class PipelineProgressService:
         self._buffers.setdefault(pipeline_id, []).append(
             {"type": event_type, "data": data}
         )
+        self._buffers[pipeline_id] = self._buffers[pipeline_id][-200:]
 
     def _remember_terminal(self, pipeline_id: str, event_type: str, data: dict) -> None:
         self._cleanup_terminal_events()
@@ -109,6 +107,7 @@ class PipelineProgressService:
             "data": data,
             "expires_at": time.monotonic() + self._terminal_ttl_seconds,
         }
+        self._latest_progress.pop(pipeline_id, None)
         while len(self._terminal_events) > self._max_terminal_events:
             oldest = min(
                 self._terminal_events,
@@ -127,8 +126,5 @@ class PipelineProgressService:
             self._terminal_events.pop(pipeline_id, None)
 
     def _enqueue(self, pipeline_id: str, event_type: str, data: dict) -> None:
-        q = self._get_or_create_queue(pipeline_id)
-        try:
+        for q in self._queues.get(pipeline_id, set()):
             q.put_nowait({"type": event_type, "data": data})
-        except asyncio.QueueFull:
-            logger.warning("SSE 큐 가득 참: %s", pipeline_id)

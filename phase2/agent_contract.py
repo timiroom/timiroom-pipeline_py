@@ -280,7 +280,7 @@ def normalize_feature_contract(spec: dict, auth_required: bool) -> dict:
     else:
         ownership_values = [raw_ownership] if isinstance(raw_ownership, str) else (raw_ownership or [])
         ownership_text = " ".join(str(value) for value in ownership_values).upper()
-        scope = next((value for value in ("USER", "SHARED", "PUBLIC") if value in ownership_text), "")
+        scope = next((value for value in ("USER", "SHARED", "PUBLIC", "SYSTEM") if value in ownership_text), "")
     if feature_requires_user_scope(normalized):
         scope = "USER"
     if scope not in {"USER", "SHARED", "PUBLIC", "SYSTEM"}:
@@ -291,19 +291,27 @@ def normalize_feature_contract(spec: dict, auth_required: bool) -> dict:
         "ownerKey": "user_id" if scope in {"USER", "SHARED"} else "",
         "access": (
             "인증 주체의 소유권 또는 명시된 역할을 검증"
-            if scope in {"USER", "SHARED"} else "인증 없이 허용된 공개 범위"
+            if scope in {"USER", "SHARED"} else
+            "시스템 관리 범위이며 인증 및 명시된 운영 역할을 검증" if scope == "SYSTEM" else
+            "인증 없이 허용된 공개 범위"
         ),
     }
-    if isinstance(raw_ownership, dict) and scope in {"USER", "SHARED"}:
+    if isinstance(raw_ownership, dict):
         for key in ("ownerEntity", "ownerKey", "access"):
             if raw_ownership.get(key):
                 normalized["ownership"][key] = raw_ownership[key]
     for key in ("states", "stateTransitions", "transactionRules"):
         values = [
-            str(value).strip() for value in normalized.get(key) or []
+            dict(value) if isinstance(value, dict) else str(value).strip() for value in normalized.get(key) or []
             if str(value).strip() and str(value).strip().upper() != "NONE"
         ]
-        normalized[key] = list(dict.fromkeys(values))
+        seen_values = set()
+        normalized[key] = []
+        for value in values:
+            fingerprint = json.dumps(value, sort_keys=True, ensure_ascii=False)
+            if fingerprint not in seen_values:
+                normalized[key].append(value)
+                seen_values.add(fingerprint)
     if normalized["states"] and not normalized["stateTransitions"]:
         normalized["stateTransitions"] = [
             "현재 상태 → 요청 상태: 기능별 선행 조건과 권한 검증 성공"
@@ -418,3 +426,30 @@ def bind_endpoint_features(endpoint: dict[str, Any], feature_ids: list[str]) -> 
         endpoint.pop("featureId", None)
         endpoint.pop("featureIds", None)
     return endpoint
+
+
+def path_input_fields(endpoint: dict, columns: list[dict]) -> set[str]:
+    parameters = set(re.findall(r"\{([^}]+)\}", str(endpoint.get("path") or "")))
+    return {
+        str(column.get("name")) for column in columns if isinstance(column, dict)
+        and str(column.get("name") or "").replace("_", "").casefold()
+        in {value.replace("_", "").casefold() for value in parameters}
+    }
+
+
+def server_managed_fields(columns: list[dict], *, association: bool = False) -> set[str]:
+    fields = {
+        "id", "created_at", "updated_at", "password_hash", "credential_hash",
+        "external_delete_status", "external_deleted_at", "storage_key", "storage_url",
+        "processing_status", "previous_status", "status_changed_at", "status_transition_history", "status_history", "completed_at",
+    }
+    if not association:
+        fields.add("user_id")
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        name = str(column.get("name") or "")
+        constraints = str(column.get("constraints") or "").upper()
+        if column.get("readOnly") or column.get("generated") or column.get("source") in {"server", "auth", "derived"} or "GENERATED" in constraints or re.match(r"^(?:previous_|external_|internal_)", name):
+            fields.add(name)
+    return fields

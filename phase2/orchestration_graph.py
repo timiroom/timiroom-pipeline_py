@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 
+from common.ai_errors import describe
 from phase2.agents.api_agent import (
     ApiAgent,
     _api_feature_mappings,
@@ -14,16 +15,18 @@ from phase2.agents.pm_agent import PmAgent
 from phase2.agents.prd_agent import PrdAgent, sync_core_features_with_registry
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent
+from phase2.artifact_shapes import shape_issues
 from phase2.json_utils import try_parse_json
 from phase2.openapi_spec import build_openapi_document
+from phase2.repair_budget import available_targets, finish_attempt, merge_attempts
 from phase2.sse_service import PipelineProgressService
 from phase2.state import PipelineState
-from common.ai_errors import describe
 
 logger = logging.getLogger(__name__)
 
 
 class OrchestrationGraph:
+    manages_repair_budget = True
 
     def __init__(
         self,
@@ -72,19 +75,29 @@ class OrchestrationGraph:
         try:
             self._progress.send(pipeline_id, "SEARCH", "시장 조사 중...", 30)
             after_search = await self._search.execute(initial_state, dump)
+            after_search = after_search.copy(last_completed_stage="SEARCH")
             if dump:
                 dump.log_state("SEARCH", after_search)
 
-            self._progress.send(pipeline_id, "PRD", "PRD 문서 작성 중...", 40)
-            after_prd = await self._prd.execute(after_search, dump)
-            self._progress.send(pipeline_id, "PM", "PRD 기준 기능 및 설계 계약 확정 중...", 50)
-            after_pm = await self._pm.execute(after_prd, dump)
+            self._progress.send(pipeline_id, "PM", "프로젝트 목표·범위·우선순위 정리 중...", 40)
+            after_pm = await self._pm.execute(after_search, dump)
+            if after_pm.generation_blockers:
+                return after_pm
+            after_pm = after_pm.copy(last_completed_stage="PM")
             if dump:
                 dump.log_state("PM", after_pm)
 
+            self._progress.send(pipeline_id, "PRD", "프로젝트 계획 기반 PRD 문서 작성 중...", 50)
+            after_prd = await self._prd.execute(after_pm, dump)
+            if after_prd.generation_blockers:
+                return after_prd
+            after_prd = after_prd.copy(last_completed_stage="PRD")
+
             after_prd_dba_api = await self._run_prd_with_rollback(
-                after_pm, pipeline_id, dump, prd_ready=True,
+                after_prd, pipeline_id, dump, prd_ready=True,
             )
+            if after_prd_dba_api.generation_blockers:
+                return after_prd_dba_api
             after_prd_dba_api = self._align_api_to_final_db(after_prd_dba_api)
             if dump:
                 dump.log_state("PRD_DBA_API", after_prd_dba_api)
@@ -97,6 +110,7 @@ class OrchestrationGraph:
                 dump.log_state("QA", final_state)
 
             logger.info("=== Phase 2 완료 ===")
+            final_state = final_state.copy(last_completed_stage="QA")
         except Exception as e:
             logger.error("오케스트레이션 예외: %s", e)
             raise
@@ -139,11 +153,13 @@ class OrchestrationGraph:
 
         if "pm" in targets:
             self._progress.send(pipeline_id, "PM_REPAIR", "기능 목록을 재정리 중...", 64)
-            after_pm = await self._repair_agent(self._pm, state, validation_error)
+            after_pm = await self._bounded_repair("pm", self._pm, state, validation_error)
             self._progress.send(pipeline_id, "PRD_REPAIR", "변경된 기능 목록 기준 산출물을 재생성 중...", 68)
-            repaired = await self._run_prd_with_rollback(after_pm, pipeline_id)
+            after_prd = await self._bounded_repair("prd", self._prd, after_pm, validation_error)
+            repaired, _ = await self._resync_prd(after_pm, after_prd, validation_error, pipeline_id,
+                                                domains=targets & {"db", "api"})
             self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
-            return await self._qa.execute(self._align_api_to_final_db(repaired))
+            return await self._qa.execute(repaired)
 
         if not targets:
             logger.warning("선택적 재생성 대상을 판단할 수 없어 QA 정규화 후 Phase 3로 반환")
@@ -153,20 +169,25 @@ class OrchestrationGraph:
             self._progress.send(pipeline_id, "PRD_REPAIR", "지적된 PRD 섹션만 수정 중...", 68)
             repair = getattr(self._prd, "repair", None)
             if callable(repair):
-                state = await repair(state, validation_error)
-                targets.remove("prd")
+                before = state
+                state = await self._bounded_repair("prd", self._prd, state, validation_error)
+                state, _ = await self._resync_prd(
+                    before, state, validation_error, pipeline_id,
+                    domains=targets & {"db", "api"},
+                )
+                targets.clear()
             else:
-                state = await self._run_prd_with_rollback(state, pipeline_id)
+                state = await self._repair_agent(self._prd, state, validation_error)
                 targets.clear()
 
         repair_state = state
         tasks = []
         labels = []
         if "db" in targets:
-            tasks.append(self._repair_agent(self._dba, state, validation_error))
+            tasks.append(self._bounded_repair("db", self._dba, state, validation_error))
             labels.append("DB")
         if "api" in targets:
-            tasks.append(self._repair_agent(self._api, state, validation_error))
+            tasks.append(self._bounded_repair("api", self._api, state, validation_error))
             labels.append("API")
 
         self._progress.send(
@@ -177,13 +198,15 @@ class OrchestrationGraph:
         )
         results = await asyncio.gather(*tasks)
         for label, result in zip(labels, results, strict=True):
+            domain = "db" if label == "DB" else "api"
+            repair_state = repair_state.copy(targeted_repair_attempts=merge_attempts(repair_state.targeted_repair_attempts, result.targeted_repair_attempts))
             if label == "DB":
                 repair_state = repair_state.copy(
                     db_schema=result.db_schema,
                     prd_feedback_from_dba=result.prd_feedback_from_dba,
                     targeted_repair_results={
                         **repair_state.targeted_repair_results,
-                        **result.targeted_repair_results,
+                        domain: result.targeted_repair_results.get(domain, "noop"),
                     },
                     generation_blockers=list(dict.fromkeys(
                         [*repair_state.generation_blockers, *result.generation_blockers]
@@ -198,7 +221,7 @@ class OrchestrationGraph:
                     prd_feedback_from_api=result.prd_feedback_from_api,
                     targeted_repair_results={
                         **repair_state.targeted_repair_results,
-                        **result.targeted_repair_results,
+                        domain: result.targeted_repair_results.get(domain, "noop"),
                     },
                     generation_blockers=list(dict.fromkeys(
                         [*repair_state.generation_blockers, *result.generation_blockers]
@@ -209,7 +232,7 @@ class OrchestrationGraph:
                 )
 
         self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
-        return await self._qa.execute(self._align_api_to_final_db(repair_state))
+        return await self._qa.execute(repair_state)
 
     @staticmethod
     def _align_api_to_final_db(state: PipelineState) -> PipelineState:
@@ -217,6 +240,8 @@ class OrchestrationGraph:
         api = try_parse_json(state.api_spec)
         db = try_parse_json(state.db_schema)
         if not isinstance(api, dict) or not isinstance(db, dict):
+            return state
+        if shape_issues("api", api) or shape_issues("db", db):
             return state
         if not isinstance(api.get("endpoints"), list) or not db.get("tables"):
             return state
@@ -249,31 +274,57 @@ class OrchestrationGraph:
                 grouped[str(issue["agent"]).upper()].append(issue)
         async with asyncio.timeout(self._repair_timeout_seconds):
             current = state
-            for label, agent in (("DBA", self._dba), ("PRD", self._prd), ("API", self._api)):
+            handled = set()
+            for label, agent in (("PRD", self._prd), ("DBA", self._dba), ("API", self._api)):
                 issues = grouped[label]
                 if label == "API" and grouped["DBA"] and not issues:
                     issues = [{"agent": "API", "target": "erd-contract", "reason": "DB 계약 변경 반영"}]
                 if not issues:
                     continue
                 domain = "db" if label == "DBA" else label.lower()
+                if domain in handled:
+                    continue
                 if current.targeted_repair_attempts.get(domain, 0) >= 1:
                     continue
-                current = current.copy(targeted_repair_attempts={
-                    **current.targeted_repair_attempts,
-                    domain: current.targeted_repair_attempts.get(domain, 0) + 1,
-                })
                 self._progress.send(pipeline_id, f"{label}_PATCH", f"{label} 검증 실패 항목 수정 중...", 80)
-                current = await self._repair_agent(agent, current, json.dumps(issues, ensure_ascii=False))
+                before = current
+                feedback = json.dumps(issues, ensure_ascii=False)
+                current = await self._bounded_repair(domain, agent, current, feedback)
+                if label == "PRD":
+                    current, handled = await self._resync_prd(before, current, feedback, pipeline_id, dump)
             self._progress.send(pipeline_id, "QA_RECHECK", "수정된 문서 관계 재검증 중...", 88)
-            return await self._qa.execute(self._align_api_to_final_db(current), dump)
+            return await self._qa.execute(current, dump)
 
     @staticmethod
     async def _repair_agent(agent, state: PipelineState, feedback: str) -> PipelineState:
-        """Agent가 지원하면 delta patch를 사용하고, 구형/mock Agent는 기존 execute를 쓴다."""
+        """Never replace targeted repair with full generation."""
         repair = getattr(agent, "repair", None)
         if callable(repair):
             return await repair(state, feedback)
-        return await agent.execute(state)
+        blocker = "TARGETED_REPAIR_BLOCKER: agent does not support patch; full generation blocked"
+        return state.copy(generation_blockers=[*state.generation_blockers, blocker], qa_approved=False)
+
+    async def _bounded_repair(self, domain, agent, state, feedback):
+        if not available_targets(state, {domain}):
+            return state.copy(targeted_repair_results={**state.targeted_repair_results, domain: "budget_exhausted"})
+        if not callable(getattr(agent, "repair", None)):
+            result = await self._repair_agent(agent, state, feedback)
+            return result.copy(targeted_repair_results={**result.targeted_repair_results, domain: "unsupported"})
+        try:
+            timeout = self._dba_resync_timeout_seconds if domain == "db" else self._api_resync_timeout_seconds if domain == "api" else self._repair_timeout_seconds
+            dispatch = state.copy(targeted_repair_results={key: value for key, value in state.targeted_repair_results.items() if key != domain})
+            async with asyncio.timeout(timeout):
+                result = await self._repair_agent(agent, dispatch, feedback)
+        except Exception as exc:
+            logger.exception("Targeted repair failed: %s", domain)
+            ai = describe(exc)
+            reason = ai.message if ai else type(exc).__name__
+            blocker = f"TARGETED_REPAIR_BLOCKER: {domain} ({reason})"
+            result = state.copy(targeted_repair_results={**state.targeted_repair_results, domain: "failed"},
+                                generation_blockers=[*state.generation_blockers, blocker], qa_approved=False)
+            if domain in {"api", "db", "prd"}:
+                result = result.copy(**{f"qa_{domain}_blockers": [*getattr(state, f"qa_{domain}_blockers"), blocker]})
+        return finish_attempt(state, result, domain)
 
     @staticmethod
     def _merge_agent_quality(base: PipelineState, dba: PipelineState, api: PipelineState) -> PipelineState:
@@ -294,11 +345,14 @@ class OrchestrationGraph:
 
         # PRD repair는 최대 한 번만 수행한다. 동일 blocker는 Phase3 blocker로 남긴다.
         for attempt in range(2):
-            logger.info("PRD 에이전트 실행 중... (시도 %d)", attempt + 1)
+            logger.info("PRD/Feature Spec 계약 처리 (PRD ready=%s, 시도 %d)", prd_ready, attempt + 1)
             after_prd = current if prd_ready and attempt == 0 else await self._prd.execute(current, dump)
             if self._feature_spec is not None:
                 self._progress.send(pipeline_id, "FEATURE_SPEC", "기능명세서 및 지원 기능 확정 중...", 55)
                 after_prd = sync_core_features_with_registry(await self._feature_spec.execute(after_prd, dump))
+            if after_prd.generation_blockers:
+                return after_prd
+            after_prd = after_prd.copy(last_completed_stage="FEATURE_SPEC")
             after_prd = self._freeze_feature_registry(after_prd)
 
             # DBA·API는 rag-pipeline과 동일하게 독립적으로 병렬 실행 (교차 주입 없음)
@@ -344,14 +398,13 @@ class OrchestrationGraph:
                 )
                 repair = getattr(self._prd, "repair", None)
                 if callable(repair):
-                    repaired_prd = await repair(
+                    repaired_prd = await self._bounded_repair("prd", self._prd,
                         after_prd.copy(
                             prd_feedback_from_dba=dba_result.prd_feedback_from_dba,
                             prd_feedback_from_api=api_result.prd_feedback_from_api,
                             rollback_count=attempt + 1,
                         ),
                         feedback,
-                        dump,
                     )
                     # PRD repair는 PRD 문서만 바꾼다. repair agent가 새 state를
                     # 만들면서 downstream 산출물을 비워도 기존 계약을 보존한다.
@@ -372,117 +425,23 @@ class OrchestrationGraph:
                             or after_prd.api_spec
                         ),
                     )
-                    changed_ids = self._changed_prd_feature_ids(
-                        after_prd.prd_document, repaired_prd.prd_document,
-                        after_prd.feature_registry or repaired_prd.feature_registry,
+                    baseline = self._merge_agent_quality(after_prd, dba_result, api_result).copy(
+                        db_schema=dba_result.db_schema, api_spec=api_result.api_spec,
                     )
-                    repeated_repair = attempt >= 1 or repaired_prd.rollback_count >= 2
-                    repair_domains = set()
+                    domains = set()
                     if has_dba_feedback:
-                        repair_domains.add("db")
+                        domains.add("db")
                     if has_api_feedback:
-                        repair_domains.add("api")
-
-                    # PRD coreFeatures가 실제로 바뀐 경우에만 Feature Spec을
-                    # 다시 계산한다. KPI/문구만 바뀐 repair는 downstream을 건드리지 않는다.
-                    resynced = repaired_prd
-                    if changed_ids and self._feature_spec is not None and not repeated_repair:
-                        self._progress.send(
-                            pipeline_id, "FEATURE_SPEC_RESYNC",
-                            "수정된 PRD 기준 기능 계약 재동기화 중...", 70,
-                        )
-                        resynced = sync_core_features_with_registry(
-                            await self._feature_spec.execute(resynced, dump)
-                        )
-                        resynced = self._retain_unchanged_registry(
-                            after_prd, resynced, changed_ids,
-                        )
-                    resynced = self._freeze_feature_registry(resynced)
-
-                    if changed_ids and not repeated_repair:
-                        repair_domains.update(self._changed_registry_domains(
-                            after_prd.feature_registry, resynced.feature_registry, changed_ids,
-                        ))
-
-                    # 반복 repair는 full execute를 금지하고, 현재 blocker가 지적한
-                    # domain만 delta patch한다. 변경 domain이 없으면 기존 결과를 유지한다.
-                    if repair_domains:
-                        targeted_feedback = self._targeted_resync_feedback(
-                            feedback, changed_ids, repair_domains,
-                        )
-                        self._progress.send(
-                            pipeline_id, "PHASE2_TARGETED_RESYNC",
-                            f"변경된 계약·blocker 대상만 재동기화 중: {', '.join(sorted(repair_domains))}", 72,
-                        )
-                        async def targeted(
-                            domain: str,
-                            base_state: PipelineState,
-                            repair_feedback: str,
-                        ):
-                            timeout = (
-                                self._dba_resync_timeout_seconds
-                                if domain == "db"
-                                else self._api_resync_timeout_seconds
-                            )
-                            try:
-                                async with asyncio.timeout(timeout):
-                                    result = await (
-                                        self._repair_agent(self._dba, base_state, repair_feedback)
-                                        if domain == "db"
-                                        else self._repair_agent(self._api, base_state, repair_feedback)
-                                    )
-                                return domain, result
-                            except Exception as exc:
-                                label = "DBA" if domain == "db" else "API"
-                                ai = describe(exc)
-                                # AI 제공사 원문(영어, 키 일부)은 문서 검토 기록에 남기지 않는다
-                                reason = ai.message if ai else f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"
-                                blocker = f"TARGETED_REPAIR_BLOCKER: {label} targeted resync 실패 ({reason})"
-                                logger.error("%s | 원인: %s", blocker, exc)
-                                if domain == "db":
-                                    return domain, base_state.copy(
-                                        prd_feedback_from_dba=blocker,
-                                        qa_db_blockers=[blocker],
-                                        qa_approved=False,
-                                    )
-                                return domain, base_state.copy(
-                                    prd_feedback_from_api=blocker,
-                                    qa_api_blockers=[blocker],
-                                    qa_approved=False,
-                                )
-
-                        results = await asyncio.gather(*(
-                            targeted(domain, resynced, targeted_feedback)
-                            for domain in sorted(repair_domains)
-                        ))
-                        for domain, result in results:
-                            if domain == "db":
-                                resynced = resynced.copy(
-                                    db_schema=result.db_schema,
-                                    prd_feedback_from_dba=result.prd_feedback_from_dba,
-                                    qa_db_blockers=result.qa_db_blockers,
-                                    targeted_repair_results={
-                                        **resynced.targeted_repair_results,
-                                        **result.targeted_repair_results,
-                                    },
-                                )
-                            else:
-                                resynced = resynced.copy(
-                                    api_spec=result.api_spec,
-                                    prd_feedback_from_api=result.prd_feedback_from_api,
-                                    qa_api_blockers=result.qa_api_blockers,
-                                    targeted_repair_results={
-                                        **resynced.targeted_repair_results,
-                                        **result.targeted_repair_results,
-                                    },
-                                )
-                    return resynced.copy(
-                        db_schema=resynced.db_schema or after_prd.db_schema,
-                        api_spec=resynced.api_spec or after_prd.api_spec,
-                        rollback_count=attempt + 1,
+                        domains.add("api")
+                    resynced, _ = await self._resync_prd(
+                        baseline, repaired_prd, feedback, pipeline_id, dump, domains=domains,
                     )
-                # 구형 Agent/mock 호환용 fallback
-                current = after_prd.copy(
+                    return resynced.copy(rollback_count=attempt + 1)
+                blocker = "TARGETED_REPAIR_BLOCKER: PRD patch unsupported; full generation blocked"
+                return self._merge_agent_quality(after_prd, dba_result, api_result).copy(
+                    db_schema=dba_result.db_schema,
+                    api_spec=api_result.api_spec,
+                    generation_blockers=[*after_prd.generation_blockers, blocker],
                     prd_feedback_from_dba=dba_result.prd_feedback_from_dba,
                     prd_feedback_from_api=api_result.prd_feedback_from_api,
                     rollback_count=attempt + 1,
@@ -497,6 +456,102 @@ class OrchestrationGraph:
                 )
 
         return current
+
+    async def _resync_prd(self, before, repaired, feedback, pipeline_id, dump=None, *, domains=None):
+        """All PRD repair paths preserve siblings and use the same delta resync."""
+        current = before.copy(
+            prd_document=repaired.prd_document, rollback_count=repaired.rollback_count,
+            generation_blockers=list(dict.fromkeys([*before.generation_blockers, *repaired.generation_blockers])),
+            targeted_repair_results={**before.targeted_repair_results, **repaired.targeted_repair_results},
+            targeted_repair_attempts={**before.targeted_repair_attempts, **repaired.targeted_repair_attempts},
+        )
+        changed = self._changed_prd_feature_ids(before.prd_document, current.prd_document, before.feature_registry)
+        def core_ids(document):
+            parsed = try_parse_json(document) or {}
+            by_name = {item.get("name"): item.get("featureId") for item in before.feature_registry}
+            return {str(item.get("featureId") or item.get("id") or by_name.get(item.get("name")) or item.get("name") or "")
+                    for item in parsed.get("coreFeatures") or [] if isinstance(item, dict)}
+        removed = core_ids(before.prd_document) - core_ids(current.prd_document)
+        while True:
+            children = {str(item.get("featureId") or item.get("id") or "") for item in before.feature_registry
+                        if item.get("parentFeatureId") in removed}
+            if children <= removed:
+                break
+            removed.update(children)
+        if removed:
+            removed_names = {item.get("name") for item in before.feature_registry if item.get("featureId") in removed}
+            current = current.copy(
+                feature_registry=[item for item in current.feature_registry if item.get("featureId") not in removed],
+                feature_specs=[item for item in current.feature_specs if item.get("featureId") not in removed],
+                feature_list=[name for name in current.feature_list if name not in removed_names],
+            )
+        if changed and self._feature_spec is None and before.feature_registry:
+            blocker = "TARGETED_REPAIR_BLOCKER: Feature Spec resync unavailable"
+            return current.copy(generation_blockers=[*current.generation_blockers, blocker], qa_approved=False), set()
+        if changed and self._feature_spec is not None:
+            try:
+                async with asyncio.timeout(self._repair_timeout_seconds):
+                    candidate = await self._feature_spec.execute(current, dump)
+            except Exception as exc:
+                logger.exception("Feature Spec resync failed")
+                blocker = f"TARGETED_REPAIR_BLOCKER: Feature Spec resync failed ({type(exc).__name__})"
+                return current.copy(generation_blockers=[*current.generation_blockers, blocker], qa_approved=False), set()
+            if candidate.generation_blockers:
+                return candidate.copy(db_schema=before.db_schema, api_spec=before.api_spec), set()
+            candidate = candidate.copy(feature_registry=[item for item in candidate.feature_registry if item.get("featureId") not in removed])
+            current = self._retain_unchanged_registry(before, candidate, changed)
+            current = sync_core_features_with_registry(current)
+        current = self._freeze_feature_registry(current)
+        affected = set(changed)
+        while True:
+            children = {str(item.get("featureId") or item.get("id") or "")
+                        for item in [*before.feature_registry, *current.feature_registry]
+                        if item.get("parentFeatureId") in affected}
+            if children <= affected:
+                break
+            affected.update(children)
+        targets = set(domains or []) | self._changed_registry_domains(
+            before.feature_registry, current.feature_registry, affected,
+        )
+        scoped_feedback = self._targeted_resync_feedback(feedback, affected, targets)
+        artifact_keys = {"api": set(), "db": set()}
+        for feature in [*before.feature_registry, *current.feature_registry]:
+            if str(feature.get("featureId") or feature.get("id") or "") not in affected:
+                continue
+            artifact_keys["api"].update(f"{item.get('method', 'GET')} {item.get('path', '')}"
+                                        for item in feature.get("apiContract") or [] if isinstance(item, dict))
+            artifact_keys["db"].update(str(name.get("name") or name.get("table")) if isinstance(name, dict) else str(name)
+                                       for name in (feature.get("dbContract") or {}).get("tables") or [])
+        scoped_feedback += "\n" + json.dumps({
+            "artifactKeys": {key: sorted(values) for key, values in artifact_keys.items()},
+            "removedFeatureIds": sorted(removed),
+        }, ensure_ascii=False)
+
+        async def patch(domain):
+            try:
+                result = await self._bounded_repair(domain, self._dba if domain == "db" else self._api, current, scoped_feedback)
+                return domain, result
+            except Exception as exc:
+                logger.exception("Targeted %s resync failed", domain)
+                ai = describe(exc)
+                reason = ai.message if ai else type(exc).__name__
+                blocker = f"TARGETED_REPAIR_BLOCKER: {domain} resync failed ({reason})"
+                return domain, current.copy(**{
+                    "qa_db_blockers" if domain == "db" else "qa_api_blockers": [blocker],
+                    "qa_approved": False,
+                })
+
+        for domain, result in await asyncio.gather(*(patch(domain) for domain in sorted(targets))):
+            fields = ("db_schema", "qa_db_blockers", "prd_feedback_from_dba") if domain == "db" else (
+                "api_spec", "openapi_spec", "qa_api_blockers", "prd_feedback_from_api",
+            )
+            current = current.copy(**{key: getattr(result, key) for key in fields},
+                generation_blockers=list(dict.fromkeys([*current.generation_blockers, *result.generation_blockers])),
+                targeted_repair_results={**current.targeted_repair_results, domain: result.targeted_repair_results.get(domain, "noop")},
+                targeted_repair_attempts=merge_attempts(current.targeted_repair_attempts, result.targeted_repair_attempts),
+                qa_approved=False if result.qa_db_blockers or result.qa_api_blockers else current.qa_approved,
+            )
+        return current, targets
 
     @staticmethod
     def _changed_prd_feature_ids(before: str, after: str, registry: list[dict] | None = None) -> set[str]:
@@ -519,14 +574,17 @@ class OrchestrationGraph:
                 name = str(item.get("name") or "").strip()
                 key = str(item.get("featureId") or item.get("id") or registry_by_name.get(name.casefold()) or name).strip()
                 if key:
-                    normalized = {
-                        "featureId": key,
-                        "name": name,
-                        "priority": item.get("priority"),
-                        "actions": item.get("actions") or [],
-                        "apiContract": item.get("apiContract") or [],
-                        "dbContract": item.get("dbContract") or {},
-                    }
+                    normalized = {**item, "featureId": key, "name": name}
+                    normalized.pop("id", None)
+                    def canonical(value):
+                        if isinstance(value, str):
+                            return " ".join(value.split())
+                        if isinstance(value, dict):
+                            return {field: canonical(content) for field, content in value.items()}
+                        if isinstance(value, list):
+                            return [canonical(content) for content in value]
+                        return value
+                    normalized = canonical(normalized)
                     result[key] = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
             return result
 
@@ -541,9 +599,13 @@ class OrchestrationGraph:
         domains = set()
         for feature_id in changed_ids:
             before_item, after_item = old.get(feature_id, {}), new.get(feature_id, {})
-            if before_item.get("apiContract") != after_item.get("apiContract"):
+            if any(before_item.get(key) != after_item.get(key) for key in (
+                "apiContract", "sessionPolicy", "readDependencies", "statePolicies", "intervalPolicies", "roles", "ownership",
+            )):
                 domains.add("api")
-            if before_item.get("dbContract") != after_item.get("dbContract"):
+            if any(before_item.get(key) != after_item.get(key) for key in (
+                "dbContract", "statePolicies", "intervalPolicies", "ownership", "stateTransitions", "transactionRules",
+            )):
                 domains.add("db")
         return domains
 
@@ -595,11 +657,21 @@ class OrchestrationGraph:
             str(item.get("featureId") or item.get("id") or ""): copy.deepcopy(item)
             for item in candidate.feature_registry if isinstance(item, dict)
         }
-        ordered_ids = list(old_by_id)
-        ordered_ids.extend(key for key in new_by_id if key not in old_by_id and key in changed_ids)
+        affected = set(changed_ids)
+        # Supporting descendants share the lifecycle of their changed parent.
+        while True:
+            children = {
+                key for key, item in {**old_by_id, **new_by_id}.items()
+                if item.get("parentFeatureId") in affected
+            }
+            if children <= affected:
+                break
+            affected.update(children)
+        ordered_ids = [key for key in old_by_id if key not in affected or key in new_by_id]
+        ordered_ids.extend(key for key in new_by_id if key not in old_by_id and key in affected)
         merged = [
             new_by_id.get(feature_id, old_by_id.get(feature_id))
-            if feature_id in changed_ids else old_by_id[feature_id]
+            if feature_id in affected else old_by_id[feature_id]
             for feature_id in ordered_ids
         ]
         merged = [item for item in merged if isinstance(item, dict)]

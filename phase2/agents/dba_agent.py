@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import difflib
 import json
 import logging
@@ -7,25 +8,45 @@ import operator
 import re
 from typing import Annotated, TypedDict
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, InternalServerError
 
-from phase2.feature_coverage import uncovered_features, missing_features_note
-from phase2.feature_scope import backend_features
+from phase2.agent_contract import (
+    feature_relation_kind,
+    normalize_api_path,
+    requires_auth,
+    route_contract_table,
+)
+from phase2.artifact_shapes import shape_issues
+from phase2.contract_quality import index_issues, volatile_index
+from phase2.feature_coverage import missing_features_note, uncovered_features
 from phase2.feature_registry import (
     missing_db_contract_features,
     normalize_feature_registry,
     registry_text,
 )
-from phase2.json_utils import try_parse_json, has_suspicious_script
+from phase2.feature_scope import artifact_features
+from phase2.fk_validation import foreign_key_issues
+from phase2.json_utils import has_suspicious_script, try_parse_json
 from phase2.llm_runtime import LlmRuntime
-from phase2.state import PipelineState
+from phase2.operation_contract import normalize_db_contract
 from phase2.quality_rules import (
-    matching_table_features, relevance_score, required_field_concepts,
-    scoped_unique_columns, self_check_passed,
+    matching_table_features,
+    relevance_score,
+    required_field_concepts,
+    scoped_unique_columns,
+    self_check_passed,
 )
-from phase2.agent_contract import feature_relation_kind, requires_auth, normalize_api_path, route_contract_table
+from phase2.registry_contract_guard import contract_artifacts, shared_db_issues
+from phase2.repair_scope import (
+    merge_columns,
+    preserve_unscoped,
+    repair_targets,
+    scope_prompt,
+    valid_base,
+)
+from phase2.state import PipelineState
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +259,10 @@ def normalize_table_contract_names(
         if not actual or actual in canonical_set:
             continue
         candidates = [name for name in canonical if _table_name_variants(name) & _table_name_variants(actual)]
+        if not candidates:
+            entity = re.sub(r"_(?:records?|entries|logs)$", "", actual)
+            candidates = [name for name in canonical if entity != actual
+                          and _table_name_variants(name) & _table_name_variants(entity)]
         if len(candidates) != 1:
             tail = actual.split("_")[-1]
             candidates = [name for name in canonical if name.split("_")[-1] == tail]
@@ -252,10 +277,9 @@ def normalize_table_contract_names(
             continue
         old = str(table.get("name") or "")
         new = aliases.get(old)
-        if not new:
-            continue
-        logger.warning("DBA 테이블명 계약 정규화: %s → %s", old, new)
-        table["name"] = new
+        if new:
+            logger.warning("DBA 테이블명 계약 정규화: %s → %s", old, new)
+            table["name"] = new
         for col in table.get("columns") or []:
             if not isinstance(col, dict):
                 continue
@@ -291,6 +315,10 @@ def annotate_table_feature_ids(tables: list[dict], registry: list[dict] | None) 
                 table = table.get("name") or table.get("table")
             if fid and table:
                 by_table.setdefault(str(table).strip(), []).append(fid)
+    valid_ids = {
+        str(item.get("featureId") or item.get("id") or "").strip()
+        for item in registry or [] if isinstance(item, dict)
+    }
     for table in tables or []:
         if not isinstance(table, dict) or not table.get("name"):
             continue
@@ -299,6 +327,47 @@ def annotate_table_feature_ids(tables: list[dict], registry: list[dict] | None) 
         # 매번 Registry 계약에서 계산한 값으로 덮어써야 그래프에 고립 노드가
         # 남지 않고, 계약이 없는 테이블은 빈 배열로 명시된다.
         table["featureIds"] = sorted(set(ids))
+
+    # Auxiliary tables are often introduced by DBA workers rather than by the
+    # Registry (memberships, *_histories, join tables). Propagate ownership
+    # through real FK edges so these tables remain connected without inventing
+    # project-specific names.
+    by_name = {
+        str(table.get("name") or ""): table
+        for table in tables or [] if isinstance(table, dict) and table.get("name")
+    }
+    direct_ids = {name: set(table.get("featureIds") or []) for name, table in by_name.items()}
+    for table in by_name.values():
+        ids = set(table.get("featureIds") or [])
+        neighbours: set[str] = set()
+        for column in table.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            match = re.search(
+                r"\bREFERENCES\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                str(column.get("constraints") or ""), re.IGNORECASE,
+            )
+            if match and match.group(1) in by_name:
+                neighbours.update(direct_ids[match.group(1)])
+        table["dependencyFeatureIds"] = sorted((neighbours & valid_ids) - ids)
+        if not ids and neighbours:
+            candidates = [item for item in registry or [] if str(item.get("featureId") or item.get("id") or "") in neighbours]
+            scored = [(relevance_score(str(item.get("name") or ""), str(table.get("description") or "")), item)
+                      for item in candidates]
+            best = max((score for score, _ in scored), default=0)
+            table["featureIds"] = sorted({str(item.get("featureId") or item.get("id"))
+                                          for score, item in scored if score == best and score >= 0.2})
+
+    auth_ids = sorted(
+        feature_id for feature_id in valid_ids
+        if feature_id.startswith(("auth.", "profile.", "user."))
+    )
+    for table in by_name.values():
+        if table.get("featureIds"):
+            continue
+        name = str(table.get("name") or "")
+        if auth_ids and any(token in name for token in ("users", "memberships", "sessions", "tokens", "consents")):
+            table["featureIds"] = auth_ids
     return tables
 
 
@@ -587,7 +656,8 @@ def _ensure_fk_references(tables: list[dict], registry: list[dict] | None = None
             if not isinstance(col, dict):
                 continue
             name = str(col.get("name") or "")
-            if not name.endswith("_id") or name in {"id", "target_id"}:
+            declared_target = contract_targets.get((str(table.get("name") or ""), name), contract_targets.get(("*", name)))
+            if not declared_target and (not name.endswith("_id") or name in {"id", "target_id"}):
                 continue
             target_table, target_column = contract_targets.get(
                 (str(table.get("name") or ""), name),
@@ -614,7 +684,11 @@ def _ensure_fk_references(tables: list[dict], registry: list[dict] | None = None
             )
             if referenced:
                 referenced_table = referenced.group(1)
-                if referenced_table.casefold() in {value.casefold() for value in lookup.values()}:
+                declared_match = (not declared_target or (
+                    referenced_table.casefold() == str(target).casefold()
+                    and referenced.group(2).strip().casefold() == str(target_column or 'id').casefold()
+                ))
+                if declared_match and referenced_table.casefold() in {value.casefold() for value in lookup.values()}:
                     continue
                 # A stale/LLM-invented target must not shield the column from
                 # deterministic repair. Remove only the invalid FK fragment;
@@ -634,7 +708,7 @@ def _ensure_fk_references(tables: list[dict], registry: list[dict] | None = None
                 constraints = re.sub(r"\s+", " ", constraints).strip()
             fk_token = "" if re.search(r"\bFOREIGN_KEY\b", constraints, re.IGNORECASE) else "FOREIGN_KEY "
             col["constraints"] = f"{constraints} {fk_token}REFERENCES {target}({target_column or 'id'})".strip()
-            logger.warning("DBA FK REFERENCES 보강 — %s.%s → %s(id)", table.get("name"), name, target)
+            logger.warning("DBA FK REFERENCES 보강 — %s.%s → %s(%s)", table.get("name"), name, target, target_column or "id")
 
 
 def _ensure_contract_tables(tables: list[dict], registry: list[dict] | None) -> list[dict]:
@@ -799,6 +873,20 @@ def dba_self_check(
     registry: list[dict] | None = None,
 ) -> tuple[list[dict], list[str], list[str]]:
     """DBA 결과를 LLM과 독립적으로 보정하고 최종 규칙을 검증한다."""
+    invalid = shape_issues("db", {"tables": tables, "relationships": relationships or []})
+    if invalid:
+        return tables, relationships or [], [f"ARTIFACT_SHAPE_INVALID: {item['pointer']} {item['message']}" for item in invalid]
+    registry = artifact_features(registry or [], "db")
+    explicit = project_explicit_schema(tables, registry)
+    if explicit is not None:
+        tables, relationships = explicit
+        tables = annotate_table_feature_ids(finalize_table_indexes(tables), registry)
+        issues = [*shared_db_issues(registry), *index_issues(tables), *(f"{issue['code']}: {issue['message']}" for issue in foreign_key_issues({"tables": tables}))]
+        for table in tables:
+            for column in table["columns"]:
+                if not re.fullmatch(r"[A-Z][A-Z0-9_ ]*(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])?", column["type"]):
+                    issues.append(f"DB_FIELD_TYPE_INVALID: {table['name']}.{column['name']}")
+        return tables, relationships, issues
     tables = sanitize_tables(list(tables or []))
     tables, relationships = normalize_table_contract_names(tables, relationships, registry or [])
     tables = _ensure_contract_tables(tables, registry or [])
@@ -825,14 +913,19 @@ def dba_self_check(
         tables = annotate_table_feature_ids(tables, registry or [])
     _ensure_fk_references(tables, registry or [])
     tables = reconcile_fk_types(tables)
+    tables = annotate_table_feature_ids(tables, registry or [])
     tables = finalize_table_indexes(tables)
+    contract_issues = apply_explicit_db_contracts(tables, registry or [])
+    # Explicit fields may change a target key's type. Reconcile only after the
+    # canonical field types have been applied, then validate the final schema.
+    tables = reconcile_fk_types(tables)
 
     table_names = {
         str(table.get("name")) for table in tables
         if isinstance(table, dict) and table.get("name")
     }
     lookup = _build_name_lookup(tables)
-    issues: list[str] = []
+    issues: list[str] = [*contract_issues, *index_issues(tables), *(f"{item['code']}: {item['message']}" for item in foreign_key_issues({"tables": tables}))]
     for table in tables:
         if not isinstance(table, dict) or not table.get("name"):
             issues.append("DBA_SELF_CHECK_BLOCKER: 테이블명이 비어 있습니다")
@@ -948,6 +1041,19 @@ def finalize_table_indexes(tables: list[dict]) -> list[dict]:
                 r"REFERENCES\s+", str(column.get("constraints") or ""), re.IGNORECASE,
             ):
                 _ensure_index(table, (str(column.get("name")),))
+        columns = {
+            str(column.get("name") or "")
+            for column in table.get("columns") or [] if isinstance(column, dict)
+        }
+        status = next((name for name in ("status", "state") if name in columns), None)
+        timestamp = next(
+            (name for name in ("scheduled_at", "due_at", "created_at", "updated_at") if name in columns),
+            None,
+        )
+        if status and timestamp:
+            _ensure_index(table, (status, timestamp))
+        elif timestamp:
+            _ensure_index(table, (timestamp,))
         _repair_indexes(table)
     return tables
 
@@ -959,13 +1065,12 @@ def reconcile_fk_types(tables: list) -> list:
     그래서 `users.id BIGINT`인데 `orders.user_id VARCHAR(255)`처럼 조인 불가능한 스키마가
     구조적으로 발생한다. 지금까지 이걸 잡는 건 manager_review(LLM)뿐이었고 리뷰 파싱이
     실패하면 그대로 통과했으므로, PK 타입을 단일 기준으로 삼아 결정론적으로 교정한다.
-    참조 대상이 없는 `<name>_id`는 최종 문서에 저장하지 않는다. API는 이 함수 실행 이후
-    최종 ERD에서 다시 조립되므로 잘못된 FK를 보존하는 것보다 제거하는 편이 안전하다."""
+    명시적 REFERENCES가 있으면 그 대상 컬럼을 우선한다. 참조를 해결할 수 없는
+    컬럼은 삭제하지 않고 보존하여 검증에서 정확한 blocker로 보고한다."""
     if not isinstance(tables, list) or not tables:
         return tables
 
     _normalize_special_references(tables)
-    _break_reciprocal_fk_cycles(tables)
     # Preserve worker-declared principals and roles. FK reconciliation below uses
     # actual REFERENCES targets; it must not invent actors from fixed name lists.
     name_lookup = _build_name_lookup(tables)
@@ -995,8 +1100,15 @@ def reconcile_fk_types(tables: list) -> list:
             if not isinstance(col, dict):
                 continue
             col_name = col.get("name")
-            explicit = re.search(r"REFERENCES\s+([a-z][a-z0-9_]*)", str(col.get("constraints") or ""), re.I)
+            explicit = re.search(r"REFERENCES\s+([a-z][a-z0-9_]*)\s*\(\s*([a-z][a-z0-9_]*)\s*\)", str(col.get("constraints") or ""), re.I)
             explicit_target = explicit.group(1).lower() if explicit and explicit.group(1).lower() in table_names else None
+            if explicit:
+                target_table = next((item for item in tables if item.get("name") == explicit.group(1)), {})
+                target_column = next((item for item in target_table.get("columns") or [] if item.get("name") == explicit.group(2)), None)
+                if target_column is not None:
+                    col["type"] = target_column.get("type", col.get("type"))
+                clean_columns.append(col)
+                continue
             ref_table = explicit_target or _fk_target(col_name, name_lookup)
             if (ref_table and not explicit_target
                     and col_name != "replaced_by_token_id"
@@ -1010,6 +1122,7 @@ def reconcile_fk_types(tables: list) -> list:
                     and ("FOREIGN_KEY" in constraints_text or "REFERENCES" in constraints_text)
                 ):
                     dangling.append(f"{tbl['name']}.{col_name}")
+                    clean_columns.append(col)
                     continue
                 clean_columns.append(col)
                 continue
@@ -1046,7 +1159,7 @@ def reconcile_fk_types(tables: list) -> list:
     if fixed:
         logger.info("DBA FK 타입 %d개 교정 — 참조 PK 타입에 정합", fixed)
     if dangling:
-        logger.warning("DBA 참조 대상 없는 FK 컬럼 %d개 제거: %s", len(dangling), dangling)
+        logger.warning("DBA unresolved FK columns preserved for repair (%d): %s", len(dangling), dangling)
     if blocked_cycles:
         logger.warning("DBA 순환 방향을 만드는 추론 FK %d개 차단: %s", len(blocked_cycles), blocked_cycles)
     return tables
@@ -1100,6 +1213,9 @@ def _primary_contract_table(spec: dict, tables: list[dict], declared: list[str])
     taking the first table in schema order maps unrelated features to the same owner table.
     """
     by_name = {str(item.get("name") or ""): item for item in tables if isinstance(item, dict)}
+    primary = (spec.get("dbContract") or {}).get("primaryTable")
+    if primary:
+        return by_name.get(str(primary))
     candidates = [name for name in dict.fromkeys(declared) if name in by_name]
     if len(candidates) <= 1:
         return by_name[candidates[0]] if candidates else None
@@ -1174,7 +1290,7 @@ def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None)
             table["description"] = f"{table.get('description', '')}; 기능 매핑: {name}".strip("; ")
         ownership = spec.get("ownership") if isinstance(spec.get("ownership"), dict) else {}
         scope = str(ownership.get("scope") or "PUBLIC").upper()
-        if table and scope in {"USER", "SHARED"} and table.get("name") not in {"users", "refresh_tokens"}:
+        if table and scope in {"USER", "SHARED"} and table.get("name") not in {"users", "refresh_tokens"} and not (spec.get("dbContract") or {}).get("fields"):
             owner_entity = str(ownership.get("ownerEntity") or "users")
             if any(item.get("name") == owner_entity for item in tables):
                 _ensure_reference_column(table, owner_entity)
@@ -1190,8 +1306,133 @@ def build_feature_mappings(tables: list[dict], feature_specs: list[dict] | None)
             "states": list(spec.get("states") or []),
             "stateTransitions": list(spec.get("stateTransitions") or []),
             "transactionRules": list(spec.get("transactionRules") or []),
+            "statePolicies": copy.deepcopy(spec.get("statePolicies") or []),
+            "intervalPolicies": copy.deepcopy(spec.get("intervalPolicies") or []),
+            "readDependencies": copy.deepcopy(spec.get("readDependencies") or []),
         })
     return mappings
+
+
+def registry_schema_fields(registry: list[dict]) -> dict[str, set[str]]:
+    """Only complete contracts can constrain first-generation worker scope."""
+    features = artifact_features(registry, "db")
+    if not features or any(not (feature.get("dbContract") or {}).get("fields") for feature in features):
+        return {}
+    declared = {}
+    for feature in features:
+        contract = normalize_db_contract(feature.get("dbContract"))
+        for name in contract["tables"]:
+            declared.setdefault(name, set())
+        for field in contract["fields"]:
+            table = field.get("table") or contract.get("primaryTable")
+            if table in declared and isinstance(field.get("name"), str) and field.get("type"):
+                declared[table].add(field["name"])
+    return declared if declared and all(declared.values()) else {}
+
+
+def project_explicit_schema(tables, registry):
+    """A complete physical contract owns names, fields, types and FK direction."""
+    declared = registry_schema_fields(registry)
+    if not declared:
+        return None
+    projected, _ = contract_artifacts(registry)
+    if any(not any(column.get("primaryKey") for column in table["columns"]) for table in projected["tables"]):
+        return None
+    previous = {table["name"]: table for table in tables}
+    relationships, result = set(), []
+    for table in projected["tables"]:
+        old = previous.get(table["name"], {})
+        table = {**copy.deepcopy(old), **table}
+        table["description"] = old.get("description") or "Feature Registry physical contract"
+        table["indexes"] = list(dict.fromkeys([*table["indexes"], *(str(value) for value in old.get("indexes") or [])]))
+        for fk in table["foreignKeys"]:
+            relationships.add(f"{fk['references']['table']} (1:N) {table['name']}")
+        result.append(table)
+    return result, sorted(relationships)
+
+
+def project_worker_columns(table: dict, registry: list[dict]) -> dict:
+    declared = registry_schema_fields(registry)
+    allowed = declared.get(table.get("name"))
+    if not allowed:
+        return table
+    allowed = allowed | {"id", "created_at", "updated_at"}
+    ignored = [column["name"] for column in table.get("columns") or [] if column.get("name") not in allowed]
+    if ignored:
+        table["columns"] = [column for column in table["columns"] if column.get("name") in allowed]
+        table.setdefault("generationWarnings", []).append("DB_UNDECLARED_COLUMNS_IGNORED: " + ",".join(ignored))
+    return table
+
+
+def apply_explicit_db_contracts(tables: list[dict], registry: list[dict]) -> list[str]:
+    """Reapply declared fields/constraints after all heuristic name cleanup.
+
+    Explicit names are not aliases to discard. Conflicting declarations are
+    reported instead of choosing whichever worker happened to finish last.
+    """
+    by_name = {table["name"]: table for table in tables if isinstance(table, dict) and table.get("name")}
+    issues = []
+    declarations = {}
+    for feature in registry:
+        contract = normalize_db_contract(feature.get("dbContract"))
+        primary = str(contract.get("primaryTable") or "")
+        if primary and primary not in by_name:
+            issues.append(f"DB_PRIMARY_TABLE_UNKNOWN: {primary}")
+        for field in contract["fields"]:
+            if not isinstance(field, dict):
+                continue
+            table_name = str(field.get("table") or primary)
+            name = str(field.get("name") or "")
+            if table_name not in by_name or not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+                issues.append(f"DB_FIELD_TARGET_UNKNOWN: {table_name}.{name}")
+                continue
+            key = (table_name, name)
+            if key in declarations and any(
+                key_name in field and key_name in declarations[key]
+                and field[key_name] != declarations[key][key_name]
+                for key_name in ("type", "required", "default", "generated")
+            ):
+                issues.append(f"DB_FIELD_CONTRACT_CONFLICT: {table_name}.{name}")
+                continue
+            declarations[key] = {**declarations.get(key, {}), **field}
+            table = by_name[table_name]
+            column = next((item for item in table.get("columns") or [] if item.get("name") == name), None)
+            if column is None:
+                if not field.get("type"):
+                    issues.append(f"DB_FIELD_TYPE_REQUIRED: {table_name}.{name}")
+                    continue
+                column = {"name": name, "type": field["type"], "constraints": "NULL"}
+                table.setdefault("columns", []).append(column)
+            if field.get("type"):
+                col_type = str(field["type"]).upper()
+                if not re.fullmatch(r"[A-Z][A-Z0-9_ ]*(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])?", col_type):
+                    issues.append(f"DB_FIELD_TYPE_INVALID: {table_name}.{name}")
+                else:
+                    column["type"] = col_type
+                    if col_type not in {"BIGINT", "INTEGER", "SMALLINT", "INT", "INT2", "INT4", "INT8"}:
+                        column["constraints"] = re.sub(r"\bGENERATED_IDENTITY\b", "", str(column.get("constraints") or "")).strip()
+            if "required" in field:
+                constraints = re.sub(r"\bNOT_NULL\b|\bNOT\s+NULL\b|\bNULL\b", "", str(column.get("constraints") or ""), flags=re.I).strip()
+                column["constraints"] = (("NOT_NULL" if field["required"] else "NULL") + " " + constraints).strip()
+            for metadata in ("generated", "readOnly", "source"):
+                if metadata in field:
+                    column[metadata] = field[metadata]
+            if "default" in field:
+                value = field["default"]
+                literal = "NULL" if value is None else str(value).upper() if isinstance(value, bool) else str(value) if isinstance(value, (int, float)) else "'" + str(value).replace("'", "''") + "'"
+                column["constraints"] = re.sub(r"\s+DEFAULT\s+(?:'[^']*(?:''[^']*)*'|\S+)", "", column.get("constraints", ""), flags=re.I) + f" DEFAULT {literal}"
+        for unique in contract["uniqueConstraints"]:
+            if not isinstance(unique, dict):
+                continue
+            table_name = str(unique.get("table") or primary)
+            names = unique.get("columns") or []
+            table = by_name.get(table_name)
+            available = {item.get("name") for item in (table or {}).get("columns") or []}
+            if not table or not names or not set(names).issubset(available):
+                issues.append(f"DB_UNIQUE_TARGET_UNKNOWN: {table_name}.{names}")
+                continue
+            _ensure_unique_index(table, tuple(names))
+    return list(dict.fromkeys(issues))
 
 
 def enforce_schema_contracts(
@@ -1633,12 +1874,14 @@ def _clean_constraint(s) -> str:
     normalized = re.sub(r'\bDEFAULT\s+NOW\s*\(\s*\)', 'DEFAULT_NOW', normalized, flags=re.I)
 
     references = [
-        target for target in re.findall(
-            r'\bREFERENCES\s+([a-z][a-z0-9_]*)(?:\s*\([^)]*\))?', normalized, re.I
-        )
-        if target.lower() not in {"foreign_key", "primary_key", "key", "references"}
+        (target, columns) for target, columns in re.findall(
+            r'\bREFERENCES\s+([a-z][a-z0-9_]*)(?:\s*\(\s*([a-z][a-z0-9_]*(?:\s*,\s*[a-z][a-z0-9_]*)*)\s*\))?', normalized, re.I
+        ) if target.lower() not in {"foreign_key", "primary_key", "key", "references"}
     ]
-    reference = f"REFERENCES {references[-1]}(id)" if references else ""
+    reference = ""
+    if references:
+        target, columns = references[-1]
+        reference = f"REFERENCES {target}({','.join(value.strip() for value in (columns or 'id').split(','))})"
 
     def balanced_check(text: str) -> str:
         match = re.search(r'\bCHECK\s*\(', text, re.I)
@@ -1897,6 +2140,15 @@ def _repair_indexes(table: dict) -> None:
     kept, fixed, dropped, seen_normalized, seen_names = [], [], [], set(), set()
     for entry in indexes:
         text = str(entry)
+        if volatile_index(text):
+            if re.search(r"\bUNIQUE\b", text, re.I):
+                # Do not weaken a business uniqueness rule by rewriting its
+                # predicate. Keep it visible to structured validation/repair.
+                kept.append(text)
+            else:
+                dropped.append(text)
+                table.setdefault("generationWarnings", []).append("DB_VOLATILE_INDEX_DROPPED: " + text)
+            continue
         syntax = re.match(
             r"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+([a-z][a-z0-9_]*)\s+ON\s+([a-z][a-z0-9_]*)\s*\(([^()]*)\)(?:\s+WHERE\s+.+)?;?$",
             text.strip(), re.I,
@@ -1918,7 +2170,12 @@ def _repair_indexes(table: dict) -> None:
         if index_name in seen_names:
             dropped.append(text)
             continue
-        referenced = [c.strip() for c in match.group(3).split(",") if c.strip()]
+        terms = [re.fullmatch(r"([a-z][a-z0-9_]*)(?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?", value.strip(), re.I)
+                 for value in match.group(3).split(",") if value.strip()]
+        if not terms or any(term is None for term in terms):
+            dropped.append(text)
+            continue
+        referenced = [term[1] for term in terms]
         unknown = [c for c in referenced if c not in col_names]
         if not unknown:
             normalized_entry = re.sub(r"\s+|;", "", text).lower()
@@ -1979,17 +2236,6 @@ def sanitize_tables(tables: list) -> list:
             new = _slugify_table_name(name, i)
             logger.warning("DBA 테이블명 비정상 — 슬러그화: %r → %s", str(name)[:60], new)
             name = new
-        elif re.search(r'\d', name):
-            # 유효하지만 숫자가 낀 이름(예: refriger60_ownerships)은 EXAONE 손상일 가능성이 높으므로
-            # 숫자를 제거한다. (중복 방지 접미사 _2/_3는 아래 dedup 단계에서 숫자 제거 후 붙으므로 안전)
-            stripped = re.sub(r'_+', '_', re.sub(r'\d+', '', name)).strip('_')
-            if stripped in _RESERVED_TABLE_NAMES:
-                # 'table_5' → 'table' 처럼 예약어/무의미한 이름이 되면 원본을 유지한다 —
-                # 인덱스 등 다른 곳이 원본 이름을 참조하고 있어 바꾸면 오히려 어긋난다
-                logger.warning("DBA 테이블명 숫자 제거 시 예약어가 됨(%s → %s) — 원본 유지", name, stripped)
-            elif stripped and _VALID_TABLE_NAME_RE.match(stripped):
-                logger.warning("DBA 테이블명 숫자 혼입 제거: %s → %s", name, stripped)
-                name = stripped
         base, n = name, 2
         while name in seen:
             name = f"{base}_{n}"
@@ -2079,13 +2325,14 @@ PLAN_PROMPT = """당신은 시니어 DBA입니다.
 - 기능 목록의 각 기능 영역(등록/조회/알림/추천/통계 등)마다 저장이 필요한 도메인 엔티티를 빠짐없이 테이블로 설계하세요.
   "users"와 범용 카탈로그 테이블 한두 개만 만들고 끝내는 뭉뚱그린 설계는 금지 — 기능 목록에 명시된
   구체적인 대상(예: 재고 항목, 알림 설정, 추천 이력 등)마다 별도 테이블이 필요한지 검토하세요.
-- 인증/회원 기능이 있으면 users 테이블 필수
-- 기능 목록이 조직·동호회·팀 소속을 전제로 하면 단일 조직인지 확인하고, 다중 조직이면 organizations/clubs와 memberships 매핑 테이블을 계획에 포함하세요.
+- 명시 dbContract가 있으면 그 테이블 집합만 계획하세요. 인증·조직 테이블을 관습적으로 추가하지 마세요.
+- 계약이 없는 legacy 입력에서만 요구사항에 필요한 인증·조직 저장 구조를 검토하세요.
 - 기능별로 필요한 테이블을 "featureId → 테이블명" 계약 매핑으로 함께 작성하세요. 상태 변화 기능은 상태 컬럼과 변경 이력 저장 위치를 명시하세요.
 - PM/Feature Spec Registry의 각 dbContract.tables를 한 항목도 빠뜨리지 말고 plan에 반영하세요. Registry에 지정된 이름과 다른 테이블명을 새로 만들지 말고, plan 각 항목에 featureIds 배열을 기록하세요.
 - Registry의 foreignKeys는 컬럼 설계에 1:1로 반영하세요. 모든 FK는 column과 references.table/references.column을 확인한 뒤 실제 컬럼 제약으로 작성해야 합니다.
-- 테이블명은 영문 소문자 snake_case, 복수형 (예: users, ingredients, notifications)
-- 최소 {min_tables}개 이상의 테이블을 설계하세요 (개수 상한 없음, 과도한 중복/분할은 지양)
+- statePolicies의 초기 상태와 허용 상태, intervalPolicies의 구간/점유 상태/실제 슬롯 참조를 그대로 소비하세요. 존재하지 않는 참조를 가정하거나 초기 상태를 임의 변경하지 마세요. 시간 구간 중복은 단순 UNIQUE가 아니라 명시된 잠금·트랜잭션 정책으로 보장합니다.
+- 계약 테이블명과 개수는 그대로 보존하세요. 복수형 변환이나 개수 채우기를 위해 이름·범위를 바꾸지 마세요.
+- 계약이 없는 legacy 입력에서만 영문 소문자 snake_case를 사용하고 {min_tables}개를 참고 목표로 검토하세요. 개수를 채우기 위한 테이블 생성은 금지합니다.
 
 응답 형식 (JSON만):
 {{
@@ -2139,26 +2386,26 @@ PM 기능 계약 Registry:
 - ⚠️ 컬럼명은 반드시 영문 소문자 snake_case. 한글 컬럼명 절대 금지
   (예: '소모량' ❌ → quantity ⭕, '기록일시' ❌ → recorded_at ⭕, '재료_id' ❌ → ingredient_id ⭕)
 - 인덱스 정의에 쓰는 컬럼명도 위에서 정의한 영문 컬럼명과 정확히 일치해야 함
-- 허용 타입: BIGINT, VARCHAR(255), VARCHAR(100), VARCHAR(50), TEXT, BOOLEAN, TIMESTAMP, DATE, DECIMAL(10,2)
+- PostgreSQL 타입을 사용하고 계약의 타입(예: UUID, JSONB, TIMESTAMPTZ, NUMERIC 포함)을 그대로 보존하세요. 임의 허용 타입 목록으로 변환하지 마세요.
 - 제약조건 키워드(공백 구분): PRIMARY_KEY, AUTO_INCREMENT, NOT_NULL, NULL, UNIQUE, FOREIGN_KEY, DEFAULT_FALSE, DEFAULT_TRUE
-- "id BIGINT PRIMARY_KEY AUTO_INCREMENT", "created_at TIMESTAMP NOT_NULL", "updated_at TIMESTAMP NOT_NULL" 필수
-- 다른 테이블을 참조하는 외래키 컬럼명은 참조테이블_id 형식 (예: user_id)
-- 모든 *_id 외래키 컬럼에는 반드시 "FOREIGN_KEY REFERENCES 실제_테이블(id)"를 함께 표기하세요. relationships 배열에만 관계를 적고 컬럼 제약을 생략하지 마세요.
+- 계약의 PK 이름·타입·복합키와 시간 필드를 보존하세요. UUID/non-id PK를 id BIGINT로 바꾸거나 계약 밖 필드를 필수로 추가하지 마세요.
+- FK 컬럼명은 계약의 이름을 그대로 사용하세요. *_id라는 이름만으로 내부 FK라고 단정하지 마세요.
+- 실제 FK에는 "FOREIGN_KEY REFERENCES 실제_테이블(실제_대상컬럼)"을 표기하세요. 대상은 계약의 PK/UNIQUE이며 비-id·복합 참조를 id로 바꾸지 마세요. relationships만 작성하고 컬럼 제약을 생략하지 마세요.
 - Registry에 정의된 foreignKeys는 이름이 비슷하다는 이유로 생략하거나 다른 테이블로 추론하지 말고, column/reference 대상/nullable 여부를 그대로 반영하세요.
-- created_by_user_id, updated_by_user_id, created_by_id, recorded_by_id, generated_by_id, checked_in_by_user_id, processed_by_user_id, actor_user_id처럼 역할 접두사가 있는 컬럼도 users(id)를 명시하세요.
-- space_id처럼 실제 테이블명이 kitchen_spaces인 경우에도 전체 테이블 목록의 실제 이름을 REFERENCES 대상으로 사용하세요.
+- Registry dbContract.fields의 name/type/required/default와 uniqueConstraints의 복합 컬럼을 그대로 반영하세요. primaryTable과 소유권 확인 테이블을 혼동하지 마세요. generated/source=server/auth/derived 값은 클라이언트 필수 입력이 아닙니다.
+- 기존 업무 필드가 있으면 비슷한 이름의 임의 컬럼을 추가하지 말고, 원래 요구사항과 명시 계약을 우선하세요. 발생일은 생년월일이 아니며 모든 날짜에 birth_date를 만들지 마세요.
+- 역할명이 붙은 FK도 Registry의 실제 참조 테이블·컬럼·타입을 사용하세요. 이름만 보고 users(id)로 추론하지 마세요.
 - target_id처럼 여러 테이블을 가리키는 polymorphic ID는 FOREIGN_KEY로 표시하지 말고 target_table과 함께 사용하는 이유를 description에 적으세요.
 - provider_message_id처럼 외부 알림/결제 사업자가 발급한 식별자는 FOREIGN_KEY로 표시하지 말고 external_reference로 설명하세요.
-- refresh_tokens.replaced_by_token_id는 refresh_tokens(id)를 참조하는 nullable self-FK로 명시하세요.
-- audit_logs.target_id는 target_type + target_id 조합으로 저장하고 내부 FOREIGN_KEY는 만들지 마세요.
+- self-FK도 계약에 선언된 경우에만 작성하세요. polymorphic/external 식별자는 계약에 내부 FK가 없는 한 내부 참조를 만들지 마세요.
 
 응답 형식 (JSON만, name/description은 위 값 그대로 유지):
 {{
   "name": "{name}",
   "description": "{purpose}",
   "featureIds": ["Registry에서 이 테이블을 사용하는 featureId"],
-  "columns": ["id BIGINT PRIMARY_KEY AUTO_INCREMENT", "..."],
-  "indexes": ["INDEX idx_{name}_x ON {name}(x)"]
+  "columns": ["계약의 컬럼명 PostgreSQL타입 제약조건"],
+  "indexes": ["CREATE INDEX idx_{name}_x ON {name}(x)"]
 }}
 
 컨텍스트:
@@ -2244,6 +2491,9 @@ class DbaAgent:
             source_registry = normalize_feature_registry(
                 state.feature_registry, state.feature_list, preserve_extra=True,
             )
+        source_registry = artifact_features(source_registry, "db")
+        if state.feature_registry and not source_registry:
+            return state.copy(db_schema='{"tables":[],"relationships":[],"featureMappings":[]}', qa_db_blockers=[])
         registry_features = [str(item.get("name")) for item in source_registry if item.get("name")]
         # API와 동일하게 Feature Spec 전체를 DB 계약의 기준으로 사용한다.
         # 일부 supporting 기능을 제외하면 해당 기능의 dbContract가 실제 테이블에
@@ -2410,21 +2660,27 @@ class DbaAgent:
             logger.error(blocker)
             return state.copy(
                 prd_feedback_from_dba=blocker,
+                targeted_repair_results={**state.targeted_repair_results, "db": "missing_baseline"},
                 qa_db_blockers=[*state.qa_db_blockers, blocker],
                 qa_approved=False,
                 status_message="DBA targeted repair 차단 — 기존 산출물 없음",
             )
+        allowed = repair_targets(state, feedback, "db", current)
+        if not allowed:
+            return state.copy(targeted_repair_results={**state.targeted_repair_results, "db": "rejected_scope"})
         prompt = TARGETED_REPAIR_PROMPT.format(
             feedback=str(feedback or "")[:8000],
             schema=json.dumps(current, ensure_ascii=False),
-        )
+        ) + scope_prompt(current, allowed)
         try:
             raw = await self._call(prompt, max_tokens=9000, system=MANAGER_SYSTEM)
             if dump:
                 dump.log_raw("DBA_TARGETED_REPAIR", 1, raw)
             result = try_parse_json(raw)
+            if not valid_base(result, current):
+                return state.copy(targeted_repair_results={**state.targeted_repair_results, "db": "rejected_revision"})
             patches = result.get("patches") if isinstance(result, dict) else None
-            by_name = {t.get("name"): t for t in current["tables"] if isinstance(t, dict) and t.get("name")}
+            by_name = {t.get("name"): copy.deepcopy(t) for t in current["tables"] if isinstance(t, dict) and t.get("name")}
             allowed_names = set(by_name)
             for item in normalize_feature_registry(
                 state.feature_registry, state.feature_list, preserve_extra=True,
@@ -2435,6 +2691,7 @@ class DbaAgent:
                         declared = declared.get("name") or declared.get("table")
                     if declared:
                         allowed_names.add(str(declared))
+            allowed_names &= allowed
             applied = 0
             if isinstance(patches, dict):
                 for name, patch in patches.items():
@@ -2447,8 +2704,22 @@ class DbaAgent:
                     if str(name) not in allowed_names:
                         logger.warning("DBA targeted repair — 계약 외 테이블 patch 무시: %s", name)
                         continue
+                    column_scope = set(re.findall(rf"\b{re.escape(str(name))}\.([a-z][a-z0-9_]*)\b", feedback))
+                    if column_scope and "columns" in patch:
+                        patch = {**patch, "columns": [column for column in _parse_column_strings(patch["columns"])
+                                                       if column.get("name") in column_scope]}
+                        patches[name] = patch
+                    if patch.get("op") == "remove":
+                        if name in by_name:
+                            del by_name[name]
+                            applied += 1
+                        continue
                     value = {**by_name.get(name, {}), **patch, "name": name}
-                    value["columns"] = _parse_column_strings(value.get("columns"))
+                    value.pop("op", None)
+                    value["columns"] = merge_columns(
+                        by_name.get(name, {}).get("columns") or [],
+                        _parse_column_strings(patch.get("columns")) if "columns" in patch else [],
+                    )
                     if not isinstance(value.get("indexes"), list):
                         value["indexes"] = [str(value["indexes"])] if value.get("indexes") else []
                     by_name[name] = value
@@ -2456,6 +2727,12 @@ class DbaAgent:
             relationships = result.get("relationships")
             if not isinstance(relationships, list):
                 relationships = current.get("relationships", [])
+            else:
+                def touches(value):
+                    return any(re.search(rf"\b{re.escape(name)}\b", str(value)) for name in allowed_names)
+                relationships = [item for item in current.get("relationships", []) if not touches(item)] + [
+                    item for item in relationships if touches(item)
+                ]
             candidate_relationships = _normalize_relationships(
                 relationships, list(by_name.values()),
             )
@@ -2490,6 +2767,29 @@ class DbaAgent:
             tables, relationships, self_check_issues = dba_self_check(
                 tables, relationships, registry,
             )
+            original_by_name = {table.get("name"): table for table in current["tables"]}
+            for table in tables:
+                name = table.get("name")
+                original = original_by_name.get(name)
+                if original is None or name not in allowed_names:
+                    continue
+                patch = patches.get(name, {}) if isinstance(patches, dict) else {}
+                changed_columns = {column.get("name") for column in _parse_column_strings(patch.get("columns"))}
+                table["columns"] = preserve_unscoped(
+                    original.get("columns") or [], table.get("columns") or [], changed_columns,
+                    lambda column: column.get("name"),
+                )
+                if "indexes" not in patch:
+                    if "indexes" in original:
+                        table["indexes"] = copy.deepcopy(original["indexes"])
+                    else:
+                        table.pop("indexes", None)
+            tables = preserve_unscoped(current["tables"], tables, allowed_names, lambda item: item.get("name"))
+            def touches_allowed(value):
+                return any(re.search(rf"\b{re.escape(name)}\b", str(value)) for name in allowed_names)
+            relationships = [item for item in current.get("relationships", []) if not touches_allowed(item)] + [
+                item for item in relationships if touches_allowed(item)
+            ]
             mappings = build_feature_mappings(tables, state.feature_specs or registry)
             repaired = json.dumps({
                 **current, "tables": tables, "relationships": relationships,
@@ -2502,7 +2802,7 @@ class DbaAgent:
                 qa_db_blockers=self_check_issues,
                 qa_db_issues=self_check_issues,
                 qa_approved=False if self_check_issues else state.qa_approved,
-                targeted_repair_results={**state.targeted_repair_results, "db": "applied"},
+                targeted_repair_results={**state.targeted_repair_results, "db": "applied" if json.loads(repaired) != current else "noop"},
                 status_message="DBA 에이전트 완료 — 지적 테이블만 수정",
             )
         except Exception as e:
@@ -2665,6 +2965,10 @@ class DbaAgent:
                             name += "_2"
                     plan.append({"name": name, "purpose": feature, "required_refs": []})
 
+        declared = registry_schema_fields(registry_items)
+        if declared:
+            planned = {item["name"]: item for item in plan if isinstance(item, dict) and item.get("name") in declared}
+            plan = [planned.get(name, {"name": name, "purpose": "Declared Registry table"}) for name in declared]
         logger.info("DBA manager_plan 완료 — 테이블 %d개 계획: %s", len(plan), [p.get("name") for p in plan if isinstance(p, dict)])
         return {"plan": plan, "generation_blocker": generation_blocker}
 
@@ -2776,6 +3080,7 @@ class DbaAgent:
             data.setdefault("description", purpose)
 
         data["columns"] = _parse_column_strings(data.get("columns"))
+        data = project_worker_columns(data, _registry_items(state.get("feature_registry", "[]")))
         if not isinstance(data.get("indexes"), list):
             data["indexes"] = [str(data["indexes"])] if data.get("indexes") else []
 

@@ -1,24 +1,38 @@
-import asyncio
 import json
 import logging
-import math
 import re
 from typing import Annotated, TypedDict
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-from openai import AsyncOpenAI, InternalServerError, APITimeoutError, APIConnectionError
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, InternalServerError
 
 from phase2.agent_contract import contract_prompt, normalize_target_arrow
-from phase2.quality_rules import (
-    contamination_reasons, feature_semantic_issues, has_placeholder, kpi_basis_issues,
-    near_duplicate, relevance_score, retry_prompt, source_evidence_issues,
-)
-from phase2.json_utils import try_parse_json, has_suspicious_script
-from phase2.llm_runtime import LlmRuntime
-from phase2.state import PipelineState
 from phase2.feature_registry import normalize_feature_registry, registry_text
-
+from phase2.json_utils import has_suspicious_script, try_parse_json
+from phase2.llm_runtime import LlmRuntime
+from phase2.prd_policy import (
+    align_project_scope,
+    assigned_dimension,
+    audit_items,
+    kpi_issues,
+    persona_coverage_issues,
+    persona_directions,
+    persona_issues,
+    segment_id,
+)
+from phase2.prd_quality import reconcile_prd_quality
+from phase2.quality_rules import (
+    contamination_reasons,
+    feature_semantic_issues,
+    has_placeholder,
+    near_duplicate,
+    relevance_score,
+    retry_prompt,
+    source_evidence_issues,
+)
+from phase2.repair_scope import repair_targets, scope_prompt, valid_base
+from phase2.state import PipelineState
 
 _TECH_DEFAULTS = {
     "backend": "FastAPI 기반 비동기 API 서버를 사용하며 Python AI 생태계와 쉽게 통합합니다.",
@@ -28,7 +42,7 @@ _TECH_DEFAULTS = {
     "messageQueue": "Kafka를 사용해 비동기 이벤트 처리와 서비스 간 결합도 완화를 지원합니다.",
     "cdn": "CDN을 사용해 정적 자산을 사용자와 가까운 위치에서 빠르게 제공합니다.",
     "monitoring": "구조화 로그와 메트릭 모니터링으로 장애 원인을 추적하고 운영 상태를 관찰합니다.",
-    "auth": "사용자 요구사항에 인증이 명시된 경우에만 서비스 특성에 맞는 인증 방식을 적용합니다.",
+    "auth": "계정·개인 데이터·권한 요구가 있으면 사용자 인증과 요청별 소유권 검증을 적용하고, 공개 무상태 서비스에는 불필요한 계정을 강제하지 않습니다.",
 }
 
 
@@ -127,9 +141,16 @@ def sync_core_features_with_registry(state):
     if not isinstance(prd, dict) or not isinstance(prd.get("coreFeatures"), list):
         return state
     registry = normalize_feature_registry(state.feature_registry, state.feature_list, preserve_extra=True)
-    before = len(prd["coreFeatures"])
-    core = ensure_registry_core_features(list(prd["coreFeatures"]), [], registry)
-    if len(core) == before:
+    core = ensure_registry_core_features([dict(item) for item in prd["coreFeatures"] if isinstance(item, dict)], [], registry)
+    by_name = {item["name"]: item for item in registry}
+    for feature in core:
+        contract = by_name.get(str(feature.get("name") or ""))
+        if not contract:
+            continue
+        for field in ("featureId", "priority", "actions", "apiContract", "dbContract"):
+            if field in contract:
+                feature[field] = contract[field]
+    if core == prd["coreFeatures"]:
         return state
     return state.copy(prd_document=json.dumps({**prd, "coreFeatures": core}, ensure_ascii=False))
 
@@ -168,8 +189,8 @@ WORKER_SYSTEM = """JSON만 출력하세요. 설명·인사말·마크다운 코�
   반드시 "누가 / 무엇을 / 어떻게 / 왜" 구조로 구체적으로 작성하세요.
 
 ══ 절대 금지 ══
-- 출처 없는 수치 사용
-- "내부 목표", "내부 설문조사" 표현
+- 외부 근거 없는 수치를 관측된 사실처럼 주장하는 것
+- 내부 제품 목표를 외부 조사 결과로 표시하는 것 (내부 운영 목표는 가설로 명시 가능)
 - "약", "대략" 등 모호한 표현 (실제 추정치 제외)
 - A사, B사 등 가상 서비스명 — 실제 한국 서비스명 사용
 - $name, $serviceName, {name}, {value} 등 placeholder를 값으로 사용하는 것
@@ -238,39 +259,14 @@ JSON:
 
 아래 JSON 형식으로 PRD의 목표·KPI 부분을 작성하세요.
 
-══ 필드별 최소 기준 (반드시 충족) ══
-▸ goals: ⭐3개 이상⭐. 각 항목은 "~을 통해 ~을 달성하여 ~에 기여한다" 형식, 60자 이상.
-▸ kpi  : ⭐⭐반드시 7개 이상⭐⭐. 획득·활성·전환·리텐션·품질·수익 등 서로 다른 관점의 지표 7개.
-         target은 "현재값 → 목표값" 형식. basis는 업계 평균 수치 출처를 "기관명, YYYY년"으로 명시.
-
-⚠️ 출력하기 전에 kpi 배열의 원소를 직접 1,2,3...로 세어 7개 이상인지 확인하고, 부족하면 채운 뒤 출력하세요.
-⚠️ 출처(basis)는 실제로 존재하고 검증 가능한 **국내** 기관·리포트를 사용하세요
-   (예: 통계청, 한국인터넷진흥원(KISA), 한국소비자원, 오픈서베이, 모바일인덱스, 와이즈앱리테일).
-   아래 예시의 출처·수치를 그대로 복사하지 말고 이 서비스와 국내 시장에 맞게 교체하세요.
-   확실하지 않은 수치는 지어내지 말고 basis에 '(추정치)'라고 명시하세요.
-
-JSON (아래 goals 3개·kpi 7개는 개수/형식 예시입니다 — 이 서비스에 맞는 실제 지표로 goals 3개 이상, kpi 7개 이상을 반드시 채우세요):
-{{
-  "goals": [
-    "핵심 기능 자동화를 통해 사용자 입력 시간을 단축하여 일일 활성 사용자 증가에 기여한다",
-    "적시 알림을 통해 사용자의 반복 이탈을 줄여 재방문율 향상에 기여한다",
-    "개인화 추천을 통해 서비스 체류 시간을 늘려 장기 리텐션 향상에 기여한다"
-  ],
-  "kpi": [
-    {{"metric":"월간 활성 사용자(MAU)","target":"0명 → 10,000명","basis":"국내 모바일 앱 이용 현황 (모바일인덱스, 2023년, 추정치)","measurementMethod":"월간 고유 로그인 사용자 집계","frequency":"월간"}},
-    {{"metric":"신규 가입자 수","target":"0명 → 3,000명","basis":"국내 동종 서비스 초기 획득 벤치마크 (와이즈앱리테일, 2023년, 추정치)","measurementMethod":"신규 계정 생성 수","frequency":"주간"}},
-    {{"metric":"온보딩 전환율","target":"0% → 60%","basis":"국내 앱 온보딩 완료율 (오픈서베이 모바일 리포트, 2023년, 추정치)","measurementMethod":"가입 대비 핵심 행동 1회 완료 비율","frequency":"주간"}},
-    {{"metric":"7일 리텐션","target":"0% → 35%","basis":"국내 유틸리티 앱 평균 리텐션 (모바일인덱스, 2023년, 추정치)","measurementMethod":"가입 후 7일차 재방문 비율","frequency":"주간"}},
-    {{"metric":"30일 리텐션","target":"0% → 20%","basis":"국내 유틸리티 앱 평균 리텐션 (모바일인덱스, 2023년, 추정치)","measurementMethod":"가입 후 30일차 재방문 비율","frequency":"월간"}},
-    {{"metric":"핵심 기능 사용률","target":"0% → 50%","basis":"앱 기능 채택률 (오픈서베이, 2023년, 추정치)","measurementMethod":"활성 사용자 중 핵심 기능 사용 비율","frequency":"주간"}},
-    {{"metric":"앱 스토어 평점","target":"0.0 → 4.5","basis":"국내 상위 유틸리티 앱 평균 평점 (구글플레이/앱스토어, 2023년)","measurementMethod":"스토어 평균 별점","frequency":"월간"}}
-  ]
-}}
-
-검증 체크리스트 (생성 후 스스로 확인):
-[ ] kpi 배열 원소를 직접 세었을 때 7개 이상인가?
-[ ] goals가 3개 이상인가?
-[ ] KPI basis에 "내부 목표" 표현이 없는가?
+goals는 요구사항의 문제·행동·기대 성과에 연결하세요.
+KPI는 실제 적용 가능한 관점만 작성하고 개수를 채우지 마세요. 외부 수치는 제공된 원문 URL을 인용하고,
+외부 근거가 없으면 basis를 검증할 내부 운영 목표로 표시하세요. target은 숫자가 있는 현재값 → 목표값입니다.
+각 KPI는 metric/dimension/target/basis/measurementMethod/frequency와 measurement를 가집니다.
+dimension은 acquisition/activation/conversion/retention_7d/retention_30d/quality/business 중 하나입니다.
+measurement는 event/numerator/denominator/unit/window 객체이며 비율의 분모와 관측 기간을 빠뜨리지 마세요.
+요구사항과 관계없는 업계 평균이나 가상의 페르소나로 개수를 맞추지 마세요.
+JSON: {{"goals":[],"kpi":[]}}
 
 사용자 요구사항: {user_query}
 """,
@@ -328,23 +324,10 @@ JSON (아래는 형식 예시 2개일 뿐 — 기능 힌트와 요구사항에 �
 
 아래 JSON 형식으로 PRD의 사용자 페르소나 부분을 작성하세요.
 
-══ 필드별 최소 기준 (반드시 충족) ══
-▸ userPersonas: ⭐⭐반드시 정확히 3개⭐⭐ (2개 이하 절대 금지). 연령대/직업/기술수준이 서로 다른 3명.
-                goal/painPoint/usagePattern 각 2문장 이상.
-
-⚠️ 출력하기 전에 userPersonas 배열이 정확히 3개인지 세어 확인하세요.
-
-JSON (반드시 서로 다른 3명 — 아래 형식으로 3개 항목을 채우세요):
-{{
-  "userPersonas": [
-    {{"name":"이름1","age":"20대 중반","job":"직업1","techLevel":"높음","goal":"사용 목표 2문장 이상","painPoint":"주요 불편함 2문장 이상","usagePattern":"사용 패턴 2문장 이상"}},
-    {{"name":"이름2","age":"30대 초반","job":"직업2","techLevel":"중간","goal":"사용 목표 2문장 이상","painPoint":"주요 불편함 2문장 이상","usagePattern":"사용 패턴 2문장 이상"}},
-    {{"name":"이름3","age":"40대","job":"직업3","techLevel":"낮음","goal":"사용 목표 2문장 이상","painPoint":"주요 불편함 2문장 이상","usagePattern":"사용 패턴 2문장 이상"}}
-  ]
-}}
-
-검증 체크리스트 (생성 후 스스로 확인):
-[ ] userPersonas가 정확히 3개인가? (2개 이하면 실패)
+실제 대상 사용자 역할·목표·사용 상황별로 작성하세요. 3개를 강제하거나 서로 다른 나이·직업을 지어내지 마세요.
+name/age/job/techLevel/role/goal/painPoint/usagePattern을 작성하고 가상의 사용자 모델임을 assumption=true로 표시하세요.
+연령·직업 정보가 없으면 연령 무관/직업 무관으로 작성하세요. 같은 연령·직업이어도 여정이 다르면 별도 세그먼트입니다.
+JSON: {{"userPersonas":[]}}
 
 사용자 요구사항: {user_query}
 """,
@@ -378,6 +361,7 @@ JSON:
 
 ══ 필드별 최소 기준 (반드시 충족) ══
 ▸ techStack: 각 레이어 선택 이유 2문장 이상 (기술 특성 + 이 서비스에 적합한 이유).
+파일·사진이 있으면 CDN과 별도로 원본 저장소, 파일 URL 변환, 삭제 보존·실패 보상·재시도 worker의 책임을 기술하세요. 큐 미사용과 비동기 작업 불필요는 다른 결정입니다. 외부 인증 제외를 실제 학생/조직 인증 완료로 표현하지 마세요.
 
 JSON:
 {{
@@ -422,9 +406,9 @@ JSON (아래는 형식 예시 2개일 뿐 — 위 6단계에 따라 반드시 6�
 _SECTION_CRITERIA = """- projectOverview: 50자 이상
 - background: 200자 이상, 수치마다 출처 표기
 - goals: 각 항목 60자 이상
-- kpi: 7개 이상, target은 "현재값 → 목표값" 형식
+- kpi: 적용 가능한 측정 정의, target은 "현재값 → 목표값" 형식. 개수 채우기 금지
 - coreFeatures: 기능 힌트를 모두 포함하고 8개 이하, description 100자 이상. PM projectPlan의 MUST/SHOULD/COULD/WONT와 MVP 범위를 반영
-- userPersonas: 정확히 3개
+- userPersonas: 실제 사용자 세그먼트별 작성. 근거 없는 연령·직업과 개수 채우기 금지
 - mvpScope: rationale 100자 이상
 - techStack: 각 레이어 선택 이유 2문장 이상
 - releaseSchedule: 6개 이상"""
@@ -624,41 +608,12 @@ def _fallback_section(section_key: str, feature_list: list[str], user_query: str
             ),
         }
     if section_key == "goalsKpi":
-        metrics = (
-            ("월간 활성 이용 주체", "0건 → 1,000건", "제품 분석 이벤트의 월간 고유 이용 주체 집계", "월간"),
-            ("핵심 작업 시작률", "0% → 55%", "서비스 진입 대비 핵심 작업 시작 비율", "주간"),
-            ("핵심 기능 활성화율", "0% → 60%", "최초 이용 후 24시간 내 핵심 기능 1회 완료 비율", "주간"),
-            ("7일 반복 이용률", "0% → 35%", "첫 이용 코호트의 7일차 재이용 비율", "주간"),
-            ("30일 반복 이용률", "0% → 20%", "첫 이용 코호트의 30일차 재이용 비율", "월간"),
-            ("핵심 처리 성공률", "0% → 95%", "핵심 기능 요청 중 성공 응답 비율", "일간"),
-            ("사용자당 문제 해결 건수", "0건 → 월 10건", "사용자별 핵심 업무 완료 이벤트 합계", "월간"),
-        )
         return {
             "goals": [f"'{f}' 기능을 통해 사용자 핵심 문제를 해결하고 측정 가능한 서비스 성과에 기여한다" for f in features[:3]],
-            "kpi": [{"metric": metric, "target": target, "basis": "제품 출시 전 기준선 0에서 시작하는 운영 목표",
-                     "measurementMethod": method, "frequency": frequency}
-                    for metric, target, method, frequency in metrics],
+            "kpi": [],
         }
     if section_key == "userPersonas":
-        range_match = re.search(r"(\d{2})\s*[-~～]\s*(\d{2})대", user_query or "")
-        if range_match:
-            start, end = int(range_match.group(1)), int(range_match.group(2))
-            allowed_ages = [f"{age}대" for age in range(start, end + 1, 10)] or [f"{start}대"]
-        else:
-            allowed_ages = ["연령 무관"]
-        persona_templates = (
-            ("김가람", "서비스 핵심 이용자", "핵심 업무를 빠르게 끝내고 반복 입력을 줄이려 합니다.", "현재 상태를 반복 확인하며 기록을 일관되게 유지하기 어렵습니다."),
-            ("이도윤", "서비스 반복 이용자", "필요한 정보를 한곳에서 확인하고 누락과 중복 작업을 줄이려 합니다.", "여러 위치의 기록이 달라 최신 상태를 파악하기 어렵습니다."),
-            ("박서윤", "서비스 초기 이용자", "복잡한 설정 없이 중요한 상태와 다음 행동을 쉽게 확인하려 합니다.", "입력 단계가 많거나 낯선 용어가 나오면 작업을 중단하게 됩니다."),
-        )
-        return {
-            "userPersonas": [
-                {"name": name, "age": allowed_ages[index % len(allowed_ages)], "job": job,
-                 "techLevel": ("높음", "중간", "낮음")[index], "goal": goal, "painPoint": pain,
-                 "usagePattern": "웹 UI에서 상태를 확인하고 필요한 작업과 알림에 반응합니다."}
-                for index, (name, job, goal, pain) in enumerate(persona_templates)
-            ],
-        }
+        return {"userPersonas": []}
     if section_key == "mvpScope":
         split = max(1, min(3, len(features)))
         return {"mvpScope": {"included": features[:split], "excluded": features[split:],
@@ -668,7 +623,7 @@ def _fallback_section(section_key: str, feature_list: list[str], user_query: str
             "backend": "FastAPI와 Python", "frontend": "React와 TypeScript", "database": "PostgreSQL",
             "cache": "Redis", "messageQueue": "Kafka", "cdn": "표준 CDN",
             "monitoring": "OpenTelemetry와 Grafana",
-            "auth": "사용자 요구사항에 인증이 명시된 경우에만 적합한 인증 방식을 적용합니다.",
+            "auth": "계정·개인 데이터·권한 요구가 있으면 사용자 인증과 요청별 소유권 검증을 적용하고, 공개 무상태 서비스에는 불필요한 계정을 강제하지 않습니다.",
         }}
     if section_key == "releaseSchedule":
         return {"releaseSchedule": [{"date": date, "milestone": milestone,
@@ -747,14 +702,8 @@ def _build_plain_section_prompt(section: str, ctx: dict) -> str:
     )
 
 
-def _persona_directions(ctx: dict) -> tuple[str, str, str]:
-    target = str(ctx.get("target_user_context") or "").strip()
-    base = target or "사용자 요구사항에 명시된 핵심 사용자"
-    return (
-        f"핵심 사용자: {base}; 요구사항에 명시된 연령·직업만 사용하고 없으면 연령 무관으로 작성",
-        f"협업자 또는 운영 이해관계자: {base}; 실제 요구사항에 해당 역할이 없으면 핵심 사용자의 다른 사용 상황으로 구분",
-        f"간헐적이거나 기술 숙련도가 낮은 사용자: {base}; 연령을 임의로 추정하지 말고 사용 행태로 구분",
-    )
+def _persona_directions(ctx: dict) -> tuple[str, ...]:
+    return persona_directions(ctx)
 
 
 def _target_user_context(target_users) -> str:
@@ -835,6 +784,11 @@ class PrdAgent:
                     "rag_context": state.context_prompt or "",
                     "priority_context": self._priority_context(state),
                     "target_user_context": _target_user_context(state.target_users),
+                    "persona_segments": (state.project_plan or {}).get("targetUsers") or [
+                        (target.model_dump(by_alias=True) if hasattr(target, "model_dump") else target).get("persona", "")
+                        if isinstance(target, dict) or hasattr(target, "model_dump") else str(target)
+                        for target in state.target_users or []
+                    ],
                     "rollback_section": rollback_section,
                     "dump": dump,
                 },
@@ -876,19 +830,29 @@ class PrdAgent:
                 # 우선순위는 항상 마지막에 정리 — MVP 범위가 확정된 뒤라야 도출할 수 있다
                 self._reconcile_priorities(parsed.get("coreFeatures"), parsed.get("mvpScope"))
                 self._apply_phase1_priorities(parsed, state)
+                align_project_scope(parsed, state.project_plan or {}, state.excluded_features)
+                parsed = reconcile_prd_quality(parsed)
                 prd_document = json.dumps(parsed, ensure_ascii=False)
 
             logger.info("PRD 에이전트 완료 — %d chars", len(prd_document))
 
             return state.copy(
                 prd_document=prd_document,
+                artifact_quality={**state.artifact_quality, "prd": (parsed or {}).get("qualityMetadata", {})},
                 prd_feedback_from_dba="",
                 prd_feedback_from_api="",
                 status_message="PRD 에이전트 완료",
             )
 
         except Exception as e:
-            logger.error("PRD 에이전트 실패: %s", e)
+            logger.error("PRD 에이전트 실패: %s", type(e).__name__)
+            if isinstance(e, (InternalServerError, APITimeoutError, APIConnectionError, TimeoutError)):
+                return state.copy(
+                    generation_blockers=[*state.generation_blockers, "PRD_TRANSPORT: upstream request failed"],
+                    failed_stage="PRD", last_completed_stage=state.last_completed_stage,
+                    skipped_stages=["FEATURE_SPEC", "DBA_API", "QA", "PHASE3", "PHASE4"],
+                    qa_approved=False, status_message="PRD 생성 연결 실패 — 형식 재시도하지 않음",
+                )
             # Repair/재실행 중 예외가 나도 이미 성공한 PRD를 빈 객체로
             # 덮어쓰지 않는다. 빈 PRD는 원인과 무관하게 모든 필수 섹션을
             # 잃고 Phase3에서 연쇄 blocker를 만든다.
@@ -907,7 +871,8 @@ class PrdAgent:
                     normalize_feature_registry(state.feature_registry, feature_list),
                 )
                 self._reconcile_priorities(fallback["coreFeatures"], fallback.get("mvpScope"))
-                preserved = json.dumps(fallback, ensure_ascii=False)
+                fallback["_qualityFallbacks"] = ["all_sections:generation_exception"]
+                preserved = json.dumps(reconcile_prd_quality(fallback), ensure_ascii=False)
             return state.copy(
                 prd_document=preserved,
                 status_message=f"PRD 에이전트 실패: {e}",
@@ -920,46 +885,78 @@ class PrdAgent:
         """
         current = try_parse_json(state.prd_document)
         if not isinstance(current, dict) or not current:
-            return await self.execute(state, dump)
+            blocker = "TARGETED_REPAIR_BLOCKER: PRD baseline missing; full generation blocked"
+            return state.copy(generation_blockers=[*state.generation_blockers, blocker], qa_approved=False,
+                              targeted_repair_results={**state.targeted_repair_results, "prd": "missing_baseline"})
 
+        allowed = repair_targets(state, feedback, "prd", current)
+        if not allowed:
+            return state.copy(targeted_repair_results={**state.targeted_repair_results, "prd": "rejected_scope"})
         prompt = TARGETED_REPAIR_PROMPT.format(
             feedback=str(feedback or "")[:8000],
             prd_document=json.dumps(current, ensure_ascii=False),
-        )
+        ) + scope_prompt(current, allowed)
+        if "kpi" in allowed:
+            prompt += "\nKPI는 dimension과 measurement(event/numerator/denominator/unit/window)를 보존·보완하세요. 비율에는 분모가 필요합니다. 외부 근거 없는 수치는 내부 운영 목표로 구분하고 개수를 채우지 마세요."
+        if "userPersonas" in allowed:
+            prompt += "\n페르소나는 실제 역할·목표·사용 상황으로 구분하고 기존 segmentId/role 및 qualityMetadata.expectedPersonaSegments의 대상을 보존하세요. 근거 없는 연령·직업을 지어내지 마세요. 가설은 assumption=true로 표시하며 개수를 채우지 마세요."
         try:
             raw = await self._call(prompt, max_tokens=10000, system=MANAGER_SYSTEM)
             if dump:
                 dump.log_raw("PRD_TARGETED_REPAIR", 1, raw)
             result = try_parse_json(raw)
+            if not valid_base(result, current):
+                return state.copy(targeted_repair_results={**state.targeted_repair_results, "prd": "rejected_revision"})
             patches = result.get("patches") if isinstance(result, dict) else None
             if not isinstance(patches, dict) or not patches:
                 logger.warning("PRD targeted repair — 유효한 patches 없음, 원본 유지")
                 return state
-            applied = {key: value for key, value in patches.items() if key in current}
+            applied = {key: value for key, value in patches.items() if key in allowed}
             if not applied:
                 logger.warning("PRD targeted repair — 기존 섹션과 일치하는 패치 없음, 원본 유지")
                 return state
+            for field, validator in (("kpi", lambda item: kpi_issues(item, market_data=state.market_research or "", require_measurement=True)),
+                                     ("userPersonas", lambda item: persona_issues(item, state.user_query))):
+                if field in applied:
+                    values = applied[field]
+                    if not isinstance(values, list) or not values or any(validator(item) for item in values):
+                        return state.copy(targeted_repair_results={**state.targeted_repair_results, "prd": "rejected_validation"})
+                    if field == "userPersonas":
+                        applied[field] = [{**item, "assumption": True} for item in values]
             repaired = {**current, **applied}
-            if isinstance(repaired.get("coreFeatures"), list):
-                repaired["coreFeatures"] = self._dedup_list(
-                    self._drop_empty_features(repaired["coreFeatures"])
-                )
-                repaired["coreFeatures"] = self._limit_core_features(
-                    repaired["coreFeatures"], state.feature_list,
-                )
-                repaired["coreFeatures"] = ensure_registry_core_features(
-                    repaired["coreFeatures"], state.feature_list,
-                    normalize_feature_registry(state.feature_registry, state.feature_list, preserve_extra=True),
-                )
-                attach_feature_ids(
-                    repaired["coreFeatures"],
-                    normalize_feature_registry(state.feature_registry, state.feature_list, preserve_extra=True),
-                )
-                self._reconcile_priorities(repaired["coreFeatures"], repaired.get("mvpScope"))
-            self._apply_phase1_priorities(repaired, state)
+            if "coreFeatures" in applied and isinstance(repaired.get("coreFeatures"), list):
+                targets = repair_targets(state, feedback, "feature", current)
+                original = current.get("coreFeatures") or []
+                by_id = {str(item.get("featureId") or item.get("name")): dict(item) for item in original if isinstance(item, dict)}
+                by_name = {item.get("name"): key for key, item in by_id.items()}
+                for patch in applied["coreFeatures"]:
+                    if not isinstance(patch, dict):
+                        continue
+                    key = str(patch.get("featureId") or by_name.get(patch.get("name")) or patch.get("name") or "")
+                    if not key or (targets and key not in targets):
+                        continue
+                    if patch.get("op") == "remove":
+                        by_id.pop(key, None)
+                    else:
+                        by_id[key] = {**by_id.get(key, {}), **{name: value for name, value in patch.items() if name != "op"}}
+                repaired["coreFeatures"] = list(by_id.values())
+            repaired = {**current, **{key: repaired[key] for key in applied}}
+            if "userPersonas" in applied and persona_coverage_issues(repaired):
+                return state.copy(targeted_repair_results={**state.targeted_repair_results, "prd": "rejected_validation"})
+            if "mvpScope" in applied:
+                align_project_scope(repaired, state.project_plan or {}, state.excluded_features)
+            resolved_sections = set(applied) & {"kpi", "userPersonas"}
+            if resolved_sections and isinstance(repaired.get("qualityMetadata"), dict):
+                quality = dict(repaired["qualityMetadata"])
+                quality["itemDiagnostics"] = [
+                    {**item, "status": "resolved_by_targeted_repair"} if item.get("section") in resolved_sections else item
+                    for item in quality.get("itemDiagnostics") or []
+                ]
+                repaired["qualityMetadata"] = quality
             logger.info("PRD targeted repair — %d개 섹션 패치: %s", len(applied), list(applied))
             return state.copy(
                 prd_document=json.dumps(repaired, ensure_ascii=False),
+                targeted_repair_results={**state.targeted_repair_results, "prd": "applied" if repaired != current else "noop"},
                 prd_feedback_from_dba="",
                 prd_feedback_from_api="",
                 status_message="PRD 에이전트 완료 — 지적 섹션만 수정",
@@ -1054,6 +1051,7 @@ class PrdAgent:
             if not data:
                 logger.warning("%s 평문 섹션 최종 검증 실패 — 결정론적 fallback 사용", label)
                 data = _fallback_section(section, state.get("feature_list") or [], state.get("user_query") or "")
+                data["_qualityFallbacks"] = [section + ":worker_validation_failed"]
             return {"sections": data}
         feature_count = state.get("feature_count") or 0
         label = f"PRD_{section}{state.get('label_suffix', '')}"
@@ -1068,7 +1066,8 @@ class PrdAgent:
         data = await self._generate_section(label, state["prompt"], dump=dump, min_counts=min_counts, max_tokens=max_tokens)
         if not data:
             logger.error("%s 최종 파싱 실패 또는 기준 미달 — fallback 콘텐츠로 대체", label)
-            return {"sections": _fallback_section(section, state.get("feature_list") or [], state.get("user_query") or "")}
+            return {"sections": {**_fallback_section(section, state.get("feature_list") or [], state.get("user_query") or ""),
+                                 "_qualityFallbacks": [section + ":worker_parse_failed"]}}
         return {"sections": data}
 
     async def _manager_review_node(self, state: dict) -> dict:
@@ -1077,6 +1076,12 @@ class PrdAgent:
         sections = self._audit_sections(
             sections, ctx.get("feature_list") or [], ctx.get("user_query") or "", ctx.get("market_data") or ""
         )
+        quality = dict(sections.get("qualityMetadata") or {})
+        quality["expectedPersonaSegments"] = [
+            {"segmentId": segment_id(direction), "role": direction.split(";", 1)[0].removeprefix("대상 사용자: ")}
+            for direction in _persona_directions(ctx)
+        ]
+        sections["qualityMetadata"] = quality
         # 각 worker 출력은 이미 Python에서 필드별 검증·fallback 처리됐다. 전체 문서를
         # LLM manager가 다시 출력하거나 JSON patch를 만들지 않고, 최종 조립만 수행한다.
         logger.info("PRD manager 결정론적 조립 완료 — 섹션 %d개", len(sections))
@@ -1344,90 +1349,14 @@ class PrdAgent:
 
     @classmethod
     def _reconcile_priorities(cls, core_features, mvp_scope) -> None:
-        """coreFeatures.priority를 정규화하고, 구분이 없거나 비어 있으면 MVP 범위에서 도출한다.
-
-        실측: 21개 기능이 전부 P0로 표기됐다 — coreFeatures 생성이 실패해 priority를 P0로
-        박아둔 fallback이 통째로 들어갔기 때문이다. mvpScope(included/excluded)는 정상적으로
-        생성되므로 이를 MoSCoW 기준으로 삼는다: MVP 포함=P0(Must), 언급 없음=P1(Should),
-        제외=P2(Could). LLM이 이미 우선순위를 실제로 구분해 놓았다면 그 판단을 존중하고
-        비어 있는 항목만 채운다. 원본을 제자리 수정."""
-        if not isinstance(core_features, list) or not core_features:
-            return
-
-        items = [f for f in core_features if isinstance(f, dict)]
-        resolved = {}
-        for item in items:
-            priority = _normalize_priority(item.get("priority"))
-            resolved[id(item)] = priority
-            if priority:
-                item["priority"] = priority
-
-        distinct = {p for p in resolved.values() if p}
-        # 구분이 전혀 없으면(전부 같은 값이거나 전부 비어 있음) 전량 재배정, 아니면 빈 항목만
-        targets = items if len(distinct) <= 1 else [i for i in items if not resolved[id(i)]]
-        if not targets:
-            cls._cap_p0_priorities(items, [])
-            return
-
-        included, excluded = [], []
-        if isinstance(mvp_scope, dict):
-            included = [x for x in (mvp_scope.get("included") or []) if isinstance(x, str) and x.strip()]
-            excluded = [x for x in (mvp_scope.get("excluded") or []) if isinstance(x, str) and x.strip()]
-        if not included and not excluded:
-            logger.warning(
-                "coreFeatures 우선순위 구분 없음(%s)이지만 mvpScope가 비어 도출 불가 — 그대로 둠",
-                distinct or "(전부 미지정)",
-            )
-            cls._cap_p0_priorities(items, [])
-            return
-
-        inc_tokens = [cls._label_tokens(x) for x in included]
-        exc_tokens = [cls._label_tokens(x) for x in excluded]
-        counts = {"P0": 0, "P1": 0, "P2": 0}
-        for item in targets:
-            tokens = cls._label_tokens(item.get("name") or "")
-            inc_score = cls._best_overlap(tokens, inc_tokens)
-            exc_score = cls._best_overlap(tokens, exc_tokens)
-            if max(inc_score, exc_score) < cls._DEDUP_OVERLAP:
-                priority = "P1"          # 어느 쪽에도 명시되지 않음 → Should
-            elif inc_score >= exc_score:
-                priority = "P0"          # MVP 포함 → Must
-            else:
-                priority = "P2"          # MVP 제외 → Could
-            item["priority"] = priority
-            counts[priority] += 1
-
-        logger.warning(
-            "coreFeatures 우선순위 %d개를 MVP 범위 기준으로 재배정 (기존 구분: %s) — %s",
-            len(targets), distinct or "없음", counts,
-        )
-        cls._cap_p0_priorities(items, included)
+        from phase2.mvp_policy import normalize_priorities
+        if isinstance(core_features, list):
+            normalize_priorities(core_features, mvp_scope)
 
     @classmethod
-    def _cap_p0_priorities(cls, items: list[dict], included: list[str] | None = None) -> None:
-        """P0가 과도하게 많으면 MVP 핵심 후보만 남기고 나머지는 P1로 낮춘다."""
-        if not items:
-            return
-        p0_items = [item for item in items if item.get("priority") == "P0"]
-        max_p0 = max(3, math.ceil(len(items) * _MAX_P0_RATIO))
-        if len(p0_items) <= max_p0:
-            return
-
-        included_tokens = [cls._label_tokens(x) for x in (included or []) if isinstance(x, str)]
-
-        def score(item: dict) -> tuple[float, int]:
-            tokens = cls._label_tokens(item.get("name") or "")
-            overlap = cls._best_overlap(tokens, included_tokens) if included_tokens else 0.0
-            # 앞쪽 기능은 PM이 더 핵심으로 배치한 경우가 많아 같은 점수에서는 앞 순서를 보존한다.
-            return overlap, -items.index(item)
-
-        keep = set(id(item) for item in sorted(p0_items, key=score, reverse=True)[:max_p0])
-        demoted = 0
-        for item in p0_items:
-            if id(item) not in keep:
-                item["priority"] = "P1"
-                demoted += 1
-        logger.warning("coreFeatures P0 과다 보정 — P0 %d개 중 %d개를 P1으로 조정", len(p0_items), demoted)
+    def _cap_p0_priorities(cls, items, included=None) -> None:
+        from phase2.mvp_policy import normalize_priorities
+        normalize_priorities(items, {"included": included or []})
 
     @classmethod
     def _dedup_section_fields(cls, data: dict, min_counts: dict | None) -> dict:
@@ -1442,32 +1371,19 @@ class PrdAgent:
         return data
 
     async def _call(self, user_prompt: str, max_tokens: int, system: str) -> str:
-        for attempt in range(1):
-            try:
-                async def request():
-                    return await self._client.chat.completions.create(
-                        model=self._model,
-                        temperature=_TEMPERATURE,
-                        top_p=_TOP_P,
-                        presence_penalty=_PRESENCE_PENALTY,
-                        max_completion_tokens=max_tokens,
-                        frequency_penalty=0.5,
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    )
+        client = self._client.with_options(max_retries=0) if hasattr(self._client, "with_options") else self._client
 
-                resp = await self._runtime.call(request) if self._runtime else await request()
-                return resp.choices[0].message.content or ""
-            except (InternalServerError, APITimeoutError, APIConnectionError, TimeoutError) as e:
-                logger.warning("PRD API 일시 오류 (attempt %d): %s — 재시도", attempt + 1, e)
-                if attempt < 2:
-                    await asyncio.sleep(5 * (attempt + 1))
-                else:
-                    logger.error("PRD API 최종 실패")
-                    return ""
-        return ""
+        async def request():
+            return await client.chat.completions.create(
+                model=self._model, temperature=_TEMPERATURE, top_p=_TOP_P,
+                presence_penalty=_PRESENCE_PENALTY, max_completion_tokens=max_tokens,
+                frequency_penalty=0.5,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
+            )
+
+        # Transport errors must not turn into empty output and consume format repairs.
+        resp = await self._runtime.call(request) if self._runtime else await request()
+        return resp.choices[0].message.content or ""
 
     def _build_rollback_section(self, state: PipelineState) -> str:
         parts = ["\n⚠️ ROLLBACK 모드 — 아래 피드백을 반드시 반영하세요:"]
@@ -1485,7 +1401,7 @@ class PrdAgent:
             ("P0", state.must_features),
             ("P1", state.should_features),
             ("P2", state.could_features),
-            ("P2", state.excluded_features),
+            ("EXCLUDE", state.excluded_features),
         )
         candidates = [
             (priority, cls._label_tokens(name))
@@ -1507,6 +1423,7 @@ class PrdAgent:
             score, priority = max(ranked, default=(0.0, ""))
             if score >= cls._DEDUP_OVERLAP:
                 item["priority"] = priority
+                item["releaseScope"] = "excluded" if priority == "EXCLUDE" else "mvp"
 
         # Must features cannot be omitted from the MVP by a downstream worker.
         scope = parsed.get("mvpScope")
@@ -1514,12 +1431,16 @@ class PrdAgent:
             must = [str(value) for value in state.must_features if str(value).strip()]
             included = [str(value) for value in scope.get("included") or []]
             excluded = [str(value) for value in scope.get("excluded") or []]
+            confirmed = set(state.must_features + state.should_features + state.could_features) - set(state.excluded_features)
+            excluded = [value for value in excluded if value not in confirmed]
             for feature in must:
                 if feature not in included:
                     included.append(feature)
                 excluded = [value for value in excluded if value != feature]
             scope["included"] = included
             scope["excluded"] = excluded
+        from phase2.mvp_policy import normalize_priorities
+        normalize_priorities(core_features, parsed.get("mvpScope"))
 
     @classmethod
     def _audit_sections(
@@ -1527,6 +1448,7 @@ class PrdAgent:
     ) -> dict:
         """PRD manager's deterministic semantic gate; invalid worker items never enter the document."""
         out = dict(sections or {})
+        quality_fallbacks = list(out.get("_qualityFallbacks") or [])
         fallback = _fallback_section("goalsKpi", feature_list, user_query)
 
         overview_fallback = _fallback_section("projectOverview", feature_list, user_query)
@@ -1536,9 +1458,11 @@ class PrdAgent:
         if (len(overview) < 50 or len(overview) > 300 or "\n" in overview
                 or contamination_reasons(overview) or has_placeholder(overview)):
             overview = overview_fallback["projectOverview"]
+            quality_fallbacks.append("projectOverview:semantic_audit")
         if (len(background) < 160 or contamination_reasons(background) or has_placeholder(background)
                 or narrative_leak.search(background)):
             background = overview_fallback["background"]
+            quality_fallbacks.append("background:semantic_audit")
         source_blocks = re.split(r"(?=SOURCE\s+\d+)", market_data or "")
         for block in source_blocks:
             if "provider: KOSIS" not in block or "evidence: KOSIS 실제 통계값" not in block:
@@ -1582,90 +1506,12 @@ class PrdAgent:
                 goals.append(goal)
         out["goals"] = goals[:3]
 
-        kpis, metric_names = [], []
-        approved_scope = " ".join(feature_list)
-        for item in out.get("kpi") or []:
-            if not isinstance(item, dict) or contamination_reasons(item) or has_placeholder(item):
-                continue
-            metric = str(item.get("metric") or "").strip()
-            target = str(item.get("target") or "")
-            if not metric or "→" not in target or not re.search(r"[%명건회원]", target):
-                continue
-            kpi_text = f"{metric} {item.get('basis', '')} {item.get('measurementMethod', '')}"
-            expansion_tokens = ("인식", "OCR", "카메라", "배달", "레시피", "추천")
-            if any(token in kpi_text and token not in approved_scope for token in expansion_tokens):
-                continue
-            if any(near_duplicate(metric, prior, 0.6) for prior in metric_names):
-                continue
-            basis = str(item.get("basis") or "")
-            unsupported_basis = any(
-                token in basis for token in ("보고서", "통계", "조사", "연구", "백서", "추정", "업계", "증가 추세")
-            ) and "http" not in basis
-            if unsupported_basis or kpi_basis_issues(item, market_data):
-                item = dict(item)
-                item["basis"] = "제품 출시 전 기준선 0에서 시작하는 내부 운영 목표"
-            metric_names.append(metric)
-            kpis.append(item)
-        for item in fallback["kpi"]:
-            if len(kpis) >= 7:
-                break
-            if not any(near_duplicate(item["metric"], prior, 0.6) for prior in metric_names):
-                metric_names.append(item["metric"])
-                kpis.append(item)
-        out["kpi"] = kpis[:7]
-
-        personas, signatures, persona_names = [], set(), set()
-        target_range = re.search(r"(\d{2})\s*[-~～]\s*(\d{2})대", user_query or "")
-        allowed_ages = (
-            {f"{age}대" for age in range(int(target_range.group(1)), int(target_range.group(2)) + 1, 10)}
-            if target_range else set()
-        )
-        for item in out.get("userPersonas") or []:
-            if not isinstance(item, dict) or contamination_reasons(item) or has_placeholder(item):
-                continue
-            age_value = str(item.get("age") or "").strip()
-            if not re.match(r"^(?:연령\s*무관|무관|\d{1,2}(?:-\d{1,2})?세|\d{1,2}대(?:\s*(?:초반|중반|후반))?)$", age_value):
-                continue
-            if allowed_ages and age_value not in allowed_ages:
-                continue
-            persona_name = str(item.get("name") or "").strip()
-            if not persona_name or persona_name in persona_names:
-                continue
-            sig = (str(item.get("age") or "").strip(), str(item.get("job") or "").strip())
-            if sig in signatures:
-                continue
-            signatures.add(sig)
-            persona_names.add(persona_name)
-            personas.append(item)
-        for item in _fallback_section("userPersonas", feature_list, user_query)["userPersonas"]:
-            if len(personas) >= 3:
-                break
-            sig = (item["age"], item["job"])
-            if item["name"] not in persona_names and sig not in signatures:
-                signatures.add(sig)
-                persona_names.add(item["name"])
-                personas.append(item)
-        if len(personas) < 3:
-            # Similarity filtering protects diversity, but it must never reduce a
-            # required section below its structural minimum. The deterministic
-            # fallback already contains distinct named personas, so use remaining
-            # names as the final cardinality guard.
-            for item in _fallback_section("userPersonas", feature_list, user_query)["userPersonas"]:
-                if len(personas) >= 3:
-                    break
-                if item["name"] not in persona_names:
-                    sig = (item["age"], item["job"])
-                    if sig in signatures:
-                        continue
-                    signatures.add(sig)
-                    persona_names.add(item["name"])
-                    personas.append(item)
-        out["userPersonas"] = personas[:3]
+        out = audit_items(out, user_query, market_data)
 
         tech_fallback = _fallback_section("techStack", feature_list, user_query)["techStack"]
         tech_stack = out.get("techStack") if isinstance(out.get("techStack"), dict) else {}
         out["techStack"] = {
-            key: (value if value and not has_placeholder(value) and not contamination_reasons(value) else tech_fallback[key])
+            key: (value if value and not has_placeholder(value) and not contamination_reasons(value, technical=True) else tech_fallback[key])
             for key, value in ((key, tech_stack.get(key)) for key in tech_fallback)
         }
 
@@ -1715,6 +1561,7 @@ class PrdAgent:
             "rationale": scope.get("rationale") or _fallback_section("mvpScope", feature_list, user_query)["mvpScope"]["rationale"],
         }
         cls._reconcile_priorities(out["coreFeatures"], out["mvpScope"])
+        out["_qualityFallbacks"] = list(dict.fromkeys(quality_fallbacks))
         return out
 
     @staticmethod
@@ -1736,6 +1583,8 @@ class PrdAgent:
         field = {"goal": "goals", "kpi": "kpi", "persona": "userPersonas",
                  "release": "releaseSchedule", "core_feature": "coreFeatures"}[kind]
         values = fallback.get(field) or []
+        if kind in {"kpi", "persona"}:
+            return {}
         value = values[min(index, len(values) - 1)] if values else "자동 생성 실패 — 수동 보완 필요"
         return {"value": value} if kind == "goal" else dict(value)
 
@@ -1759,7 +1608,7 @@ class PrdAgent:
         return True
 
     @classmethod
-    def _item_quality_issues(cls, kind: str, item: dict | None, raw: str, item_context: str) -> list[str]:
+    def _item_quality_issues(cls, kind: str, item: dict | None, raw: str, item_context: str, market_data="", user_query="") -> list[str]:
         issues: list[str] = []
         if not cls._valid_item(kind, item):
             issues.append("필수 필드 누락 또는 형식 오류")
@@ -1767,18 +1616,9 @@ class PrdAgent:
         if item and has_placeholder(item):
             issues.append("placeholder 또는 미정 값 포함")
         if kind == "kpi" and item:
-            if "→" not in str(item.get("target") or ""):
-                issues.append("KPI target이 현재값 → 목표값 형식이 아님")
-            direction = item_context.split(":", 1)[0]
-            expected = {
-                "획득": ("신규", "유입", "획득"), "활성": ("활성", "온보딩", "핵심 기능"),
-                "전환": ("전환", "완료", "성공"), "단기 리텐션": ("7일", "단기", "재방문"),
-                "장기 리텐션": ("30일", "장기", "리텐션"), "품질": ("정확", "성공", "품질"),
-                "비즈니스": ("시간", "비용", "매출", "성과", "절감"),
-            }.get(direction, ())
-            metric_text = f"{item.get('metric', '')} {item.get('measurementMethod', '')}"
-            if expected and not any(token in metric_text for token in expected):
-                issues.append("할당된 KPI 관점과 지표 내용이 불일치")
+            issues.extend(kpi_issues(item, item_context, market_data, require_measurement=True))
+        if kind == "persona" and item:
+            issues.extend(persona_issues(item, user_query))
         if kind == "core_feature" and item:
             content = f"{item.get('description', '')} {' '.join(item.get('requirements') or [])}"
             if relevance_score(item_context, content) < 0.2:
@@ -1791,9 +1631,10 @@ class PrdAgent:
         labels = {
             "goal": {"GOAL": "value"},
             "kpi": {"METRIC": "metric", "TARGET": "target", "BASIS": "basis",
-                    "MEASUREMENT_METHOD": "measurementMethod", "FREQUENCY": "frequency"},
+                    "MEASUREMENT_METHOD": "measurementMethod", "FREQUENCY": "frequency", "DIMENSION": "dimension",
+                    "EVENT": "event", "NUMERATOR": "numerator", "DENOMINATOR": "denominator", "UNIT": "unit", "WINDOW": "window"},
             "persona": {"NAME": "name", "AGE": "age", "JOB": "job", "TECH_LEVEL": "techLevel",
-                        "GOAL": "goal", "PAIN_POINT": "painPoint", "USAGE_PATTERN": "usagePattern"},
+                        "GOAL": "goal", "PAIN_POINT": "painPoint", "USAGE_PATTERN": "usagePattern", "ROLE": "role"},
             "release": {"DATE": "date", "MILESTONE": "milestone", "DESCRIPTION": "description",
                         "DELIVERABLES": "deliverables"},
             "core_feature": {"NAME": "name", "DESCRIPTION": "description", "PRIORITY": "priority",
@@ -1848,6 +1689,15 @@ class PrdAgent:
                 result[field] = [x.strip() for x in re.split(r"\s*\|\|\|\s*|\s*;\s*", result[field]) if x.strip()]
         if kind == "kpi" and result.get("target"):
             result["target"] = normalize_target_arrow(result["target"])
+            result.setdefault("dimension", assigned_dimension(item_context))
+            if any(key in result for key in ("event", "numerator", "denominator", "unit", "window")):
+                result["measurement"] = {key: result.pop(key, "") for key in ("event", "numerator", "denominator", "unit", "window")}
+                if result["measurement"]["denominator"] in {"없음", "해당 없음", "none"}:
+                    result["measurement"]["denominator"] = None
+        if kind == "persona":
+            result["segmentId"] = segment_id(item_context)
+            result["role"] = item_context.split(";", 1)[0].removeprefix("대상 사용자: ").strip() or result.get("role", "")
+            result["assumption"] = True
         if kind == "core_feature" and not result.get("requirements") and "|||" in str(result.get("description") or ""):
             parts = [x.strip() for x in str(result["description"]).split("|||") if x.strip()]
             result["description"] = parts[0]
@@ -1870,6 +1720,7 @@ class PrdAgent:
         index = int(state.get("item_index", 0))
         label = f"PRD_{kind.upper()}_{index + 1}"
         item = None
+        used_fallback = False
         retry_reasons: list[str] = []
         # 의미 이탈은 같은 모델이 반복하는 경향이 강하므로 즉시 fallback하고,
         # 라벨/SELF_CHECK 누락처럼 형식 교정 가능한 경우에만 한 번 재시도한다.
@@ -1881,7 +1732,8 @@ class PrdAgent:
             if state.get("dump"):
                 state["dump"].log_raw(label, attempt + 1, raw)
             parsed = self._parse_item_text(kind, raw, state.get("item_context", ""), index)
-            retry_reasons = self._item_quality_issues(kind, parsed, raw, state.get("item_context", ""))
+            retry_reasons = self._item_quality_issues(kind, parsed, raw, state.get("item_context", ""),
+                                                    state.get("market_data", ""), state.get("user_query", ""))
             if not retry_reasons:
                 item = parsed
                 break
@@ -1894,8 +1746,16 @@ class PrdAgent:
                 break
 
         if item is None:
-            logger.warning("%s 단일 항목 최종 검증 실패 — 결정론적 fallback 사용", label)
+            logger.warning("%s 단일 항목 최종 검증 실패 — %s", label,
+                           "생성값 제외 및 사유 기록" if kind in {"kpi", "persona"} else "결정론적 fallback 사용")
             item = self._fallback_item(kind, index, state.get("item_context", ""), state)
+            used_fallback = True
+
+        if used_fallback and kind in {"kpi", "persona"}:
+            target = "kpi" if kind == "kpi" else "userPersonas"
+            return {"sections": {target: [],
+                                 "_qualityDiagnostics": [{"section": target, "index": index, "stage": "worker",
+                                                          "reasons": retry_reasons, "action": "omitted_not_fabricated"}]}}
 
         item["_order"] = index
         target = {
@@ -1903,7 +1763,7 @@ class PrdAgent:
             "release": "releaseSchedule", "core_feature": "coreFeatures",
         }[kind]
         value = item.pop("value") if kind == "goal" else item
-        return {"sections": {target: [value]}}
+        return {"sections": {target: [value], **({"_qualityFallbacks": [f"{target}/{index}:worker_validation_failed"]} if used_fallback else {})}}
 
     @staticmethod
     def _build_item_prompt(ctx: dict, kind: str, index: int, item_context: str) -> str:
@@ -1925,13 +1785,18 @@ class PrdAgent:
                 "GOAL: 담당 방향의 문제·행동·기대 성과가 드러나는 단일 목표 문장"
             ),
             "kpi": (
-                "METRIC: 항목 방향과 직접 연결된 지표명\nTARGET: 현재값 → 목표값\n"
+                f"DIMENSION: {assigned_dimension(item_context)}\n"
+                "METRIC: 항목 방향과 직접 연결된 지표명\nTARGET: 숫자와 단위를 가진 현재값 → 숫자와 단위를 가진 목표값. 화살표 양쪽에 숫자가 필수이며 라벨·미측정 같은 말만 쓰지 마세요\n"
                 "BASIS: 외부 수치를 쓰면 제공된 시장 데이터의 원문 URL·수치를 함께 쓰고, 그렇지 않으면 "
-                "'제품 출시 전 기준선 0에서 시작하는 내부 운영 목표'라고 작성\n"
-                "MEASUREMENT_METHOD: 측정 방법\nFREQUENCY: 일간/주간/월간 중 하나"
+                "'검증할 내부 운영 목표'로 표시하고 가설 수치를 실제 관측값처럼 쓰지 마세요. 신규 가입·비율의 출시 전 기준선 0과 시간·비용의 사전 측정 또는 가설 기준선을 구분하세요\n"
+                "MEASUREMENT_METHOD: 측정 방법\nFREQUENCY: 일간/주간/월간 중 하나\n"
+                "EVENT: 실제 핵심 행동의 단일 영문 snake_case 이벤트명. 여러 이벤트를 자연어로 합치지 마세요\n"
+                "NUMERATOR: 분자에 해당하는 집계 건수나 합계만 작성하고 분모로 나누는 계산식은 넣지 마세요\n"
+                "DENOMINATOR: 비율이면 분모 집단, 평균이면 완료 과업/세션 건수. 합계·단순 건수 지표에만 없음\nUNIT: %, 초, 분, 원, 건 등 실제 단위\n"
+                "WINDOW: 관측 기간 및 코호트 조건. 7/30일 재방문은 정확히 그 날 재방문인지 기간 내 재방문인지 하나로 통일하세요. 시간 절감은 비교 기준선의 수집 방법도 명시하세요. 외부 근거가 없으면 목표는 검증할 내부 가설이며 실제 관측값으로 주장하지 마세요."
             ),
             "persona": (
-                "NAME: 가상 인물 이름\nAGE: 연령대\nJOB: 직업\nTECH_LEVEL: 높음/중간/낮음\n"
+                "ROLE: 할당된 실제 대상 사용자 역할\nNAME: 가상 인물 이름\nAGE: 명시된 연령대 또는 연령 무관\nJOB: 명시된 직업 또는 직업 무관\nTECH_LEVEL: 높음/중간/낮음\n"
                 "GOAL: 사용 목표 2문장\nPAIN_POINT: 주요 불편 2문장\nUSAGE_PATTERN: 사용 패턴 2문장"
             ),
             "release": (
@@ -1986,6 +1851,7 @@ class PrdAgent:
                 "feature_list": ctx.get("feature_list") or [],
                 "feature_count": ctx["feature_count"],
                 "user_query": ctx["user_query"],
+                "market_data": ctx.get("market_data", ""),
             })
             for kind, index, item_context in specs
         ]

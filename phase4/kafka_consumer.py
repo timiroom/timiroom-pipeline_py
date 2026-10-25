@@ -7,6 +7,7 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import OffsetAndMetadata, TopicPartition
 
 from phase1.document_ingestion import DocumentIngestionService
+from phase4.documents import event_documents
 from phase4.event import PipelineResultEvent
 
 logger = logging.getLogger(__name__)
@@ -144,31 +145,10 @@ class KafkaConsumerService:
     async def _process(self, raw_event: dict) -> None:
         event = PipelineResultEvent.model_validate(raw_event)
         logger.info("Kafka 메시지 수신 — pipelineId: %s", event.pipeline_id)
-        base_meta = {
-            "pipeline_id": event.pipeline_id,
-            "project_name": event.project_name,
-            "platform": event.platform,
-            "tech_stack": event.tech_stack,
-            "query": event.user_query,
-        }
-        documents = [
-            (event.prd_document, {**base_meta, "type": "prd"}),
-            (event.db_schema, {**base_meta, "type": "erd"}),
-            (event.api_spec, {**base_meta, "type": "api"}),
-            ("\n".join(event.feature_list), {**base_meta, "type": "features"}),
-        ]
-        if event.openapi_spec.strip() and event.openapi_spec.strip() != "{}":
-            documents.append((event.openapi_spec, {**base_meta, "type": "openapi"}))
-        if event.feature_spec_document.strip() and event.feature_spec_document.strip() != "{}":
-            documents.append((event.feature_spec_document, {**base_meta, "type": "feature_spec"}))
-        if event.feature_registry:
-            documents.append((json.dumps(event.feature_registry, ensure_ascii=False), {**base_meta, "type": "feature_registry"}))
-        if event.market_research.strip():
-            documents.append((event.market_research, {**base_meta, "type": "market_research"}))
-
-        saved = await self._ingestion.ingest_event(documents)
-        if saved <= 0:
-            raise RuntimeError(f"pipelineId {event.pipeline_id}: 저장된 청크가 없습니다")
+        saved = await self._ingestion.ingest_event(event_documents(event))
+        if saved == 0:
+            logger.info("중복 이벤트 처리 생략 — pipelineId: %s, 기존 청크 유지", event.pipeline_id)
+            return
         logger.info("처리 완료 — pipelineId: %s, 총 %d chunks 저장", event.pipeline_id, saved)
 
     async def _close_consumer(self) -> None:

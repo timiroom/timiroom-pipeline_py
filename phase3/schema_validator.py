@@ -4,21 +4,30 @@ import re
 from dataclasses import dataclass, field
 
 from phase2.agent_contract import (
-    bind_endpoint_features,
     canonical_api_method,
     endpoint_feature_ids,
     is_pre_auth_route,
 )
 from phase2.agents.api_agent import _canonical_api_path, _invalid_paths
 from phase2.agents.dba_agent import USER_REFERENCE_STEMS
+from phase2.artifact_shapes import shape_issues
+from phase2.contract_quality import public_read_contract
 from phase2.feature_coverage import strictly_uncovered_features, uncovered_features
 from phase2.feature_registry import (
     missing_api_contract_features,
     missing_db_contract_features,
 )
-from phase2.feature_scope import backend_features
+from phase2.feature_scope import artifact_required, backend_features
+from phase2.fk_validation import foreign_key_issues
 from phase2.json_utils import try_parse_json
+from phase2.mvp_policy import dependency_issues
 from phase2.openapi_spec import build_openapi_document, validate_openapi_document
+from phase2.operation_contract import (
+    auxiliary_only_contract,
+    cross_contract_issues,
+    is_public_session_entry,
+)
+from phase2.validation_contract import artifact_revision, issue_detail, issue_identity
 
 logger = logging.getLogger(__name__)
 
@@ -78,29 +87,61 @@ class SchemaValidator:
         codes: list[str] = []
         targets: set[str] = set()
         blocker_details: list[dict] = []
+        revision = artifact_revision(db_schema, api_spec, prd_document, feature_registry)
 
         def add(code: str, target: str, message: str, **artifact: object) -> None:
+            detail = issue_detail(code, target, message, revision=revision, **artifact)
+            if any(issue_identity(item) == issue_identity(detail) for item in blocker_details):
+                return
+            blocker_details.append(detail)
+            if detail.get("severity") == "WARNING":
+                return
             if code not in codes:
                 codes.append(code)
             if message not in errors:
                 errors.append(message)
             targets.add(target)
-            detail = {
-                "code": code,
-                "repairTarget": target,
-                "message": message,
-            }
-            detail.update({key: value for key, value in artifact.items() if value is not None})
-            if detail not in blocker_details:
-                blocker_details.append(detail)
 
         db, normalized_db = self._parse_object(db_schema, "DB 스키마", "DB_JSON", "db", add)
         api, normalized_api = self._parse_object(api_spec, "API 스펙", "API_JSON", "api", add)
         prd, normalized_prd = (None, None) if legacy_specs else self._parse_object(
             prd_document, "PRD 문서", "PRD_JSON", "prd", add,
         )
+        def safe(domain, document):
+            if document is None:
+                return None
+            issues = shape_issues(domain, document)
+            for issue in issues:
+                code = issue["code"]
+                if re.fullmatch(r"/tables/\d+", issue["pointer"]):
+                    code = "DB_TABLE_INVALID"
+                elif re.fullmatch(r"/endpoints/\d+", issue["pointer"]):
+                    code = "API_ENDPOINT_INVALID"
+                key = issue["artifactKey"]
+                match = re.match(r"^/(tables|endpoints)/(\d+)(?:/|$)", issue["pointer"])
+                if match:
+                    value = (document.get(match.group(1)) or [])[int(match.group(2))]
+                    if isinstance(value, dict):
+                        key = str(value.get("name") or key) if domain == "db" else f"{value.get('method', 'GET')} {value.get('path', '')}"
+                add(code, issue["domain"], f"{key} (at {issue['pointer']}): {issue['message']}", artifactKey=key, pointer=issue["pointer"])
+            return None if issues else document
+        db, api, prd = safe("db", db), safe("api", api), safe("prd", prd)
+        if feature_registry:
+            registry_issues = shape_issues("registry", feature_registry)
+            for issue in registry_issues:
+                add(issue["code"], "prd", issue["message"], artifactKey="registry", pointer=issue["pointer"])
+            if registry_issues:
+                feature_registry = []
+        if feature_specs:
+            spec_issues = shape_issues("registry", feature_specs)
+            for issue in spec_issues:
+                add(issue["code"], "prd", issue["message"], artifactKey="feature_specs", pointer=issue["pointer"])
+            if spec_issues:
+                feature_specs = []
 
-        raw_features = feature_list or []
+        raw_features = feature_list if isinstance(feature_list, list) else []
+        if feature_registry:
+            raw_features = [item.get("name") for item in feature_registry]
         cleaned_features = [value.strip() for value in raw_features if isinstance(value, str) and value.strip()]
         if not cleaned_features:
             add("FEATURES_EMPTY", "pm", "featureList: 기능 목록이 비어있습니다")
@@ -115,10 +156,23 @@ class SchemaValidator:
             self._check_api(api, cleaned_features, add, feature_registry)
         if prd is not None:
             self._check_prd(prd, cleaned_features, add, feature_registry)
+        if feature_registry:
+            self._check_registry_invariants(feature_registry, add)
         if db is not None and api is not None:
             self._check_cross_artifact(db, api, add)
+            for code, domain, detail in cross_contract_issues(feature_registry or [], db, api, prd or {}):
+                fid = next((str(item.get("featureId") or item.get("id")) for item in feature_registry or []
+                            if detail.startswith(str(item.get("featureId") or item.get("id")) + ":")), "")
+                add(code, domain, detail, featureId=fid, repairScope="feature_contract")
             if feature_registry:
                 self._check_contract_graph(db, api, feature_registry, add)
+            from phase2.agent_contract import IssueSeverity, classify_issue
+            from phase2.agents.qa_agent import QaAgent
+            semantics = QaAgent._check_cross_document_semantics(prd or {}, db, api, cleaned_features) if feature_registry else ([], [], [])
+            for domain, messages in zip(("db", "api", "prd"), semantics, strict=True):
+                for message in messages:
+                    severity = "WARNING" if classify_issue(message) == IssueSeverity.WARNING or message.startswith("상호 참조 순환 FK:") else "BLOCKER"
+                    add("SEMANTIC_CONTRACT", domain, message, severity=severity)
         if db is not None and prd is not None:
             self._check_prd_db_entities(prd, db, add)
 
@@ -144,7 +198,7 @@ class SchemaValidator:
 
     @staticmethod
     def _parse_object(value: str, label: str, code: str, target: str, add):
-        if not value or not value.strip():
+        if not isinstance(value, str) or not value.strip():
             add(code, target, f"{label}: 값이 비어있습니다")
             return None, None
         try:
@@ -159,6 +213,8 @@ class SchemaValidator:
     @staticmethod
     def _check_db(data: dict, feature_list: list[str], add, feature_registry=None) -> None:
         tables = data.get("tables")
+        if tables == [] and feature_registry and not any(artifact_required(item, "db") for item in feature_registry):
+            return
         if not isinstance(tables, list) or not tables:
             add("DB_TABLES_REQUIRED", "db", "DB 스키마: tables는 비어있지 않은 배열이어야 합니다")
             return
@@ -173,6 +229,30 @@ class SchemaValidator:
                 add("DB_TABLE_NAME_REQUIRED", "db", f"DB 스키마: tables[{index}].name이 비어있습니다")
                 continue
             table_names.append(name)
+            if feature_registry:
+                valid_ids = {
+                    str(item.get("featureId") or item.get("id") or "").strip()
+                    for item in feature_registry if isinstance(item, dict)
+                }
+                table_feature_ids = {
+                    str(value).strip() for value in table.get("featureIds") or []
+                    if str(value).strip()
+                }
+                dependency_ids = set(table.get("dependencyFeatureIds") or [])
+                has_fk = any("REFERENCES" in str(column.get("constraints") or "").upper()
+                             for column in table.get("columns") or [] if isinstance(column, dict))
+                if not table_feature_ids and not (has_fk and dependency_ids and dependency_ids <= valid_ids):
+                    add(
+                        "DB_TABLE_FEATURE_ID_REQUIRED", "db",
+                        f"DB 스키마: {name}에 featureId 매핑이 없습니다",
+                        artifactKey=name, table=name, repairScope="table",
+                    )
+                elif not table_feature_ids <= valid_ids:
+                    add(
+                        "DB_TABLE_FEATURE_NOT_FOUND", "db",
+                        f"DB 스키마: {name}에 Registry에 없는 featureId가 있습니다 — {sorted(table_feature_ids - valid_ids)}",
+                        artifactKey=name, table=name, repairScope="table",
+                    )
             columns = table.get("columns")
             if not isinstance(columns, list) or not columns:
                 add("DB_COLUMNS_REQUIRED", "db", f"DB 스키마: {name}.columns가 비어있습니다")
@@ -238,6 +318,8 @@ class SchemaValidator:
     @staticmethod
     def _check_api(data: dict, feature_list: list[str], add, feature_registry=None) -> None:
         endpoints = data.get("endpoints")
+        if endpoints == [] and feature_registry and not any(artifact_required(item, "api") for item in feature_registry):
+            return
         if not isinstance(endpoints, list) or not endpoints:
             add("API_ENDPOINTS_REQUIRED", "api", "API 스펙: endpoints는 비어있지 않은 배열이어야 합니다")
             return
@@ -256,6 +338,10 @@ class SchemaValidator:
             else:
                 keys.append((method, path))
             for field_name in ("description", "successResponse", "errorCodes"):
+                if field_name == "successResponse" and (endpoint.get("responseSchema") or str(endpoint.get("successStatus")) == "204"):
+                    continue
+                if field_name == "errorCodes" and endpoint.get("responses"):
+                    continue
                 if not str(endpoint.get(field_name, "")).strip():
                     add(
                         "API_FIELDS_REQUIRED",
@@ -280,7 +366,19 @@ class SchemaValidator:
             for endpoint in endpoints:
                 if not isinstance(endpoint, dict):
                     continue
+                method = str(endpoint.get("method") or "GET").upper()
+                path = str(endpoint.get("path") or "")
                 feature_ids = endpoint_feature_ids(endpoint)
+                if method == "GET" and re.search(
+                    r"/(?:retry|approve|reject|cancel|confirm|publish|complete)(?:/|$)",
+                    str(path), re.IGNORECASE,
+                ):
+                    add(
+                        "API_UNSAFE_GET_ACTION", "api",
+                        f"API 스펙: 상태 변경 명령에 GET을 사용할 수 없습니다 — {method} {path}",
+                        artifactKey=f"{method} {path}", method=method, path=path,
+                        repairScope="endpoint",
+                    )
                 if feature_ids and all(feature_id in registry_ids for feature_id in feature_ids):
                     continue
                 method = str(endpoint.get("method") or "GET").upper()
@@ -320,6 +418,53 @@ class SchemaValidator:
                 add("API_FEATURE_COVERAGE", "api", f"API 스펙: 기능에 대응하는 endpoint가 없어 보입니다 — {missing}")
         for issue in validate_openapi_document(build_openapi_document(data)):
             add("OPENAPI_INVALID", "api", f"OpenAPI 스펙: {issue}")
+
+    @staticmethod
+    def _check_registry_invariants(registry: list[dict], add) -> None:
+        items = [item for item in registry if isinstance(item, dict)]
+        for message in dependency_issues(items):
+            add(message.split(":", 1)[0], "prd", message)
+        for item in items:
+            if str(item.get("releaseScope") or "mvp").lower() != "mvp":
+                add("MVP_RELEASE_SCOPE_CONFLICT", "prd", f"Excluded feature in active registry: {item.get('featureId')}")
+        if len(items) > 12:
+            add(
+                "FEATURE_TOTAL_LIMIT_EXCEEDED", "pm",
+                f"Feature Registry: MVP 기능은 최대 12개여야 합니다 — {len(items)}개",
+            )
+        p0_count = sum(
+            1 for item in items if str(item.get("priority") or "").upper() == "P0"
+        )
+        if items and not 0 <= p0_count <= 5:
+            add(
+                "P0_COUNT_OUT_OF_RANGE", "pm",
+                f"Feature Registry: P0 기능은 최대 5개여야 합니다 — {p0_count}개",
+            )
+        seen: set[str] = set()
+        for item in items:
+            feature_id = str(item.get("featureId") or item.get("id") or "").strip()
+            if not feature_id or feature_id in seen:
+                add(
+                    "FEATURE_COUNT_MISMATCH", "pm",
+                    f"Feature Registry: 비어 있거나 중복된 featureId — {feature_id or '(없음)'}",
+                )
+            seen.add(feature_id)
+            if re.match(r"^(?:feature[_-]?\d+|supporting\.\d+|intent\.)", feature_id):
+                add("FEATURE_ID_NON_SEMANTIC", "pm", f"Feature Registry: 도메인.동작 형식의 ID가 필요합니다 — {feature_id}")
+
+            contracts = [
+                contract for contract in item.get("apiContract") or []
+                if isinstance(contract, dict)
+            ]
+            if any(contract.get("featureId") and contract["featureId"] != feature_id for contract in contracts):
+                add("FEATURE_CONTRACT_OWNER_MISMATCH", "pm", f"Feature Registry: 내부 API 계약의 featureId가 소유 기능과 다릅니다 — {feature_id}")
+            if auxiliary_only_contract(item, items):
+                add(
+                    "API_AUXILIARY_ONLY_CONTRACT", "api",
+                    f"Feature Registry: 보조 endpoint만 존재합니다 — {feature_id}",
+                    artifactKey=feature_id, featureId=feature_id,
+                    repairScope="feature_contract",
+                )
     @staticmethod
     def _check_prd(data: dict, feature_list: list[str], add, feature_registry=None) -> None:
         missing_fields = sorted(_REQUIRED_PRD_FIELDS - set(data))
@@ -332,6 +477,10 @@ class SchemaValidator:
         core_texts = []
         for feature in core_features:
             if isinstance(feature, dict):
+                match = next((item for item in feature_registry or [] if isinstance(item, dict)
+                              and item.get("name") == feature.get("name")), None)
+                if match and feature.get("priority") and match.get("priority") and feature["priority"] != match["priority"]:
+                    add("PRD_FEATURE_PRIORITY_MISMATCH", "prd", f"PRD/Feature Spec 우선순위 불일치: {feature.get('name')}")
                 core_texts.extend([
                     str(feature.get("name", "")),
                     str(feature.get("description", "")),
@@ -370,6 +519,8 @@ class SchemaValidator:
 
     @staticmethod
     def _check_cross_artifact(db: dict, api: dict, add) -> None:
+        for issue in foreign_key_issues(db):
+            add(issue["code"], "db", issue["message"], artifactKey=issue["artifactKey"], pointer=issue["pointer"])
         endpoints = api.get("endpoints") if isinstance(api.get("endpoints"), list) else []
         authentication = str(api.get("authentication", "")).strip()
         if any(endpoint.get("authRequired") is True for endpoint in endpoints if isinstance(endpoint, dict)) and not authentication:
@@ -474,7 +625,6 @@ class SchemaValidator:
         }
         endpoints = [item for item in api.get("endpoints", []) if isinstance(item, dict)]
         endpoint_keys_by_feature: dict[str, set[tuple[str, str]]] = {}
-        endpoint_by_key: dict[tuple[str, str], dict] = {}
         for endpoint in endpoints:
             key = (
                 str(endpoint.get("method") or "GET").upper(),
@@ -495,7 +645,6 @@ class SchemaValidator:
                     )
                     continue
                 endpoint_keys_by_feature.setdefault(feature_id, set()).add(key)
-            endpoint_by_key.setdefault(key, endpoint)
 
         table_features: dict[str, set[str]] = {}
         for table_name, table in tables.items():
@@ -522,17 +671,7 @@ class SchemaValidator:
             }
             actual_api = endpoint_keys_by_feature.get(feature_id, set())
             missing_api = expected_api - actual_api
-            # LLM이 featureId만 잘못 붙였지만 method/path 계약 자체는
-            # 존재하는 경우, 동일 계약 endpoint를 결정론적으로 이 feature에
-            # 재연결한다. 실제 route가 없는 경우에만 blocker로 남긴다.
-            for key in list(missing_api):
-                endpoint = endpoint_by_key.get(key)
-                if endpoint is not None:
-                    bind_endpoint_features(
-                        endpoint, [*endpoint_feature_ids(endpoint), feature_id],
-                    )
-                    endpoint_keys_by_feature.setdefault(feature_id, set()).add(key)
-                    missing_api.discard(key)
+            # Validation is read-only; mapping repairs belong to the API agent.
             if missing_api:
                 add(
                     "CONTRACT_GRAPH_API_DB_DISCONNECTED",
@@ -558,7 +697,7 @@ class SchemaValidator:
             linked_tables = {
                 table_name for table_name, ids in table_features.items() if feature_id in ids
             }
-            if expected_tables and not expected_tables & linked_tables:
+            if expected_tables - linked_tables:
                 add(
                     "CONTRACT_GRAPH_DB_FEATURE_DISCONNECTED",
                     "db",
@@ -622,6 +761,8 @@ class SchemaValidator:
             if not isinstance(spec, dict) or not spec.get("name"):
                 continue
             name = str(spec["name"])
+            if not artifact_required(spec, "api") and not artifact_required(spec, "db"):
+                continue
             ownership = spec.get("ownership") if isinstance(spec.get("ownership"), dict) else {}
             scope = str(ownership.get("scope") or "").upper()
             owner_entity = str(ownership.get("ownerEntity") or "users")
@@ -648,9 +789,9 @@ class SchemaValidator:
                 errors.append(f"기능 계약: 상태 전이 누락 — {name}")
             db_mapping = db_mappings.get(name)
             table_name = str((db_mapping or {}).get("table") or "")
-            if not db_mapping or not table_name or table_name not in tables:
+            if artifact_required(spec, "db") and (not db_mapping or not table_name or table_name not in tables):
                 errors.append(f"DB 기능 매핑 누락: {name}")
-            elif scope in {"USER", "SHARED"} and table_name not in {owner_entity, "refresh_tokens"}:
+            elif artifact_required(spec, "db") and scope in {"USER", "SHARED"} and table_name not in {owner_entity, "refresh_tokens"}:
                 columns = {
                     str(column.get("name") or ""): str(column.get("constraints") or "")
                     for column in tables[table_name].get("columns") or [] if isinstance(column, dict)
@@ -665,7 +806,7 @@ class SchemaValidator:
                     )
             api_mapping = api_mappings.get(name)
             operations = (api_mapping or {}).get("operations") or []
-            if not operations:
+            if not operations and artifact_required(spec, "api"):
                 errors.append(f"API 기능 매핑 누락: {name}")
             for operation in operations:
                 if not isinstance(operation, dict):
@@ -675,14 +816,22 @@ class SchemaValidator:
                 if not endpoint:
                     errors.append(f"API 기능 매핑 대상 없음: {name} → {key[0]} {key[1]}")
                     continue
-                if scope in {"USER", "SHARED"} and not (
+                if scope in {"USER", "SHARED"} and not endpoint.get("authRequired") and not (
                     key[1].endswith(("/signup", "/login", "/refresh")) or is_pre_auth_route(key[1])
+                    or any(contract.get("method") == key[0] and contract.get("path") == key[1]
+                           and is_public_session_entry(contract, spec) for contract in spec.get("apiContract") or [])
+                    or public_read_contract(spec, endpoint)
                 ):
-                    if not endpoint.get("authRequired"):
-                        errors.append(f"API 사용자 소유 기능 인증 누락: {key[0]} {key[1]}")
-                for field in ("requestBody", "successResponse", "errorCodes"):
-                    if not str(endpoint.get(field) or "").strip():
-                        errors.append(f"API {field} 계약 누락: {key[0]} {key[1]}")
+                    errors.append(f"API 사용자 소유 기능 인증 누락: {key[0]} {key[1]}")
+                for field_name in ("requestBody", "successResponse", "errorCodes"):
+                    if field_name == "requestBody" and (key[0] in {"GET", "DELETE", "HEAD"} or endpoint.get("requestSchema")):
+                        continue
+                    if field_name == "successResponse" and (endpoint.get("responseSchema") or str(endpoint.get("successStatus")) == "204"):
+                        continue
+                    if field_name == "errorCodes" and endpoint.get("responses"):
+                        continue
+                    if not str(endpoint.get(field_name) or "").strip():
+                        errors.append(f"API {field_name} 계약 누락: {key[0]} {key[1]}")
                 if key[0] in {"POST", "PATCH", "PUT", "DELETE"} and not endpoint.get("transactionRules"):
                     errors.append(f"API 트랜잭션 계약 누락: {key[0]} {key[1]}")
         return list(dict.fromkeys(errors))

@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 import logging
 import re
 import uuid
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from common.document_chunk import DocumentChunk
-from .embedding_service import EmbeddingService
+if TYPE_CHECKING:
+    from .embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 

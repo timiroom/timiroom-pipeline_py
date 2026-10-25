@@ -3,8 +3,9 @@ import logging
 import logging.config
 import sys
 
-import psycopg2
 import httpx
+import psycopg2
+
 
 # Windows cp949 터미널에서 UTF-8 출력 강제.
 # 기존 스트림을 새 TextIOWrapper로 감싸면 pytest 캡처 스트림의 소유권을
@@ -22,8 +23,8 @@ _configure_utf8_stdio()
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
 
 from common.exception_handler import register_exception_handlers
@@ -48,9 +49,9 @@ from phase1.semantic_chunking import SemanticChunkingService
 from phase1.session_vector_store import SessionVectorStore
 from phase2.agents.api_agent import ApiAgent
 from phase2.agents.dba_agent import DbaAgent
+from phase2.agents.feature_spec_agent import FeatureSpecAgent
 from phase2.agents.pm_agent import PmAgent
 from phase2.agents.prd_agent import PrdAgent
-from phase2.agents.feature_spec_agent import FeatureSpecAgent
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent
 from phase2.llm_runtime import LlmRuntime
@@ -59,8 +60,8 @@ from phase2.sse_service import PipelineProgressService
 from phase3.retry_service import RetryService
 from phase3.schema_validator import SchemaValidator
 from phase3.validation_service import ValidationService
-from phase4.kafka_consumer import KafkaConsumerService
 from phase4.kafka_connection import build_kafka_client_options
+from phase4.kafka_consumer import KafkaConsumerService
 from phase4.kafka_producer import KafkaProducerService
 
 # ── 로깅 설정 (requestId 컨텍스트 포함) ──────────────────────────
@@ -81,6 +82,7 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("aiokafka").setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ── API 클라이언트 ────────────────────────────────────────────────
 
@@ -181,7 +183,7 @@ search_agent = SearchAgent(
 )
 pm_agent = PmAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
 prd_agent = PrdAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
-feature_spec_agent = FeatureSpecAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
+feature_spec_agent = FeatureSpecAgent(openai_client, settings.feature_spec_model or settings.openai_chat_model, runtime=phase2_llm_runtime)
 dba_agent = DbaAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
 api_agent = ApiAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
 qa_agent = QaAgent(openai_client, settings.openai_chat_model, runtime=phase2_llm_runtime)
@@ -227,6 +229,8 @@ kafka_producer_service = KafkaProducerService(
     db_url=settings.db_url,
     max_publish_retry=settings.kafka_publish_max_retry,
     kafka_client_options=kafka_client_options,
+    ingestion_service=document_ingestion_service,
+    storage_timeout_seconds=settings.phase4_storage_timeout_seconds,
 )
 kafka_consumer_service = KafkaConsumerService(
     bootstrap_servers=settings.kafka_bootstrap_servers,

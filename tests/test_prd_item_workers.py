@@ -263,11 +263,11 @@ def test_legacy_full_api_output_is_reduced_to_non_destructive_patches():
     assert {x["path"] for x in result["endpoints"]} == {"/old", "/new"}
 
 
-def test_prd_audit_always_restores_three_distinct_personas():
+def test_prd_audit_records_missing_personas_without_inventing_three_people():
     audited = PrdAgent._audit_sections(
         {"userPersonas": []}, ["문서 등록"], "웹에서 문서를 등록하는 서비스", "",
     )
 
     personas = audited["userPersonas"]
-    assert len(personas) == 3
-    assert len({item["name"] for item in personas}) == 3
+    assert personas == []
+    assert any(item["section"] == "userPersonas" for item in audited["_qualityDiagnostics"])

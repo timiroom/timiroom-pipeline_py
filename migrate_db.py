@@ -9,6 +9,32 @@ from psycopg2 import sql
 from config.settings import settings
 
 
+def remove_global_content_hash_uniqueness(cur, table_name: str) -> None:
+    """Replace legacy hash-only uniqueness, including custom and partial indexes."""
+    cur.execute(
+        """
+        SELECT tn.nspname, t.relname, ixn.nspname, ix.relname, con.conname
+        FROM pg_index i
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        JOIN pg_class ix ON ix.oid = i.indexrelid
+        JOIN pg_namespace ixn ON ixn.oid = ix.relnamespace
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
+        LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid AND con.contype = 'u'
+        WHERE i.indrelid = %s::regclass AND i.indisunique AND NOT i.indisprimary
+          AND i.indnkeyatts = 1 AND i.indexprs IS NULL AND a.attname = 'content_hash'
+        """,
+        (table_name,),
+    )
+    for table_schema, resolved_table, index_schema, index_name, constraint in cur.fetchall():
+        if constraint:
+            cur.execute(sql.SQL("ALTER TABLE {} DROP CONSTRAINT {}").format(
+                sql.Identifier(table_schema, resolved_table), sql.Identifier(constraint),
+            ))
+        else:
+            cur.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(index_schema, index_name)))
+
+
 def main() -> None:
     table_name = settings.get_rag_document_table()
     table = sql.Identifier(table_name)
@@ -45,16 +71,11 @@ def main() -> None:
             )
             cur.execute(sql.SQL("ALTER TABLE {} ALTER COLUMN source_key SET NOT NULL").format(table))
             cur.execute(
-                sql.SQL("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {}").format(
-                    table,
-                    sql.Identifier(f"{table_name}_content_hash_key"),
-                )
-            )
-            cur.execute(
                 sql.SQL("CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} (source_key)").format(
                     sql.Identifier(f"idx_{table_name}_source_key"), table
                 )
             )
+            remove_global_content_hash_uniqueness(cur, table_name)
 
             cur.execute(
                 """
@@ -120,6 +141,11 @@ def main() -> None:
                 )
                 """
             )
+            cur.execute("""CREATE TABLE IF NOT EXISTS pipeline_storage_receipts (
+                pipeline_id TEXT PRIMARY KEY, source_keys JSONB NOT NULL,
+                published BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
 
     print(f"DB migration complete: {table_name} (vector(1024))")
 

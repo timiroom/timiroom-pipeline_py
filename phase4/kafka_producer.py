@@ -8,7 +8,9 @@ import psycopg2
 from aiokafka import AIOKafkaProducer
 
 from phase2.state import PipelineState
+from phase4.documents import event_documents
 from phase4.event import PipelineResultEvent
+from phase4.storage_receipt import StorageReceiptStore
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,9 @@ class KafkaProducerService:
         max_publish_retry: int = 3,
         outbox: KafkaOutbox | None = None,
         kafka_client_options: dict[str, Any] | None = None,
+        ingestion_service=None,
+        storage_timeout_seconds: float = 120.0,
+        receipt_store=None,
     ):
         if max_publish_retry <= 0:
             raise ValueError("max_publish_retry는 1 이상이어야 합니다")
@@ -97,6 +102,11 @@ class KafkaProducerService:
         self._main_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         self._publish_lock = asyncio.Lock()
+        self._ingestion = ingestion_service
+        if storage_timeout_seconds <= 0:
+            raise ValueError("storage_timeout_seconds must be positive")
+        self._storage_timeout = storage_timeout_seconds
+        self._receipts = receipt_store or (StorageReceiptStore(db_url, ingestion_service) if ingestion_service else None)
 
     def start(self) -> None:
         if self._main_task is None or self._main_task.done():
@@ -113,7 +123,19 @@ class KafkaProducerService:
         await self._close_producer()
 
     async def publish(self, state: PipelineState, pipeline_id: str) -> str:
-        event = PipelineResultEvent(
+        event = self._event(state, pipeline_id).model_dump(by_alias=True)
+        if self._receipts is not None:
+            await self._receipts.prepare(pipeline_id, event_documents(self._event(state, pipeline_id)))
+
+        async with self._publish_lock:
+            await self._outbox.put(pipeline_id, self._topic, event)
+            if not await self._send_with_retry(pipeline_id, self._topic, event):
+                raise RuntimeError(f"Kafka 발행 실패 — outbox에 보관됨: {pipeline_id}")
+        return pipeline_id
+
+    @staticmethod
+    def _event(state: PipelineState, pipeline_id: str) -> PipelineResultEvent:
+        return PipelineResultEvent(
             pipelineId=pipeline_id,
             projectName=state.project_name,
             platform=(
@@ -133,13 +155,25 @@ class KafkaProducerService:
             featureRegistry=state.feature_registry or [],
             retryCount=state.retry_count,
             createdAt=datetime.now(UTC).isoformat(),
-        ).model_dump(by_alias=True)
+        )
 
-        async with self._publish_lock:
-            await self._outbox.put(pipeline_id, self._topic, event)
-            if not await self._send_with_retry(pipeline_id, self._topic, event):
-                raise RuntimeError(f"Kafka 발행 실패 — outbox에 보관됨: {pipeline_id}")
-        return pipeline_id
+    async def confirm_storage(self, state: PipelineState, pipeline_id: str) -> dict:
+        if self._ingestion is None:
+            raise RuntimeError("STORAGE_VERIFIER_UNAVAILABLE")
+        documents = event_documents(self._event(state, pipeline_id))
+        last = {"status": "pending"}
+        try:
+            async with asyncio.timeout(self._storage_timeout):
+                while True:
+                    last = await self._ingestion.event_storage_status(documents)
+                    if last.get("status") == "stored":
+                        return {**last, "kafkaPublished": True}
+                    await asyncio.sleep(1)
+        except TimeoutError:
+            # The Kafka event is still durable and may finish later. Do not
+            # misreport this as a completed write or republish automatically.
+            return {**last, "status": "pending", "kafkaPublished": True,
+                    "reason": "STORAGE_CONFIRMATION_TIMEOUT"}
 
     async def _send_with_retry(self, pipeline_id: str, topic: str, event: dict) -> bool:
         last_error = ""
@@ -150,6 +184,8 @@ class KafkaProducerService:
                 if self._producer is None:
                     raise RuntimeError("Kafka Producer 연결 없음")
                 await self._producer.send_and_wait(topic, key=pipeline_id, value=event)
+                if self._receipts is not None:
+                    await self._receipts.mark_published(pipeline_id)
                 await self._outbox.delete(pipeline_id)
                 logger.info("Kafka 발행 완료 — pipelineId: %s", pipeline_id)
                 return True
@@ -225,3 +261,8 @@ class KafkaProducerService:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    async def storage_status(self, pipeline_id: str) -> dict:
+        if self._receipts is None:
+            raise RuntimeError("STORAGE_VERIFIER_UNAVAILABLE")
+        return await self._receipts.status(pipeline_id)

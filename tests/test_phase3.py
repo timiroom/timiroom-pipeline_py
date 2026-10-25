@@ -9,6 +9,21 @@ from phase3.validation_service import ValidationService
 FEATURES = ["사용자 로그인"]
 
 
+def test_owned_auth_feature_accepts_declared_public_session_entry_but_not_other_writes():
+    contract = {"method": "POST", "path": "/api/v1/identity/sessions", "action": "login", "authRequired": False,
+                "requestSchema": {"type": "object"}, "effects": [{"kind": "insert", "table": "sessions"}]}
+    spec = {"featureId": "identity.session", "name": "Session", "ownership": {"scope": "USER", "ownerEntity": "sessions"},
+            "sessionPolicy": {"strategy": "bearer_session", "sessionTable": "sessions"},
+            "apiContract": [contract], "dbContract": {"tables": ["sessions"]}, "transactionRules": ["atomic"]}
+    db = json.dumps({"tables": [{"name": "sessions", "columns": []}], "featureMappings": [{"featureName": "Session", "table": "sessions"}]})
+    endpoint = {**contract, "successResponse": "token: string", "errorCodes": "400,500", "transactionRules": "atomic"}
+    api = {"endpoints": [endpoint], "featureMappings": [{"featureName": "Session", "operations": [{"method": "POST", "path": contract["path"]}]}]}
+    validator = SchemaValidator()
+    assert not validator._check_feature_contracts([spec], db, json.dumps(api))
+    contract["action"] = "update"
+    assert any("인증 누락" in issue for issue in validator._check_feature_contracts([spec], db, json.dumps(api)))
+
+
 def test_phase3_contract_graph_rejects_disconnected_api_and_db():
     registry = [{
         "featureId": "market.list",
@@ -290,6 +305,30 @@ def test_api_registry_contract_missing_is_a_structured_blocker():
     assert "API_CONTRACT_MISSING" in result.error_codes
 
 
+def test_registry_and_table_mapping_invariants_are_structured_blockers():
+    registry = [
+        {
+            "featureId": f"feature.{index}",
+            "name": f"기능 {index}",
+            "priority": "P0",
+            "apiContract": [{"method": "GET", "path": f"/api/v1/features/{index}"}],
+            "dbContract": {"tables": ["sessions"], "foreignKeys": []},
+        }
+        for index in range(1, 7)
+    ]
+
+    result = SchemaValidator().validate(
+        FEATURES,
+        json.dumps(_db()),
+        json.dumps(_api()),
+        json.dumps(_prd()),
+        registry,
+    )
+
+    assert "P0_COUNT_OUT_OF_RANGE" in result.error_codes
+    assert "DB_TABLE_FEATURE_ID_REQUIRED" in result.error_codes
+
+
 def test_prd_required_sections_are_validated():
     result = SchemaValidator().validate(
         FEATURES,
@@ -448,11 +487,11 @@ def test_common_fk_aliases_and_self_relationships_are_allowed():
         "columns": [{"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"}],
     })
     db["tables"][0]["columns"].append(
-        {"name": "created_by_user_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"}
+        {"name": "created_by_user_id", "type": "BIGINT", "constraints": "FOREIGN_KEY REFERENCES users(id)"}
     )
     db["tables"][1]["columns"].extend([
-        {"name": "pdf_file_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"},
-        {"name": "source_session_id", "type": "BIGINT", "constraints": "FOREIGN_KEY"},
+        {"name": "pdf_file_id", "type": "BIGINT", "constraints": "FOREIGN_KEY REFERENCES files(id)"},
+        {"name": "source_session_id", "type": "BIGINT", "constraints": "FOREIGN_KEY REFERENCES sessions(id)"},
     ])
     db["relationships"].extend([
         "users (1:N) files",

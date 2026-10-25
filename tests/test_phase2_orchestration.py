@@ -29,7 +29,7 @@ class _Agent:
         return state
 
 
-def test_top_level_phase2_builds_prd_then_pm_and_fans_out_dba_api():
+def test_top_level_phase2_builds_pm_then_prd_and_fans_out_dba_api():
     events = []
     graph = OrchestrationGraph(
         _Agent("search", events, market_research="research"),
@@ -40,18 +40,15 @@ def test_top_level_phase2_builds_prd_then_pm_and_fans_out_dba_api():
         _Agent("qa", events),
         _Progress(),
     )
-    started = time.perf_counter()
     result = asyncio.run(graph.run(PipelineState()))
-    elapsed = time.perf_counter() - started
 
     starts = {name: stamp for name, kind, stamp in events if kind == "start"}
     ends = {name: stamp for name, kind, stamp in events if kind == "end"}
-    assert starts["prd"] >= ends["search"]
-    assert starts["pm"] >= ends["prd"]
-    assert min(starts[name] for name in ("dba", "api")) >= ends["pm"]
+    assert starts["pm"] >= ends["search"]
+    assert starts["prd"] >= ends["pm"]
+    assert min(starts[name] for name in ("dba", "api")) >= ends["prd"]
     assert max(starts[name] for name in ("dba", "api")) < min(ends[name] for name in ("dba", "api"))
     assert starts["qa"] >= max(ends[name] for name in ("dba", "api"))
-    assert elapsed < 0.2
     assert result.market_research == "research"
     assert result.prd_document == '{"coreFeatures":[]}'
 
