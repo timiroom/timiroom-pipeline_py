@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+import asyncio
 import asyncio
 import json
 from types import SimpleNamespace
@@ -324,3 +327,41 @@ def test_dependency_cycle_repair_has_feature_scope():
     provider = client(response([first, second]), response([fixed]))
     result, _, issues = run(provider, source_cores({"coreFeatures": [first, second]}))
     assert result and not issues
+
+
+def test_extra_attempts_patch_the_previous_draft_until_contracts_pass():
+    """Feature Spec은 fallback이 없으므로 보정 기회가 모자라면 그대로 하드 블록이다.
+
+    보정은 이전 draft 위의 targeted patch라서, 시도를 늘리면 남은 위반이
+    줄어든다. 실측에서 초안(231s/61KB)의 1/15 비용(15s/4KB)으로 3건을 고쳤다.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from phase2.feature_draft import compile_document
+    from phase2.feature_generation import document_issues, generate_document
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_flat_feature_draft import draft, response
+
+    good = draft()
+    cores = [{"sourceFeatureId": compile_document(good)[0]["sourceFeatureId"]}]
+    broken = {"version": "contract-draft-v1", "features": [], "tables": [], "schemas": []}
+
+    # 2회로는 모자라고 3회째에 통과하는 경우.
+    def run(max_attempts):
+        create = AsyncMock(side_effect=[
+            response(broken), response(broken), response(good),
+        ])
+        provider = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        result, _diagnostics, issues = asyncio.run(generate_document(
+            provider, "test", None, "draft", cores, draft=True, max_attempts=max_attempts,
+        ))
+        return result, issues, create.await_count
+
+    _result, issues, calls = run(2)
+    assert issues and calls == 2, (issues, calls)
+
+    result, issues, calls = run(3)
+    assert not issues and calls == 3, (issues, calls)
+    assert not document_issues(result, cores, preflight=True)

@@ -700,6 +700,42 @@ def test_market_research_polish_removes_system_limitation_phrasing():
     assert "공개적으로 확인 가능한 자료 기준" in polished
 
 
+def test_search_agent_output_never_leaks_system_limitation_phrasing():
+    """정리 함수가 에이전트 산출 경로에 실제로 연결돼 있어야 한다.
+
+    market_research는 PRD 프롬프트와 저장되는 marketResearch 산출물에 그대로
+    실리므로, 모델이 드러낸 시스템 사정 문구가 통과하면 최종 결과물에 남는다.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from phase2.state import PipelineState
+
+    leaky = "현재 웹 검색을 수행할 수 없어 최신 법규를 확인할 수 없습니다. 출처: https://example.go.kr/a 2026"
+
+    class _Client:
+        def __init__(self):
+            self.responses = SimpleNamespace(create=self._responses)
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._chat))
+
+        async def _responses(self, **_kwargs):
+            return SimpleNamespace(output_text=leaky, model_dump=lambda: {"output": []})
+
+        async def _chat(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="할 일 관리 협업"))]
+            )
+
+    agent = SearchAgent(_Client(), "stub-model", web_search_enabled=True)
+    research = asyncio.run(agent.execute(PipelineState(user_query="할 일 정리"))).market_research
+
+    assert "웹 검색을 수행할 수 없어" not in research
+    assert "확인할 수 없습니다" not in research
+    assert "공개적으로 확인 가능한 자료 기준" in research
+    # 추적 가능한 출처는 보존해야 한다.
+    assert "https://example.go.kr/a" in research
+
+
 def test_qa_max_round_ends_without_false_approval():
     agent = QaAgent(object())
     check = agent._make_check_node("db")

@@ -50,6 +50,12 @@ class FormToQueryService:
     def extract_excluded_features(self, form: FormData) -> list[str]:
         return self._get_by_priority(form.feature_definition, MoSCoW.WONT)
 
+    def extract_should_features(self, form: FormData) -> list[str]:
+        return self._get_by_priority(form.feature_definition, MoSCoW.SHOULD)
+
+    def extract_could_features(self, form: FormData) -> list[str]:
+        return self._get_by_priority(form.feature_definition, MoSCoW.COULD)
+
     def extract_all_included_features(self, form: FormData) -> list[str]:
         fd = form.feature_definition
         # commonFeatures는 핵심 여정이 아니라 Feature Spec의 supporting

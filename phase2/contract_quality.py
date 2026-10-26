@@ -17,6 +17,42 @@ def public_read_contract(feature, endpoint):
                 and (op.get("accessScope") == "PUBLIC" or (feature.get("ownership") or {}).get("scope") == "PUBLIC"))
 
 
+def _public_lookup_sibling(feature):
+    """같은 기능이 선언한 공개 조회 수단 (접수번호 조회 등)."""
+    return any(
+        isinstance(op, dict)
+        and op.get("authRequired") is False
+        and op.get("accessScope") == "PUBLIC"
+        and str(op.get("method")).upper() in {"GET", "HEAD"}
+        for op in feature.get("apiContract") or []
+    )
+
+
+def public_write_contract(feature, endpoint):
+    """비회원 접수(게스트 제출) 생성만 허용한다. 무심한 공개 쓰기는 계속 막는다.
+
+    배달·수리 접수나 비회원 예약처럼 제출자가 계정을 갖지 않는 흐름이 실제로
+    존재하고 draft 계약은 accessScope로 이를 표현할 수 있다. 다만 공개 쓰기는
+    보안에 민감하므로 아래를 모두 만족할 때만 인정한다.
+
+    - operation에 accessScope=PUBLIC이 **명시**되어 있다
+      (feature.ownership.scope의 상속으로는 인정하지 않는다)
+    - 생성(POST)이다 — 기존 자원의 수정·삭제는 공개로 열지 않는다
+    - effects가 insert/create뿐이다 — 기존 행을 바꾸지 않는다
+    - 같은 기능이 공개 조회 수단을 함께 선언했다
+      (제출만 받고 확인할 길이 없는 반쪽 흐름을 거른다)
+    """
+    op = declared_operation(feature, endpoint)
+    if not op or op.get("authRequired") is not False:
+        return False
+    if op.get("accessScope") != "PUBLIC" or str(op.get("method")).upper() != "POST":
+        return False
+    effects = op.get("effects") or []
+    if not all(isinstance(item, dict) and item.get("kind") in {"insert", "create"} for item in effects):
+        return False
+    return _public_lookup_sibling(feature)
+
+
 def operation_primary_table(operation, fallback=None):
     if operation.get("primaryTable"):
         return operation["primaryTable"]

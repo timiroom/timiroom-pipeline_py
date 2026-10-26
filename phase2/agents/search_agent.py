@@ -103,7 +103,12 @@ class SearchAgent:
             sourced = bool(urls) and self._web_search_enabled
             statuses.append({"section": LABELS[i], "status": "sourced" if sourced else "unavailable", "sourceUrls": urls if sourced else []})
             # A URL is traceability, not a claim that every sentence was independently verified.
-            body = text if sourced else "확인 불가 — 추적 가능한 외부 근거 없음. 수치를 추정하지 마세요."
+            # 산출물은 PRD 프롬프트와 저장되는 marketResearch에 그대로 실리므로,
+            # 모델이 드러낸 시스템 사정 문구는 보고서형 표현으로 정리해서 내보낸다.
+            body = (
+                _polish_market_research_text(text) if sourced
+                else "확인 불가 — 추적 가능한 외부 근거 없음. 수치를 추정하지 마세요."
+            )
             parts.append(f"=== {LABELS[i]} ===\n{body}")
         return "\n\n".join(parts), statuses
 

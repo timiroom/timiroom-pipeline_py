@@ -201,6 +201,7 @@ orchestration_graph = OrchestrationGraph(
     repair_timeout_seconds=settings.phase3_repair_timeout_seconds,
     dba_resync_timeout_seconds=settings.phase2_dba_resync_timeout_seconds,
     api_resync_timeout_seconds=settings.phase2_api_resync_timeout_seconds,
+    max_targeted_repair_per_domain=settings.phase3_targeted_repair_max_per_domain,
 )
 
 # ── Phase 3 ───────────────────────────────────────────────────────

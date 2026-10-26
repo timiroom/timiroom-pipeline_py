@@ -11,7 +11,7 @@ from phase2.agent_contract import (
 from phase2.agents.api_agent import _canonical_api_path, _invalid_paths
 from phase2.agents.dba_agent import USER_REFERENCE_STEMS
 from phase2.artifact_shapes import shape_issues
-from phase2.contract_quality import public_read_contract
+from phase2.contract_quality import public_read_contract, public_write_contract
 from phase2.feature_coverage import strictly_uncovered_features, uncovered_features
 from phase2.feature_registry import (
     missing_api_contract_features,
@@ -821,6 +821,8 @@ class SchemaValidator:
                     or any(contract.get("method") == key[0] and contract.get("path") == key[1]
                            and is_public_session_entry(contract, spec) for contract in spec.get("apiContract") or [])
                     or public_read_contract(spec, endpoint)
+                    # 명시적으로 선언된 비회원 접수 생성 (게스트 제출)
+                    or public_write_contract(spec, endpoint)
                 ):
                     errors.append(f"API 사용자 소유 기능 인증 누락: {key[0]} {key[1]}")
                 for field_name in ("requestBody", "successResponse", "errorCodes"):

@@ -126,6 +126,12 @@ def test_rag_pipeline_skips_rl_feedback_when_cohere_was_not_applied() -> None:
         def extract_must_features(self, form):
             return ["필수 기능"]
 
+        def extract_should_features(self, form):
+            return []
+
+        def extract_could_features(self, form):
+            return []
+
         def extract_excluded_features(self, form):
             return []
 
@@ -184,3 +190,65 @@ def test_file_count_is_rejected_before_files_are_read() -> None:
         _validate_file_count(6)
 
     assert exc_info.value.status_code == 400
+
+
+def test_pipeline_state_carries_the_users_moscow_decision_to_prd():
+    """폼의 SHOULD/COULD가 state까지 전달돼야 PRD가 우선순위를 강제할 수 있다.
+
+    PrdAgent._apply_phase1_priorities는 should_features/could_features를 읽어
+    coreFeatures에 P1/P2를 부여하고, 사용자가 확정한 기능이 mvpScope.excluded로
+    빠지면 구제한다. 이 필드가 비어 있으면 두 보정이 모두 동작하지 않는다.
+    """
+    from phase1.form_to_query import FormToQueryService
+    from phase1.models import FormData
+    from phase2.agents.prd_agent import PrdAgent
+    from phase2.state import PipelineState
+
+    form = FormData.model_validate_json(json.dumps({
+        "projectName": "플로우메이트",
+        "projectDescription": "할 일 정리 서비스",
+        "platform": "WEB",
+        "techStack": [],
+        "problemDefinition": {
+            "currentPainPoint": "할 일이 흩어져 있어요",
+            "currentSolution": "메모 앱을 써요",
+            "idealState": "자동으로 정리되면 좋겠어요",
+        },
+        "targetUsers": [
+            {"persona": "팀원", "usageEnvironment": "웹", "biggestPainPoint": "할 일을 놓쳐요"},
+        ],
+        "featureDefinition": {
+            "commonFeatures": [],
+            "customFeatures": [
+                {"featureName": "할 일 자동 추출", "description": "a", "priority": "MUST"},
+                {"featureName": "담당자 지정", "description": "b", "priority": "SHOULD"},
+                {"featureName": "주간 리포트", "description": "c", "priority": "COULD"},
+            ],
+        },
+    }, ensure_ascii=False))
+    service = FormToQueryService()
+
+    assert service.extract_should_features(form) == ["담당자 지정"]
+    assert service.extract_could_features(form) == ["주간 리포트"]
+
+    state = PipelineState(
+        must_features=service.extract_must_features(form),
+        should_features=service.extract_should_features(form),
+        could_features=service.extract_could_features(form),
+        excluded_features=service.extract_excluded_features(form),
+        feature_list=service.extract_all_included_features(form),
+    )
+
+    parsed = {
+        "coreFeatures": [
+            {"name": "할 일 자동 추출", "priority": "P2"},
+            {"name": "담당자 지정", "priority": "P2"},
+            {"name": "주간 리포트", "priority": "P0"},
+        ],
+        "mvpScope": {"included": [], "excluded": ["담당자 지정", "주간 리포트"]},
+    }
+    PrdAgent._apply_phase1_priorities(parsed, state)
+
+    priority = {item["name"]: item["priority"] for item in parsed["coreFeatures"]}
+    assert priority == {"할 일 자동 추출": "P0", "담당자 지정": "P1", "주간 리포트": "P2"}
+    assert parsed["mvpScope"]["excluded"] == []

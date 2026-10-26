@@ -443,7 +443,7 @@ def _merge_patch(baseline, patch, issues, cores):
     return merged
 
 
-async def generate_document(client, model, runtime, prompt, cores, *, mode="auto", diagnostics_dir="", max_tokens=16000, draft=False, reasoning_effort=None, timeout_seconds=None):
+async def generate_document(client, model, runtime, prompt, cores, *, mode="auto", diagnostics_dir="", max_tokens=16000, draft=False, reasoning_effort=None, timeout_seconds=None, max_attempts=2):
     diagnostics = []
     current_mode = "json_schema" if mode == "auto" else mode
     # Keep other model families' existing request contract unchanged.
@@ -456,15 +456,19 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
             " contract-draft-v1 has sibling top-level arrays features, tables and schemas. "
             "Never put a document envelope, tables or schemas inside the features array."
         )
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
     baseline, failures, previous_issues = None, [], []
     draft_baseline, active_scope = None, None
-    # SDK retries are disabled here: this owner provides one bounded retry.
+    # SDK retries are disabled here: this owner provides the bounded retries.
+    # Each retry is a targeted patch over the previous draft, so extra attempts
+    # shrink the remaining violations instead of regenerating from scratch.
     with_options = getattr(client, "with_options", None)
     options = {"max_retries": 0}
     if timeout_seconds is not None:
         options["timeout"] = timeout_seconds
     transport = with_options(**options) if callable(with_options) else client
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         normalizations = []
         response_normalizations = []
         boolean_normalizations = []
@@ -544,7 +548,7 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
                     attempt, current_mode, finish, record["responseBytes"], len(failures), record["durationSeconds"])
         if not failures:
             return candidate, diagnostics, []
-        if terminal or attempt == 1:
+        if terminal or attempt == max_attempts - 1:
             break
         if mode == "auto" and current_mode == "json_schema" and any(item.startswith("FEATURE_SPEC_JSON:") for item in failures):
             # Some compatible gateways accept schema guidance without enforcing JSON syntax.

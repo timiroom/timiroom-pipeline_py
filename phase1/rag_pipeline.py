@@ -158,6 +158,11 @@ class RagPipelineService:
                     self._form_to_query.extract_supporting_features(form)
                     if hasattr(self._form_to_query, "extract_supporting_features") else []
                 ),
+                # PRD의 _apply_phase1_priorities가 사용자의 MoSCoW 결정을 강제할 때
+                # 읽는 필드다. 비워 두면 SHOULD/COULD 기능이 P1/P2를 못 받고
+                # mvpScope.excluded에서 구제되지도 않아 MVP에서 조용히 빠진다.
+                should_features=self._form_to_query.extract_should_features(form),
+                could_features=self._form_to_query.extract_could_features(form),
                 excluded_features=self._form_to_query.extract_excluded_features(form),
                 feature_list=self._form_to_query.extract_all_included_features(form),
                 context_prompt=context_prompt,

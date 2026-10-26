@@ -21,6 +21,16 @@ CREATE TABLE IF NOT EXISTS pipeline_outbox (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Phase4 StorageReceiptStore (phase4/storage_receipt.py) — Kafka 발행과
+-- consumer의 DB 저장을 대조하는 기대 청크 명세. 이 테이블이 없으면
+-- publish()가 INSERT 단계에서 실패해 결과가 저장되지 않는다.
+CREATE TABLE IF NOT EXISTS pipeline_storage_receipts (
+    pipeline_id TEXT PRIMARY KEY,
+    source_keys JSONB NOT NULL,
+    published   BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Phase1 SearchRLService (phase1/search_rl_service.py) — similarity_threshold 자동 튜닝
 CREATE TABLE IF NOT EXISTS rl_params (
     id                   INT PRIMARY KEY,

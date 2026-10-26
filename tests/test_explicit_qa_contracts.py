@@ -129,3 +129,62 @@ def test_notification_preferences_can_belong_to_user_through_parent_foreign_keys
     prd = {'coreFeatures': [{'name': '알림 설정', 'requirements': ['자산별 알림 설정 변경']} ]}
     issues, _, _ = QaAgent(object())._check_cross_document_semantics(prd, db, {'endpoints': []}, [])
     assert any('수신 설정 구조' in issue for issue in issues) is (link != 'principal')
+
+
+def _guest_intake_feature():
+    """비회원 접수: 공개 생성 + 접수번호 공개 조회 + 사장님 전용 목록."""
+    return {
+        "name": "수거 접수 등록",
+        "featureId": "pickup.request",
+        "applicability": {"ui": True, "api": True, "db": True},
+        "ownership": {"scope": "SHARED", "ownerEntity": "users", "ownerKey": "owner_id",
+                      "access": "고객은 receiptNumber로만 조회하고 OWNER는 자신의 접수만 조회한다"},
+        "apiContract": [
+            {"method": "POST", "path": "/api/v1/pickup-requests", "authRequired": False,
+             "accessScope": "PUBLIC", "effects": [{"table": "pickup_requests", "kind": "insert"}]},
+            {"method": "GET", "path": "/api/v1/public/pickup-requests/{receiptNumber}",
+             "authRequired": False, "accessScope": "PUBLIC"},
+        ],
+    }
+
+
+def test_explicitly_declared_guest_intake_create_is_allowed():
+    from phase2.contract_quality import public_write_contract
+
+    feature = _guest_intake_feature()
+    endpoint = {"method": "POST", "path": "/api/v1/pickup-requests", "authRequired": False}
+    assert public_write_contract(feature, endpoint)
+
+
+def test_careless_public_writes_are_still_blocked():
+    from phase2.contract_quality import public_write_contract
+
+    endpoint = {"method": "POST", "path": "/api/v1/pickup-requests", "authRequired": False}
+
+    # accessScope 미선언 — ownership.scope 상속으로는 인정하지 않는다.
+    feature = _guest_intake_feature()
+    feature["apiContract"][0].pop("accessScope")
+    assert not public_write_contract(feature, endpoint)
+
+    # 공개 조회 수단이 없는 반쪽 흐름.
+    feature = _guest_intake_feature()
+    feature["apiContract"] = feature["apiContract"][:1]
+    assert not public_write_contract(feature, endpoint)
+
+    # 기존 행을 바꾸는 effects.
+    feature = _guest_intake_feature()
+    feature["apiContract"][0]["effects"] = [{"table": "pickup_requests", "kind": "update"}]
+    assert not public_write_contract(feature, endpoint)
+
+    # 생성이 아닌 수정·삭제는 공개로 열지 않는다.
+    feature = _guest_intake_feature()
+    for method in ("PATCH", "DELETE", "PUT"):
+        feature["apiContract"][0]["method"] = method
+        assert not public_write_contract(
+            feature, {"method": method, "path": "/api/v1/pickup-requests", "authRequired": False})
+
+    # 인증이 필요한 operation은 애초에 대상이 아니다.
+    feature = _guest_intake_feature()
+    feature["apiContract"][0]["authRequired"] = True
+    assert not public_write_contract(
+        feature, {"method": "POST", "path": "/api/v1/pickup-requests", "authRequired": True})

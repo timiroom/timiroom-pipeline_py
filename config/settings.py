@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     feature_spec_max_completion_tokens: int = 24000
     feature_spec_reasoning_effort: str = "medium"
     feature_spec_request_timeout_seconds: float = 240.0
+    # Feature Spec은 fallback이 없는 유일한 단계이고 실패하면 Phase3가 자동
+    # 재시도하지 않는다(repair 대상은 pm/prd/db/api뿐). 보정은 초안 대비
+    # 훨씬 싸므로(실측 15s/4KB vs 231s/61KB) 초안 1회 + 보정 2회를 기본으로 둔다.
+    feature_spec_max_attempts: int = 3
     # Opt-in local response diagnostics. Never exposed through progress APIs.
     feature_spec_diagnostics_dir: str = ""
     phase4_storage_timeout_seconds: float = 120.0
@@ -119,6 +123,8 @@ class Settings(BaseSettings):
             raise ValueError("FEATURE_SPEC_REASONING_EFFORT must be none/low/medium/high/xhigh")
         if self.feature_spec_request_timeout_seconds <= 0:
             raise ValueError("FEATURE_SPEC_REQUEST_TIMEOUT_SECONDS must be > 0")
+        if not 1 <= self.feature_spec_max_attempts <= 5:
+            raise ValueError("FEATURE_SPEC_MAX_ATTEMPTS must be between 1 and 5")
         if self.phase4_storage_timeout_seconds <= 0:
             raise ValueError("PHASE4_STORAGE_TIMEOUT_SECONDS must be > 0")
         if self.rag_chunk_size <= 0:

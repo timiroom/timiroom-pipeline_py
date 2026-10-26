@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from common.ai_errors import describe
 from common.api_response import ok
-from phase1.models import FormData, MoSCoW, PlatformType
+from phase1.models import FormData
 from phase2.json_utils import try_parse_json
 
 logger = logging.getLogger(__name__)
@@ -171,19 +171,8 @@ JSON 하나만 출력하세요. 다른 텍스트 절대 금지.
 {context}
 """
 
-# ── 합성 프롬프트 ───────────────────────────────────────────────────
-SYNTHESIS_PROMPT = """대화를 분석해서 아래 형식의 JSON을 출력하세요.
-JSON 하나만 출력하세요. 마크다운·설명 금지. {{ 로 시작해서 }} 로 끝납니다.
-
-{{"projectName": "이름", "projectDescription": "설명 1-2문장", "platform": "WEB", "techStack": [], "problemDefinition": {{"currentPainPoint": "불편함", "currentSolution": "현재방법", "idealState": "이상적상태", "businessImpact": null, "motivation": null, "competitorGap": null}}, "targetUsers": [{{"persona": "유저설명", "usageEnvironment": "사용환경", "biggestPainPoint": "주요불편함"}}], "featureDefinition": {{"commonFeatures": [], "customFeatures": [{{"featureName": "기능명", "description": "기능설명", "priority": "MUST"}}]}}}}
-
-규칙:
-- platform: WEB, APP, WEB_APP 중 하나
-- priority: MUST 또는 SHOULD로 자동 할당 (사용자가 순서대로 말한 기능이므로, 처음 3개는 우선순위를 자동으로 분배)
-- projectName: 대화에서 유추 (사용자가 명시하지 않으면 기능과 불편함으로부터 추론)
-- projectDescription: 현재 불편함과 이상적 상태로부터 생성
-- 대화에서 언급 없는 필드는 합리적으로 추론해서 채우기
-- 빈 문자열("") 금지"""
+# FormData는 LLM 합성 대신 _synthesize_form_data의 결정론적 조립으로 만든다.
+# 합성 프롬프트와 EXAONE 출력 정규화는 그래서 더 이상 쓰이지 않는다.
 
 
 # ── EXAONE 프롬프트 에코 방어 ─────────────────────────────────────────
@@ -328,6 +317,20 @@ def _is_valid_generated_project_name(text: str) -> bool:
     return bool(re.fullmatch(r"[가-힣A-Za-z0-9]+", value)) and value.endswith(approved_suffixes)
 
 
+_SUBJECT_MAX_LEN = 16
+# 관리 대상 자리에 절이 통째로 잡히면 기능 제안과 프로젝트명 후보가 모두
+# 말이 안 되게 조합된다 (실측: '필요할 때 요청하고 관리자가 승인하는 과정'
+# → '필요할때요청하고관리메이트'). 용언 활용형과 절 내부 주격/처격 조사를
+# 신호로 삼아 명사구만 통과시킨다. '할 일'처럼 짧은 관용 명사구는 길이로 살린다.
+_CLAUSE_MARKER_RE = re.compile(
+    r"하고|하는|하며|해서|되는|되면|하면|있는|없는|싶|[가-힣](?:이|가|에서|에게)\s"
+)
+
+
+def _is_subject_phrase(value: str) -> bool:
+    return 2 <= len(value) <= _SUBJECT_MAX_LEN and not _CLAUSE_MARKER_RE.search(value)
+
+
 def _extract_service_subject(state: dict) -> str:
     """기능명과 이름 fallback에 쓸 서비스의 핵심 관리 대상을 사용자 문장에서 추출한다."""
     idea = state.get("idea", "")
@@ -338,6 +341,9 @@ def _extract_service_subject(state: dict) -> str:
         r"^(.{2,32}?)(?:이|가)\s+(?:자동|한눈|통합|정리|표시|보이)",
         r"^(.{2,32}?)(?:을|를)\s+(?:자동|한눈|통합|정리|표시|모으|보이)",
         r"(?:이|가)\s+(.{2,32}?)(?:을|를)\s+(?:함께\s+)?(?:관리|기록|예약|공유|추적|확인)",
+        # 위 패턴이 절을 물면 '비품이 … 과정을 관리'의 실제 대상인 앞쪽
+        # 명사('비품')를 쓴다. 공백을 포함하지 않아 절로 번지지 않는다.
+        r"([가-힣A-Za-z0-9]{2,16})(?:이|가)\s+.{0,48}?(?:을|를)\s+(?:함께\s+)?(?:관리|기록|예약|공유|추적|확인)",
     )
     for source in sources:
         for pattern in patterns:
@@ -347,7 +353,7 @@ def _extract_service_subject(state: dict) -> str:
                 # "대화에서 할 일을 자동으로"처럼 출처가 앞에 붙은 경우에는
                 # 관리 대상만 남긴다.
                 subject = re.sub(r"^.*(?:에서|으로)\s+", "", subject).strip()
-                if 2 <= len(subject) <= 32:
+                if _is_subject_phrase(subject):
                     return subject
     return "핵심 항목"
 
@@ -433,6 +439,20 @@ def _collect_interview_state(messages: list["ChatMessageDto"]) -> dict:
     }
 
 
+def _josa(word: str, after_consonant: str, after_vowel: str) -> str:
+    """사용자 문장을 그대로 인용하므로 조사는 끝 글자의 종성에 맞춰 고른다.
+
+    (예: '번거로워요'→'라고', '자동 정리됨'→'이라고')
+    anchor()가 말줄임표를 붙일 수 있어 뒤쪽 구두점은 건너뛰고 마지막 한글을 본다.
+    """
+    for char in reversed(word or ""):
+        if "가" <= char <= "힣":
+            return after_vowel if (ord(char) - 0xAC00) % 28 == 0 else after_consonant
+        if char.isalnum():
+            break
+    return after_vowel
+
+
 def _contextual_question(messages: list["ChatMessageDto"], q_idx: int) -> str:
     """Build a stage-safe question while retaining the user's own wording."""
     state = _collect_interview_state(messages)
@@ -444,12 +464,14 @@ def _contextual_question(messages: list["ChatMessageDto"], q_idx: int) -> str:
         return value if len(value) <= 64 else value[:61].rstrip() + "…"
 
     idea = anchor(0, "말씀하신 서비스")
+    pain = anchor(2, "그 불편한 상황")
+    ideal = anchor(4, "원하는 변화")
     templates = (
         f"‘{idea}’ 아이디어는 웹, 모바일 앱, 또는 둘 다 중 어떤 형태로 만들고 싶으신가요?",
         f"‘{idea}’ 서비스를 구상하실 때 지금 가장 번거롭거나 답답한 순간은 언제인가요?",
-        f"‘{anchor(2, '그 불편한 상황')}’이라고 하셨는데, 지금은 어떤 방법이나 도구로 처리하고 계신가요?",
+        f"‘{pain}’{_josa(pain, '이라고', '라고')} 하셨는데, 지금은 어떤 방법이나 도구로 처리하고 계신가요?",
         f"지금은 ‘{anchor(3, '현재 사용 중인 방법')}’ 방식으로 해결하고 계신데, 문제가 해결되면 어떤 모습이면 좋을까요?",
-        f"‘{anchor(4, '원하는 변화')}’를 가장 필요로 하는 사용자는 구체적으로 어떤 분들인가요?",
+        f"‘{ideal}’{_josa(ideal, '을', '를')} 가장 필요로 하는 사용자는 구체적으로 어떤 분들인가요?",
         f"‘{anchor(5, '말씀하신 사용자')}’에게 꼭 필요한 핵심 기능 세 가지는 무엇인가요?",
     )
     question = templates[q_idx] if 0 <= q_idx < len(templates) else _QUESTIONS[0]["fallback_question"]
@@ -663,152 +685,6 @@ def _build_context_string(messages: list[ChatMessageDto]) -> str:
     return "\n".join(lines) if lines else "(아직 수집한 정보 없음)"
 
 
-def _normalize_form_data(node: dict) -> dict:
-    """EXAONE 출력의 흔한 포맷 오류를 FormData 스키마에 맞게 정규화."""
-    # platform 정규화
-    platform_map = {
-        "앱": "APP", "모바일": "APP", "MOBILE": "APP",
-        "웹": "WEB", "WEB ONLY": "WEB",
-        "앱+웹": "WEB_APP", "웹+앱": "WEB_APP", "BOTH": "WEB_APP",
-    }
-    valid_platforms = {p.value for p in PlatformType}
-    p = node.get("platform", "APP")
-    if isinstance(p, str) and p not in valid_platforms:
-        node["platform"] = platform_map.get(p, "APP")
-
-    # featureDefinition 정규화
-    fd = node.get("featureDefinition")
-    if isinstance(fd, dict):
-        # priority 정규화
-        priority_map = {
-            "필수": "MUST", "HIGH": "MUST", "높음": "MUST",
-            "권장": "SHOULD", "MEDIUM": "SHOULD", "중간": "SHOULD",
-            "선택": "COULD", "LOW": "COULD", "낮음": "COULD",
-        }
-        valid_priorities = {m.value for m in MoSCoW}
-        for cf in fd.get("customFeatures") or []:
-            if isinstance(cf, dict):
-                pri = cf.get("priority", "MUST")
-                if pri not in valid_priorities:
-                    cf["priority"] = priority_map.get(pri, "MUST")
-
-        # commonFeatures: 문자열 아이템 → 객체 변환
-        common = fd.get("commonFeatures") or []
-        if common and isinstance(common[0], str):
-            fd["commonFeatures"] = [{"featureName": f, "selected": True} for f in common]
-        else:
-            # Chat에서 명시적으로 생성된 공통 기능은 사용자가 요청한
-            # supporting 후보이므로 selected 누락을 미선택으로 해석하지 않는다.
-            for cf in common:
-                if isinstance(cf, dict):
-                    cf.setdefault("selected", True)
-
-    # problemDefinition 필수 필드 보완
-    pd = node.get("problemDefinition")
-    if isinstance(pd, dict):
-        if not pd.get("currentPainPoint"):
-            pd["currentPainPoint"] = pd.get("painPoint") or pd.get("problem") or "정보 없음"
-        if not pd.get("currentSolution"):
-            pd["currentSolution"] = pd.get("solution") or "정보 없음"
-        if not pd.get("idealState"):
-            pd["idealState"] = pd.get("goal") or pd.get("ideal") or "정보 없음"
-
-    # targetUsers 필수 필드 보완
-    for tu in node.get("targetUsers") or []:
-        if isinstance(tu, dict):
-            if not tu.get("persona"):
-                tu["persona"] = "일반 사용자"
-            if not tu.get("usageEnvironment"):
-                tu["usageEnvironment"] = tu.get("environment") or "일반적인 환경"
-            if not tu.get("biggestPainPoint"):
-                tu["biggestPainPoint"] = tu.get("painPoint") or "정보 없음"
-
-    return node
-
-
-async def _generate_dynamic_suggestions(question_idx: int, context: str, client) -> list[str]:
-    """
-    사용자 컨텍스트를 기반으로 동적 suggestions 생성
-    """
-    if question_idx < 0 or question_idx >= _QUESTION_COUNT:
-        return []
-
-    question = _QUESTIONS[question_idx]
-
-    # 동적 suggestions 프롬프트 - 매우 명확하게
-    dynamic_prompt = f"""사용자의 다음 질문에 대한 좋은 답변 예시 3개를 JSON으로 생성하세요.
-
-현재까지 수집한 정보:
-{context}
-
-다음 질문 #{question_idx + 1}: {question['label']}
-
-질문 가이드:
-{question['guideline']}
-
-답변 형식: {question['suggestion_format']}
-
-답변 형식: {{"suggestions": ["...", "...", "..."]}}
-
-중요한 규칙:
-- 절대 이전 질문의 답변으로 혼동하지 말 것
-- 위 '수집한 정보'에 나온 사용자의 실제 상황에 맞춘 구체적인 내용일 것
-- 각 suggestion은 사용자가 그대로 입력할 수 있는 완성된 문장
-- 반드시 정확히 3개, 서로 다른 방향으로
-- 자리표시자(예: "답변1", "기능명") 금지 — 실제 내용이어야 함"""
-
-    try:
-        messages_for_suggestions = [
-            {"role": "system", "content": "사용자의 맥락을 기반으로 각 질문에 정확히 맞는 suggestions을 생성합니다. JSON만 출력하세요."},
-            {"role": "user", "content": dynamic_prompt}
-        ]
-
-        raw = await _call_openai(client, messages_for_suggestions, max_tokens=500)
-        node = try_parse_json(raw)
-
-        if node and isinstance(node, dict):
-            suggestions = _clean_suggestions(node.get("suggestions"))
-            if len(suggestions) == 3:
-                logger.info("동적 suggestions 생성 성공 (질문: %s)", question["label"])
-                return suggestions
-            logger.warning(
-                "동적 suggestions 유효 항목 부족 (%d/3, 질문: %s)", len(suggestions), question["label"],
-            )
-
-    except Exception as e:
-        logger.warning("동적 suggestions 생성 실패: %s", e)
-
-    return []
-
-
-async def _regenerate_question(
-    client, collection_messages: list[dict], question_idx: int,
-) -> tuple[str | None, list[str]]:
-    """message가 프롬프트 예시의 에코로 판정됐을 때, 무엇이 잘못됐는지 명시해 한 번 더 생성.
-    (프롬프트만으로는 안 잡히는 EXAONE 특성상 재요청도 실패할 수 있어 결과는 다시 검증한다)"""
-    label = _QUESTIONS[question_idx]["label"]
-    retry_messages = collection_messages + [{
-        "role": "user",
-        "content": (
-            "방금 응답의 message가 지시문에 있던 예시 문장을 그대로 복사한 것이었습니다. "
-            f"'{label}' 항목을, 사용자가 앞서 실제로 사용한 표현을 인용하면서 "
-            "완전히 새로운 한 문장으로 다시 질문하세요. suggestions 3개도 함께 다시 만드세요. "
-            "JSON만 출력하세요."
-        ),
-    }]
-    try:
-        raw = await _call_openai(client, retry_messages, max_tokens=800)
-        node = try_parse_json(raw)
-        if not (node and isinstance(node, dict)):
-            return None, []
-        msg = node.get("message")
-        cleaned = _strip_format_hint(msg) if isinstance(msg, str) else None
-        return (cleaned if _is_valid_question(cleaned) else None), _clean_suggestions(node.get("suggestions"))
-    except Exception as e:
-        logger.warning("질문 재생성 실패: %s", e)
-        return None, []
-
-
 async def _generate_project_name_candidates(messages: list[ChatMessageDto], client) -> list[str]:
     """
     사용자의 답변을 분석해서 프로젝트 이름 3가지 후보 생성
@@ -853,10 +729,13 @@ async def _generate_project_name_candidates(messages: list[ChatMessageDto], clie
                 name for name in _clean_suggestions(node.get("names"))
                 if _is_valid_generated_project_name(name)
             ]
-            if len(names) == 3:
-                logger.info("프로젝트 이름 후보 생성 성공: %s", names)
-                return names
-            logger.warning("프로젝트 이름 후보 유효 항목 부족 (%d/3)", len(names))
+            # 유효한 후보는 3개가 안 되더라도 살린다. 전부 버리고 fallback으로
+            # 대체하면 모델이 만든 멀쩡한 이름까지 기계적인 조합어로 바뀐다.
+            if names:
+                logger.info("프로젝트 이름 후보 생성 — 유효 %d/3: %s", len(names), names)
+            else:
+                logger.warning("프로젝트 이름 후보 유효 항목 없음")
+            return names
     
     except Exception as e:
         logger.warning("프로젝트 이름 생성 실패: %s", e)
@@ -939,8 +818,15 @@ async def _finish_collection(
     if not state["extras"]:
         project_name_candidates = await _generate_project_name_candidates(messages, client)
 
+        # 모델이 만든 유효한 이름은 유지하고 모자란 개수만 fallback으로 채운다.
         if len(project_name_candidates) < 3:
-            project_name_candidates = _fallback_project_name_candidates(state)
+            seen = {_normalize(name) for name in project_name_candidates}
+            for name in _fallback_project_name_candidates(state):
+                if len(project_name_candidates) >= 3:
+                    break
+                if _normalize(name) not in seen:
+                    project_name_candidates.append(name)
+                    seen.add(_normalize(name))
 
         if project_name_candidates:
             logger.info("프로젝트 이름 후보 제시 | candidates=%s", project_name_candidates)
@@ -1061,8 +947,11 @@ async def message(req: ChatRequest) -> dict:
 
         # 프롬프트 에코 방어. 추가 LLM 재생성은 하지 않고 fallback을 사용해
         # 한 번의 사용자 메시지가 여러 upstream 호출로 늘어나지 않게 한다.
+        # _contextual_question은 템플릿 기반이라 정상적으로는 항상 유효하다.
+        # 템플릿이 바뀌어 무효 문장이 나오면 결정론적 fallback으로 되돌린다.
         if not _is_valid_question(question):
-            logger.warning("질문이 프롬프트 에코/무효 (idx=%d): %r — fallback 사용", q_idx, question)
+            logger.warning("질문이 프롬프트 에코/무효 (idx=%d): %r — fallback 질문 사용", q_idx, question)
+            question = _QUESTIONS[q_idx]["fallback_question"]
 
         # suggestions가 부족해도 추가 LLM 호출을 하지 않고 정적 fallback으로 보충한다.
         if len(suggestions) < 3:
@@ -1075,10 +964,6 @@ async def message(req: ChatRequest) -> dict:
                 if valid and _normalize(normalized) not in existing:
                     suggestions.append(normalized)
                     existing.add(_normalize(normalized))
-
-        if not question:
-            logger.warning("질문 재생성도 실패 — 결정론적 fallback 질문 사용 (idx=%d)", q_idx)
-            question = _QUESTIONS[q_idx]["fallback_question"]
 
         return ok({
             "message": question,

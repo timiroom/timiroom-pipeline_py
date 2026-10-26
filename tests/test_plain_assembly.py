@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 
 import main
+import routers.chat as chat_module
 from phase2.agents.prd_agent import _parse_plain_section
 from routers.chat import (
     ChatMessageDto,
@@ -11,6 +12,7 @@ from routers.chat import (
     _collect_interview_state,
     _contextual_fallback_suggestions,
     _extract_service_subject,
+    _fallback_project_name_candidates,
     _is_valid_generated_project_name,
     _parse_labeled_text,
     _synthesize_form_data,
@@ -286,3 +288,95 @@ def test_prd_plain_sections_are_assembled_into_nested_python_objects():
     assert scope["mvpScope"]["excluded"] == ["추천"]
     assert tech["techStack"]["backend"].startswith("FastAPI")
     assert tech["techStack"]["auth"]
+
+
+def test_chat_synthesis_hands_a_runnable_form_to_the_pipeline():
+    """채팅 합성 결과가 그대로 /orchestration/generate 입력으로 성립해야 한다."""
+    import json
+
+    from phase1.form_to_query import FormToQueryService
+    from phase1.models import FormData
+
+    messages = [ChatMessageDto(role="user", content=text) for text in (
+        "대화에서 할 일을 자동으로 정리해주는 서비스를 만들고 싶어요",
+        "웹과 앱 둘 다(WEB_APP) 필요해요",
+        "여러 대화방에 흩어진 할 일을 매번 직접 찾아야 해서 번거로워요",
+        "메모 앱에 그때그때 기록해 둬요",
+        "대화에서 할 일이 자동으로 정리되면 좋겠어요",
+        "여러 대화방에서 담당 업무를 확인하는 팀원",
+        "할 일 자동 추출, 담당자 지정, 마감일 알림",
+        "플로우메이트",
+    )]
+
+    state = _collect_interview_state(messages)
+    assert state["stage"] == 6
+    assert state["extras"] == ["플로우메이트"]
+
+    payload = asyncio.run(_synthesize_form_data(messages, client=None))
+    assert payload is not None
+    assert payload["projectName"] == "플로우메이트"
+
+    form = FormData.model_validate_json(json.dumps(payload, ensure_ascii=False))
+    service = FormToQueryService()
+    assert form.platform.value == "WEB_APP"
+    assert service.extract_must_features(form) == ["할 일 자동 추출", "담당자 지정", "마감일 알림"]
+    assert service.extract_all_included_features(form)
+    assert service.synthesize(form).strip()
+
+
+def test_quoted_user_wording_gets_the_right_korean_particle():
+    """질문은 사용자 문장을 그대로 인용하므로 조사가 종성에 맞아야 한다."""
+    from routers.chat import _josa
+
+    assert _josa("번거로워요", "이라고", "라고") == "라고"
+    assert _josa("자동 정리됨", "이라고", "라고") == "이라고"
+    assert _josa("한눈에 보이는 통합 화면", "을", "를") == "을"
+    assert _josa("정리되면 좋겠어요", "을", "를") == "를"
+    # anchor()가 붙이는 말줄임표는 건너뛰고 마지막 한글로 판단한다.
+    assert _josa("아주 긴 문장…", "이라고", "라고") == "이라고"
+    assert _josa("", "이라고", "라고") == "라고"
+
+    messages = [ChatMessageDto(role="user", content=value) for value in (
+        "할 일 정리 서비스", "웹", "할 일이 여기저기 흩어져서 번거로워요", "메모 앱에 기록해요",
+        "한눈에 보이는 통합 화면",
+    )]
+    assert "번거로워요’라고 하셨는데" in chat_module._contextual_question(messages, 2)
+    assert "통합 화면’을 가장 필요로" in chat_module._contextual_question(messages, 4)
+
+
+def test_service_subject_rejects_a_whole_clause_and_uses_the_managed_noun():
+    """관리 대상 자리에 절이 잡히면 기능 제안과 프로젝트명이 모두 망가진다.
+
+    실측(사내 비품 요청·승인 라이브): '필요할 때 요청하고 관리자가 승인하는 과정'이
+    주어로 잡혀 '필요할때요청하고관리메이트'가 후보로 제시됐다.
+    """
+    state = {
+        "idea": "회사에서 비품이 필요할 때 요청하고 관리자가 승인하는 과정을 관리하는 서비스를 만들고 싶어요",
+        "answers": [
+            "웹사이트(WEB)로 만들고 싶어요",
+            "비품 요청을 메신저로 보내서 추적이 안 되고 승인 여부도 흐려져요",
+            "엑셀 파일에 요청 내역을 적고 메신저로 승인 여부를 주고받아요",
+            "요청부터 승인, 지급까지 상태가 한 화면에서 보이고 담당자가 바뀌어도 이력이 남으면 좋겠어요",
+            "비품을 요청하는 일반 직원과 요청을 승인하는 총무 담당자",
+            "비품 요청 등록, 요청 승인 및 반려, 재고 수량 관리",
+        ],
+    }
+
+    assert _extract_service_subject(state) == "비품"
+    assert _fallback_project_name_candidates(state) == ["비품메이트", "비품플로우", "비품허브"]
+    assert all("비품" in suggestion for suggestion in _contextual_fallback_suggestions(5, state))
+
+
+def test_subject_phrase_filter_keeps_noun_phrases_and_drops_clauses():
+    from routers.chat import _is_subject_phrase
+
+    for value in ("비품", "할 일", "과제와 시험 일정", "재고 수량"):
+        assert _is_subject_phrase(value), value
+    for value in (
+        "필요할 때 요청하고 관리자가 승인하는 과정",
+        "담당자가 바뀌어도 남는 이력",
+        "자동으로 정리되는 목록",
+        "요청하는 비품",
+        "",
+    ):
+        assert not _is_subject_phrase(value), value

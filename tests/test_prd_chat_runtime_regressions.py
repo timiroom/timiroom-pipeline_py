@@ -141,8 +141,16 @@ def test_chat_name_candidates_reject_generated_sentences_and_use_contextual_fall
     ])))["data"]
 
     assert result["stage"] == "naming"
-    assert len(result["suggestions"]) == 3
-    assert all("과제와시험일정" in name for name in result["suggestions"])
+    suggestions = result["suggestions"]
+    assert len(suggestions) == 3
+    # 문장형·조어형 후보는 거절한다.
+    assert "업무수퍼고" not in suggestions
+    assert "업무를 놓치지 않는 서비스" not in suggestions
+    # 모델이 만든 유효한 이름은 버리지 않고 유지하고, 모자란 개수만
+    # 사용자 문맥 기반 fallback으로 채운다. 전부 fallback으로 교체하면
+    # 멀쩡한 이름까지 기계적인 조합어가 된다.
+    assert suggestions[0] == "TaskPulse"
+    assert all("과제와시험일정" in name for name in suggestions[1:])
 
 
 def test_chat_accepts_corrected_project_name_after_rejected_name(monkeypatch):

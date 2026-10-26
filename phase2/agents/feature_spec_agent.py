@@ -925,6 +925,7 @@ class FeatureSpecAgent:
             max_tokens=settings.feature_spec_max_completion_tokens,
             reasoning_effort=settings.feature_spec_reasoning_effort,
             timeout_seconds=settings.feature_spec_request_timeout_seconds,
+            max_attempts=settings.feature_spec_max_attempts,
             draft=True,
         )
         state = state.copy(generation_diagnostics=[*state.generation_diagnostics, *diagnostics])

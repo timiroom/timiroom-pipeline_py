@@ -43,6 +43,7 @@ class OrchestrationGraph:
         resync_timeout_seconds: float = 120.0,
         dba_resync_timeout_seconds: float | None = None,
         api_resync_timeout_seconds: float | None = None,
+        max_targeted_repair_per_domain: int = 1,
     ):
         self._search = search_agent
         self._pm = pm_agent
@@ -58,6 +59,12 @@ class OrchestrationGraph:
             raise ValueError("repair_timeout_seconds는 0보다 커야 합니다")
         if resync_timeout_seconds <= 0:
             raise ValueError("resync_timeout_seconds는 0보다 커야 합니다")
+        if max_targeted_repair_per_domain <= 0:
+            raise ValueError("max_targeted_repair_per_domain은 1 이상이어야 합니다")
+        # 복구를 실제로 수행하는 쪽이 예산을 몰라 상수 1을 쓰면, RetryService가
+        # 더 큰 예산으로 재시도를 보내도 _bounded_repair가 budget_exhausted로
+        # 아무 일도 하지 않고 끝난다. 설정된 예산이 조용히 무시된다.
+        self._max_targeted_repair_per_domain = max_targeted_repair_per_domain
         self._timeout_seconds = timeout_seconds
         self._repair_timeout_seconds = repair_timeout_seconds
         self._dba_resync_timeout_seconds = dba_resync_timeout_seconds or resync_timeout_seconds
@@ -159,7 +166,7 @@ class OrchestrationGraph:
             repaired, _ = await self._resync_prd(after_pm, after_prd, validation_error, pipeline_id,
                                                 domains=targets & {"db", "api"})
             self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
-            return await self._qa.execute(repaired)
+            return await self._qa.execute(self._align_api_to_final_db(repaired))
 
         if not targets:
             logger.warning("선택적 재생성 대상을 판단할 수 없어 QA 정규화 후 Phase 3로 반환")
@@ -190,12 +197,15 @@ class OrchestrationGraph:
             tasks.append(self._bounded_repair("api", self._api, state, validation_error))
             labels.append("API")
 
-        self._progress.send(
-            pipeline_id,
-            "PHASE2_REPAIR",
-            f"검증 실패 영역만 재생성 중: {', '.join(labels)}",
-            72,
-        )
+        # PRD만 복구된 경우 targets가 비어 재생성할 산출물이 없다. 빈 라벨로
+        # PHASE2_REPAIR를 보내면 화면이 DB·API 설계 단계로 되돌아간 것처럼 보인다.
+        if labels:
+            self._progress.send(
+                pipeline_id,
+                "PHASE2_REPAIR",
+                f"검증 실패 영역만 재생성 중: {', '.join(labels)}",
+                72,
+            )
         results = await asyncio.gather(*tasks)
         for label, result in zip(labels, results, strict=True):
             domain = "db" if label == "DB" else "api"
@@ -232,11 +242,17 @@ class OrchestrationGraph:
                 )
 
         self._progress.send(pipeline_id, "QA_REPAIR", "수정 산출물 재검수 중...", 78)
-        return await self._qa.execute(repair_state)
+        return await self._qa.execute(self._align_api_to_final_db(repair_state))
 
     @staticmethod
     def _align_api_to_final_db(state: PipelineState) -> PipelineState:
-        """Reconcile fields after both parallel drafts are available."""
+        """Reconcile API contracts against the final DB schema.
+
+        Runs after the parallel DBA/API drafts and again after every repair that
+        can move either artifact. A db-only repair otherwise leaves
+        featureMappings and request/response schemas bound to the previous
+        tables, which QA and Phase 3 then report as a contract blocker.
+        """
         api = try_parse_json(state.api_spec)
         db = try_parse_json(state.db_schema)
         if not isinstance(api, dict) or not isinstance(db, dict):
@@ -293,7 +309,7 @@ class OrchestrationGraph:
                 if label == "PRD":
                     current, handled = await self._resync_prd(before, current, feedback, pipeline_id, dump)
             self._progress.send(pipeline_id, "QA_RECHECK", "수정된 문서 관계 재검증 중...", 88)
-            return await self._qa.execute(current, dump)
+            return await self._qa.execute(self._align_api_to_final_db(current), dump)
 
     @staticmethod
     async def _repair_agent(agent, state: PipelineState, feedback: str) -> PipelineState:
@@ -305,7 +321,7 @@ class OrchestrationGraph:
         return state.copy(generation_blockers=[*state.generation_blockers, blocker], qa_approved=False)
 
     async def _bounded_repair(self, domain, agent, state, feedback):
-        if not available_targets(state, {domain}):
+        if not available_targets(state, {domain}, self._max_targeted_repair_per_domain):
             return state.copy(targeted_repair_results={**state.targeted_repair_results, domain: "budget_exhausted"})
         if not callable(getattr(agent, "repair", None)):
             result = await self._repair_agent(agent, state, feedback)

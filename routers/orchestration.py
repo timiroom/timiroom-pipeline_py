@@ -182,6 +182,8 @@ async def _run_pipeline_inner(
                 target_users=form_data.target_users,
                 must_features=form_to_query_svc.extract_must_features(form_data),
                 supporting_feature_names=form_to_query_svc.extract_supporting_features(form_data),
+                should_features=form_to_query_svc.extract_should_features(form_data),
+                could_features=form_to_query_svc.extract_could_features(form_data),
                 excluded_features=form_to_query_svc.extract_excluded_features(form_data),
                 feature_list=form_to_query_svc.extract_all_included_features(form_data),
                 user_query=user_query,
