@@ -28,6 +28,7 @@ MAX_CONCURRENT_PIPELINES = 10  # Java AsyncConfig.pipelineExecutor(core=4, max=1
 
 router = APIRouter(prefix="/api/v1/orchestration", tags=["orchestration"])
 _pipeline_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PIPELINES)
+_pipeline_tasks: set[asyncio.Task] = set()
 
 
 def _services():
@@ -83,11 +84,14 @@ async def generate(
 
     (rag_svc, orch, val_svc, retry_svc, kafka_svc, progress_svc, form_to_query_svc) = _services()
 
-    asyncio.create_task(
+    progress_svc.send(pipeline_id, "QUEUED", "파이프라인 실행 대기 중...", 0)
+    task = asyncio.create_task(
         _run_pipeline(pipeline_id, form_data, pdf_bytes,
                       rag_svc, orch, val_svc, retry_svc, kafka_svc, progress_svc,
                       form_to_query_svc, skip_phase1=skip_phase1)
     )
+    _pipeline_tasks.add(task)
+    task.add_done_callback(_pipeline_tasks.discard)
 
     return ok({"pipelineId": pipeline_id})
 
@@ -118,6 +122,12 @@ async def progress(pipeline_id: str):
 async def storage_status(pipeline_id: uuid.UUID):
     _, _, _, _, kafka_svc, _, _ = _services()
     return ok(await kafka_svc.storage_status(str(pipeline_id)))
+
+
+@router.get("/state/{pipeline_id}")
+async def execution_state(pipeline_id: uuid.UUID):
+    _, _, _, _, _, progress_svc, _ = _services()
+    return ok(progress_svc.snapshot(str(pipeline_id)))
 
 
 async def _run_pipeline(

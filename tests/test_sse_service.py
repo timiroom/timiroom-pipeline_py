@@ -85,3 +85,53 @@ def test_backend_watcher_and_browser_both_receive_terminal_and_progress():
         assert len(events[0]) == 2
         assert "p" not in service._queues
     asyncio.run(scenario())
+
+
+def test_idle_llm_call_emits_heartbeats_without_replaying_progress():
+    async def scenario():
+        service = PipelineProgressService(heartbeat_seconds=0.01)
+        service.send("slow", "PRD", "작성 중", 50)
+        stream = service.subscribe("slow")
+        assert 'event: progress' in await anext(stream)
+        assert 'event: heartbeat' in await asyncio.wait_for(anext(stream), 0.5)
+        assert service.snapshot("slow")["lastProgress"]["step"] == "PRD"
+        service.complete("slow", {"storage": {"status": "stored"}})
+        assert 'event: complete' in await anext(stream)
+        await stream.aclose()
+        assert "slow" not in service._queues
+    asyncio.run(scenario())
+
+
+def test_unknown_worker_run_is_not_an_infinite_running_stream():
+    service = PipelineProgressService()
+    events = asyncio.run(_collect(service, "missing"))
+    assert len(events) == 1 and events[0].startswith("event: connection")
+    assert "PROGRESS_NOT_FOUND" in events[0]
+    assert service.snapshot("missing")["status"] == "UNKNOWN"
+    assert not service._queues
+
+
+def test_snapshot_recovers_a_missed_terminal_event_without_generation():
+    service = PipelineProgressService()
+    service.send("failed", "FEATURE_SPEC", "생성 중", 55)
+    service.error("failed", "계약 누락", {"failedStage": "FEATURE_SPEC"})
+    assert service.snapshot("failed")["error"]["failedStage"] == "FEATURE_SPEC"
+    service.complete("stored", {"storage": {"status": "stored"}})
+    assert service.snapshot("stored") == {"status": "COMPLETED", "result": {"storage": {"status": "stored"}}}
+
+
+def test_state_endpoint_returns_missed_terminal_without_starting_pipeline(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from routers import orchestration
+
+    service = PipelineProgressService()
+    pipeline_id = "3d7d00ad-35d8-4578-b8f2-3ff3134c0b43"
+    service.complete(pipeline_id, {"storage": {"status": "stored"}})
+    monkeypatch.setattr(orchestration, "_services", lambda: (None, None, None, None, None, service, None))
+    app = FastAPI()
+    app.include_router(orchestration.router)
+    response = TestClient(app).get(f"/api/v1/orchestration/state/{pipeline_id}")
+    assert response.status_code == 200
+    assert response.json()["data"] == {"status": "COMPLETED", "result": {"storage": {"status": "stored"}}}
