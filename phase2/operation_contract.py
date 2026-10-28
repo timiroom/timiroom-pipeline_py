@@ -20,6 +20,14 @@ from phase2.contract_quality import (
 from phase2.feature_scope import artifact_required
 
 
+def _without_nulls(value):
+    if isinstance(value, dict):
+        return {key: _without_nulls(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_without_nulls(item) for item in value]
+    return value
+
+
 def route_key(operation: dict) -> tuple[str, str]:
     path = normalize_api_path(operation.get("path"))
     return canonical_api_method(operation.get("method"), path), re.sub(r"\{[^}]+\}", "{}", path)
@@ -51,8 +59,12 @@ def _auth_features(registry):
 
 def session_tables(registry):
     explicit, inferred = set(), set()
-    fields = {}
+    fields, issued = {}, set()
     for _, feature in _auth_features(registry):
+        for operation in feature.get("apiContract") or []:
+            if isinstance(operation, dict) and operation.get("authRequired") is False:
+                issued.update(effect.get("table") for effect in operation.get("effects") or []
+                              if isinstance(effect, dict) and effect.get("kind") in {"insert", "create"})
         policies = [feature.get("sessionPolicy"), *(op.get("sessionPolicy") for op in feature.get("apiContract") or [] if isinstance(op, dict))]
         for policy in policies:
             if isinstance(policy, dict) and (policy.get("sessionTable") or policy.get("table")):
@@ -61,6 +73,11 @@ def session_tables(registry):
             if isinstance(field, dict) and isinstance(field.get("table"), str) and isinstance(field.get("name"), str):
                 fields.setdefault(field.get("table"), set()).add(field.get("name"))
     inferred = {name for name, names in fields.items() if name and {"token_hash", "expires_at"} <= names}
+    # Invite/reset tokens share token_hash+expires_at but are written by an
+    # authenticated issuer, not by the public login/signup that opens a session.
+    # Counting them made a single declared sessionTable an unrepairable conflict.
+    if issued:
+        inferred &= issued
     return explicit, inferred
 
 
@@ -89,7 +106,12 @@ def is_public_session_entry(operation: dict, feature: dict) -> bool:
     return (
         operation.get("authRequired") is False
         and str(operation.get("method")).upper() == "POST"
-        and operation.get("action") in {"register", "signup", "login", "refresh", "create"}
+        # Decided by structure, not by the action's wording: any unauthenticated
+        # POST that inserts into the declared session table opens a session
+        # (login, invite acceptance, magic link...). Verbs that end a session or
+        # change existing data are excluded.
+        and not re.search(r"log_?out|sign_?out|revoke|update|edit|patch|delete|remove",
+                          str(operation.get("action") or ""), re.IGNORECASE)
         and policy.get("strategy") in {"bearer_session", "refresh_token"}
         and bool(table)
         and table in (feature.get("dbContract") or {}).get("tables", [])
@@ -408,6 +430,27 @@ def operation_schema_issues(endpoint: dict, tables: dict[str, dict], schemas: di
     return list(dict.fromkeys(issues))
 
 
+def _merge_field_mappings(current, incoming) -> list | None:
+    """Union field bindings; None when one field/source is bound to two storage targets."""
+    if not isinstance(current, list) or not isinstance(incoming, list):
+        return None
+    merged, bound = deepcopy(current), {}
+    for item in current:
+        if isinstance(item, dict):
+            bound[(item.get("field"), item.get("source"))] = (item.get("table"), item.get("column"))
+    for item in incoming:
+        if not isinstance(item, dict):
+            return None
+        key, target = (item.get("field"), item.get("source")), (item.get("table"), item.get("column"))
+        if key in bound:
+            if bound[key] != target:
+                return None
+            continue
+        bound[key] = target
+        merged.append(deepcopy(item))
+    return merged
+
+
 def operation_registry(registry: list[dict]) -> tuple[dict, list[str]]:
     """A route has one contract; disjoint declarations merge, conflicts never overwrite."""
     operations, issues = {}, []
@@ -428,6 +471,11 @@ def operation_registry(registry: list[dict]) -> tuple[dict, list[str]]:
                 if field in {"requiredInputs", "requiredOutputs", "requiredEffectTables"}:
                     entry[field] = list(dict.fromkeys([*entry.get(field, []), *contract[field]]))
                     continue
+                if field == "fieldMappings" and field in entry:
+                    merged = _merge_field_mappings(entry[field], contract[field])
+                    if merged is not None:
+                        entry[field] = merged
+                        continue
                 if field in entry and entry[field] != contract[field]:
                     issues.append(f"API_OPERATION_CONTRACT_CONFLICT: {key[0]} {key[1]} {field}; featureIds={','.join(entry['featureIds'])}")
                 else:
@@ -538,7 +586,9 @@ def cross_contract_issues(registry: list[dict], db: dict, api: dict, prd: dict) 
             if endpoint is not None:
                 for key in ("requestSchema", "responseSchema", "contentType", "successStatus", "fieldMappings", "effects",
                             "sessionPolicy", "allowedRoles", "responseHeaders", "authRequired", "accessScope", "primaryTable", "pagination"):
-                    if key in contract and endpoint.get(key) != contract[key]:
+                    # Agents serialize absent optional values either as null or by
+                    # omitting the key; only a real value difference is drift.
+                    if key in contract and _without_nulls(endpoint.get(key)) != _without_nulls(contract[key]):
                         issues.append(("API_OPERATION_CONTRACT_DRIFT", "api", f"{fid}: {route_key(contract)} {key}"))
         if not artifact_required(feature, "db"):
             continue

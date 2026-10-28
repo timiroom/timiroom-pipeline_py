@@ -39,12 +39,12 @@ def save(run_dir: Path, name: str, value) -> None:
     (run_dir / name).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def chat(run_dir: Path, answers: list[str]) -> dict:
+def chat(run_dir: Path, answers: list[str], name: str = NAME) -> dict:
     messages: list[dict] = []
     trace: list[dict] = []
     pending = list(answers)
     for turn in range(len(answers) + 4):
-        answer = pending.pop(0) if pending else NAME
+        answer = pending.pop(0) if pending else name
         messages.append({"role": "user", "content": answer})
         began = time.time()
         response = requests.post(f"{BASE}/api/v1/chat/message", json={"messages": messages}, timeout=180)
@@ -61,14 +61,16 @@ def chat(run_dir: Path, answers: list[str]) -> dict:
 
 def main() -> int:
     slug = sys.argv[1] if len(sys.argv) > 1 else "tool-lending"
-    answers = DEFAULT_ANSWERS
+    answers, name = DEFAULT_ANSWERS, NAME
     if len(sys.argv) > 2:
-        answers = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+        # Either a plain answer list or {"name": ..., "answers": [...]}.
+        topic = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+        answers, name = (topic["answers"], topic.get("name", NAME)) if isinstance(topic, dict) else (topic, NAME)
     run_dir = ROOT / "test-runs" / f"live-{slug}-{datetime.now(timezone.utc):%Y%m%d-%H%M%SZ}"
     run_dir.mkdir(parents=True)
     stamp(f"RUN_DIR={run_dir}")
 
-    form_data = chat(run_dir, answers)
+    form_data = chat(run_dir, answers, name)
     save(run_dir, "form_data.json", form_data)
 
     response = requests.post(

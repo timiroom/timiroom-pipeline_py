@@ -736,3 +736,39 @@ def test_feature_spec_publishes_read_contracts_to_prd_without_losing_them_in_nor
     assert not result.generation_blockers
     assert json.loads(result.prd_document)["coreFeatures"][0]["readDependencies"] == result.feature_registry[0]["readDependencies"]
     assert provider.chat.completions.create.await_count == 1
+
+
+def test_existing_lookup_route_is_repairable_in_place():
+    # Live run (academy-makeup): GET /makeup-requests existed but was flagged as a
+    # missing lookup; listing it only as an append key rejected the model's fix.
+    from phase2.feature_draft import repair_scope
+    payload = {"features": [{"featureId": "makeup.assignment", "apiContract": [
+        {"method": "GET", "path": "/api/v1/makeup-requests"}, {"method": "POST", "path": "/api/v1/makeup-schedules"}]}]}
+    issues = ["WORKFLOW_LOOKUP_MISSING: /features/0/readDependencies: GET /api/v1/makeup-requests: lookup",
+              "WORKFLOW_LOOKUP_MISSING: /features/0/readDependencies: GET /api/v1/makeup-schedules: lookup"]
+    scope = repair_scope(payload, issues, [])
+    assert scope["operationIndices"]["makeup.assignment"] == [0]
+    assert scope["missingOperationKeys"]["makeup.assignment"] == ["GET /api/v1/makeup-schedules"]
+
+
+def test_list_route_returning_the_parameter_field_counts_as_lookup():
+    from phase2.workflow_contract import _lists_parameter
+    listing = {"method": "GET", "path": "/api/v1/absences", "authRequired": True, "allowedRoles": ["principal"], "parameters": [],
+               "responseSchema": {"type": "object", "properties": {"items": {"type": "array", "items": {
+                   "type": "object", "properties": {"absenceId": {"type": "string", "format": "uuid"}}}}}}}
+    parameter = [{"name": "absenceId", "in": "path"}]
+    assert _lists_parameter([listing], "/api/v1/absences", parameter, ["principal"])
+    assert not _lists_parameter([listing], "/api/v1/absences", [{"name": "studentId", "in": "path"}], ["principal"])
+    assert not _lists_parameter([listing], "/api/v1/absences", parameter, ["guardian"])
+
+
+def test_lookup_missing_names_the_roles_that_must_discover_the_identifier():
+    parameter = {"name": "assetId", "in": "path", "schema": {"type": "string", "format": "uuid"}}
+    feature = {"workflowContractVersion": 1, "applicability": {"ui": True}, "apiContract": [
+        {"method": "PATCH", "path": "/api/v1/assets/{assetId}", "authRequired": True, "allowedRoles": ["MANAGER"], "parameters": [parameter]},
+        {"method": "GET", "path": "/api/v1/assets", "authRequired": True, "allowedRoles": ["MEMBER"],
+         "responseSchema": {"type": "array", "items": {"type": "object", "properties": {"assetId": {"type": "string"}}}}}]}
+    issues = [value for value in workflow_contract_issues([feature]) if "WORKFLOW_LOOKUP_MISSING" in value]
+    assert issues and "['MANAGER']" in issues[0] and "extend its allowedRoles" in issues[0]
+    feature["apiContract"][1]["allowedRoles"] = ["MEMBER", "MANAGER"]
+    assert not any("WORKFLOW_LOOKUP_MISSING" in value for value in workflow_contract_issues([feature]))

@@ -473,3 +473,38 @@ def test_auth_policy_binding_does_not_enrich_explicit_physical_contract():
     before = deepcopy(item["dbContract"])
     bind_auth_registry_policy([item])
     assert item["dbContract"] == before
+
+
+def test_invite_token_table_is_not_a_second_session_table():
+    # Live run (academy-makeup): account_invites(token_hash, expires_at) next to the
+    # declared user_sessions table blocked Feature Spec with an unrepairable conflict.
+    from phase2.operation_contract import session_policy_issues
+    policy = {"strategy": "bearer_session", "sessionTable": "user_sessions"}
+    fields = [{"table": "user_sessions", "name": "session_token_hash"}, {"table": "user_sessions", "name": "expires_at"},
+              {"table": "account_invites", "name": "token_hash"}, {"table": "account_invites", "name": "expires_at"}]
+    feature = {"sessionPolicy": policy, "dbContract": {"fields": fields}, "apiContract": [
+        {"method": "POST", "path": "/api/v1/auth/login", "authRequired": False, "effects": [{"table": "user_sessions", "kind": "insert"}]},
+        {"method": "POST", "path": "/api/v1/auth/invitations", "authRequired": True, "effects": [{"table": "account_invites", "kind": "insert"}]},
+    ]}
+    assert session_policy_issues([feature]) == []
+    # A second table that public login actually writes is still a conflict.
+    feature["apiContract"][0]["effects"].append({"table": "account_invites", "kind": "insert"})
+    assert session_policy_issues([feature])
+
+
+def test_shared_route_unions_compatible_field_mappings():
+    from phase2.operation_contract import operation_registry
+
+    def feature(fid, mappings):
+        return {"featureId": fid, "apiContract": [{"method": "GET", "path": "/api/v1/orders/{orderId}", "fieldMappings": mappings}]}
+
+    path = {"field": "orderId", "table": "orders", "column": "id", "source": "path"}
+    status = {"field": "status", "table": "orders", "column": "status", "source": "response"}
+    quantity = {"field": "items[].quantity", "table": "order_items", "column": "quantity", "source": "response"}
+    operations, conflicts = operation_registry([feature("a", [path, status]), feature("b", [path, quantity])])
+    assert conflicts == []
+    assert next(iter(operations.values()))["fieldMappings"] == [path, status, quantity]
+
+    clash = {"field": "status", "table": "orders", "column": "state", "source": "response"}
+    _, conflicts = operation_registry([feature("a", [path, status]), feature("b", [path, clash])])
+    assert any("fieldMappings" in item for item in conflicts)

@@ -1,5 +1,6 @@
 """Shallow generation transport compiled into the existing feature contracts."""
 
+import logging
 from copy import deepcopy
 from typing import Annotated, Literal
 
@@ -23,6 +24,9 @@ from phase2.workflow_contract import (
 )
 
 Scalar = str | int | float | bool | None
+
+
+logger = logging.getLogger(__name__)
 
 
 class DraftModel(BaseModel):
@@ -115,7 +119,9 @@ class DbFieldDraft(DraftModel):
     primaryKey: bool = False
     generated: bool = False
     unique: bool = False
-    source: Literal["request", "body", "path", "query", "auth", "server", "derived"] = "request"
+    # header covers values such as an Idempotency-Key stored for replay checks;
+    # without it one such column made the whole first draft unusable.
+    source: Literal["request", "body", "path", "query", "header", "auth", "server", "derived"] = "request"
     default: Scalar = None
     minimum: int | float | None = None
     maximum: int | float | None = None
@@ -375,6 +381,20 @@ def compile_document(payload):
     _unique(draft.features, "featureId", "/features")
     for index, table in enumerate(draft.tables):
         _unique(table.fields, "name", f"/tables/{index}/fields")
+        # A composite UNIQUE naming a column that this table does not define
+        # (e.g. a sibling table's version column) can never be built. DBA then
+        # drops the index and Phase3 repeats DB_UNIQUE_CONTRACT_MISSING until
+        # the run fails, so keep only constraints the table can implement.
+        declared = {field.name for field in table.fields}
+        kept = []
+        for unique in table.uniqueConstraints:
+            columns = unique.columns if isinstance(unique, UniqueDraft) else unique
+            if set(columns) <= declared:
+                kept.append(unique)
+            else:
+                logger.warning("Feature draft UNIQUE 제거 — %s.%s: 테이블에 없는 컬럼 %s",
+                               table.name, list(columns), sorted(set(columns) - declared))
+        table.uniqueConstraints = kept
     features = []
     for index, feature in enumerate(draft.features):
         data = feature.model_dump(by_alias=True, exclude_none=True)
@@ -474,9 +494,17 @@ def repair_scope(payload, issues, cores):
         missing_keys = sorted({f"{method} {path}" for issue in issues
                                if issue.startswith("WORKFLOW_LOOKUP_MISSING:") and re.search(rf"/features/{index}(?:/|:|$)", issue)
                                for method, path in re.findall(r"\b(GET|POST|PUT|PATCH) (/api/v1/[^\s:]+)", issue)})
+        op_indices = {int(value) for issue in issues for value in re.findall(rf"/features/{index}/apiContract/(\d+)", issue)}
+        # A lookup route that already exists (wrong output field or roles) has to
+        # be corrected in place. Listing it only as an append key made the merge
+        # reject the model's correct fix as "unrelated endpoint changed".
+        for op_index, operation in enumerate(_array(feature.get("apiContract"))):
+            key = f"{operation.get('method')} {operation.get('path')}" if isinstance(operation, dict) else None
+            if key in missing_keys:
+                missing_keys.remove(key)
+                op_indices.add(op_index)
         if missing_keys:
             scope["missingOperationKeys"][feature["featureId"]] = missing_keys
-        op_indices = {int(value) for issue in issues for value in re.findall(rf"/features/{index}/apiContract/(\d+)", issue)}
         if any(issue.startswith("API_REQUIRED_OUTPUT_MISSING:") and re.search(rf"/features/{index}(?:\s*:|$)", issue)
                for issue in issues):
             # A feature-level output defect also permits repairing its current

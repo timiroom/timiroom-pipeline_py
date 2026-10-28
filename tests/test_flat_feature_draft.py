@@ -490,6 +490,29 @@ def test_composite_unique_transport_uses_named_objects_and_preserves_legacy_inpu
     assert schema['$defs']['TableDraft']['properties']['uniqueConstraints']['items'] == {'$ref': '#/$defs/UniqueDraft'}
 
 
+def test_composite_unique_on_undeclared_column_is_dropped_not_propagated():
+    # Live run (club-dues): file_cleanup_jobs UNIQUE(stored_file_id, deletion_version)
+    # named a sibling table's column, so DBA dropped it and Phase3 failed forever.
+    payload = draft()
+    payload["tables"][0]["uniqueConstraints"] = [{"columns": ["id", "deletion_version"]}, {"columns": ["id", "name"]}]
+    assert compile_document(payload)[0]["dbContract"]["uniqueConstraints"] == [{"table": "items", "columns": ["id", "name"]}]
+
+
+def test_state_transition_effect_takes_from_and_to_from_declared_transitions():
+    from phase2.workflow_contract import normalize_state_transition_effects
+    feature = {"dbContract": {"primaryTable": "requests"},
+               "stateTransitions": [{"from": "requested", "to": "cancelled"}, {"from": "scheduled", "to": "cancelled"},
+                                    {"from": "requested", "to": "scheduled"}],
+               "apiContract": [{"effects": [{"kind": "state_transition", "table": "requests", "column": "status", "to": "cancelled"}]},
+                               {"effects": [{"kind": "state_transition", "table": "requests", "column": "status", "from": "requested"}]}]}
+    result, changes = normalize_state_transition_effects([feature])
+    cancel, schedule = (op["effects"] for op in result[0]["apiContract"])
+    # Many sources become one typed effect per source.
+    assert [(item["from"], item["to"]) for item in cancel] == [("requested", "cancelled"), ("scheduled", "cancelled")]
+    # requested -> {cancelled, scheduled} is ambiguous, so it stays for the model to repair.
+    assert schedule == feature["apiContract"][1]["effects"] and len(changes) == 1
+
+
 def test_invalid_json_retry_does_not_replay_unusable_assistant_output():
     broken = '{"features":[INVALID'
     create = AsyncMock(side_effect=[response(broken), response(draft())])
@@ -856,3 +879,42 @@ def test_supporting_type_requires_a_real_parent_and_reason_before_compilation():
     assert "/features/0/parentFeatureId" in str(error.value)
     assert "/features/0/reason" in str(error.value)
     assert "/features/0/supporting/" not in str(error.value)
+
+
+def test_scope_rejected_patch_keeps_draft_baseline_and_retries_patch():
+    payload = draft()
+    payload["features"][0]["apiContract"][0]["effects"] = [{"kind": "state_transition", "table": "items", "column": "name"}]
+    payload["features"][0]["ownership"] = {"scope": "SHARED", "ownerEntity": "unknown", "access": "Restricted to members"}
+    fixed = {"method": "POST", "path": "/api/v1/items", "effects": [{"kind": "insert", "table": "items"}]}
+    # Appending a route nobody asked for violates the repair scope.
+    rogue = {"features": [{"featureId": "items.create", "apiContract": [fixed, {"method": "GET", "path": "/api/v1/unrelated"}]}]}
+    repaired = {"features": [{"featureId": "items.create", "ownership": {"scope": "PUBLIC", "ownerEntity": "", "access": "Public creation"},
+                              "apiContract": [fixed]}]}
+    create = AsyncMock(side_effect=[response(payload), response(rogue), response(repaired)])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    features, diagnostics, failures = asyncio.run(generate_document(
+        client, "test", None, "JSON", [{"sourceFeatureId": "source.items"}], draft=True, max_attempts=3))
+    assert features and not failures and create.await_count == 3
+    assert diagnostics[1]["retryKind"] == "SCOPE_REJECTED_PATCH_RETRY"
+    # The retry stays a patch over the original draft, not a full regeneration.
+    last_prompt = create.call_args.kwargs["messages"][-1]["content"]
+    assert "FEATURE_OWNER_TABLE_UNKNOWN" in last_prompt and "unusable" not in last_prompt
+
+
+def test_unparseable_patch_keeps_baseline_issues_and_retries_patch():
+    payload = draft()
+    payload["features"][0]["apiContract"][0]["effects"] = [{"kind": "state_transition", "table": "items", "column": "name"}]
+    payload["features"][0]["ownership"] = {"scope": "SHARED", "ownerEntity": "unknown", "access": "Restricted to members"}
+    fixed = {"method": "POST", "path": "/api/v1/items", "effects": [{"kind": "insert", "table": "items"}]}
+    repaired = {"features": [{"featureId": "items.create", "ownership": {"scope": "PUBLIC", "ownerEntity": "", "access": "Public creation"},
+                              "apiContract": [fixed]}]}
+    broken = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"features":[{}]}\n}]', refusal=None),
+                                                      finish_reason="stop")], model="test", usage=None)
+    create = AsyncMock(side_effect=[response(payload), broken, response(repaired)])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    features, diagnostics, failures = asyncio.run(generate_document(
+        client, "test", None, "JSON", [{"sourceFeatureId": "source.items"}], draft=True, max_attempts=3))
+    assert features and not failures and create.await_count == 3
+    assert any(item.get("retryKind") == "UNPARSEABLE_PATCH_RETRY" for item in diagnostics)
+    last_prompt = create.call_args.kwargs["messages"][-1]["content"]
+    assert "FEATURE_OWNER_TABLE_UNKNOWN" in last_prompt and "unusable" not in last_prompt
