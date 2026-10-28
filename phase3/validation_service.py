@@ -3,6 +3,7 @@ import logging
 import re
 
 from phase2.agent_contract import IssueSeverity, classify_issue
+from phase2.execution_error import GENERATION_HALT_STAGES
 from phase2.openapi_spec import build_openapi_document
 from phase2.state import PipelineState
 from phase3.schema_validator import SchemaValidator
@@ -29,13 +30,41 @@ class ValidationService:
                 normalized.append(value)
         return normalized
 
+    @staticmethod
+    def _halted_generation(state: PipelineState) -> PipelineState:
+        """Report only the halt. A stage that never ran leaves no repairable defect.
+
+        Without this, a PM/PRD/SEARCH transport failure was reported as three
+        extra blockers ("DB 스키마: 값이 비어있습니다", ...) plus a PRD repair
+        target, so Phase3 dispatched repairs for artifacts no agent had been
+        asked to produce.
+        """
+        from phase2.validation_contract import issue_detail
+        messages = list(dict.fromkeys(state.generation_blockers))
+        details = [{**issue_detail(message.split(":", 1)[0], "prd", message),
+                    "repairable": False, "failedStage": state.failed_stage}
+                   for message in messages]
+        return state.copy(
+            validated=False, qa_approved=False,
+            qa_blocker_details=details, qa_issue_details=details, qa_repair_issues=[],
+            qa_db_blockers=[], qa_api_blockers=[], qa_prd_blockers=messages,
+            qa_db_warnings=[], qa_api_warnings=[], qa_prd_warnings=[],
+            validation_error_codes=sorted({detail["code"] for detail in details}),
+            validation_repair_targets=[], validation_blockers=messages,
+            validation_unresolved_blockers=messages,
+            last_validation_error="\n".join(messages),
+            status_message=f"{state.failed_stage} 생성 실패 — 이후 단계는 실행되지 않았습니다",
+        )
+
     def validate(self, state: PipelineState) -> PipelineState:
         from phase2.validation_contract import (
             artifact_revision,
             dedupe_issues,
             issue_detail,
         )
-        if state.failed_stage == "FEATURE_SPEC" and state.generation_blockers:
+        if state.failed_stage in GENERATION_HALT_STAGES and state.generation_blockers:
+            if state.failed_stage != "FEATURE_SPEC":
+                return self._halted_generation(state)
             # Missing downstream artifacts are consequences, not independent
             # repair targets. The producer already exhausted its own budget.
             diagnostic = next((item for item in reversed(state.generation_diagnostics) if item.get("issues")), {})

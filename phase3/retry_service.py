@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 
+from phase2.execution_error import GENERATION_HALT_STAGES
 from phase2.json_utils import try_parse_json
 from phase2.repair_budget import available_targets
 from phase2.state import PipelineState
@@ -45,10 +46,11 @@ class RetryService:
                 "REGISTRY_CONTRACT_BLOCKER:",
             ))
         ]
-        if terminal_generation_blockers or (state.failed_stage == "FEATURE_SPEC" and state.generation_blockers):
+        halted = state.failed_stage in GENERATION_HALT_STAGES and bool(state.generation_blockers)
+        if terminal_generation_blockers or halted:
             logger.warning(
                 "불변 generation blocker 감지 — Phase3 repair 재시도 중단: %s",
-                terminal_generation_blockers,
+                terminal_generation_blockers or state.generation_blockers,
             )
             return state.copy(
                 validated=False,

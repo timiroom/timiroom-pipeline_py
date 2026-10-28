@@ -14,6 +14,7 @@ from phase1.form_to_query import FormToQueryService
 from phase1.models import FormData
 from phase1.pdf_parsing import MAX_FILES
 from phase1.rag_pipeline import RagPipelineService
+from phase2.execution_error import state_from_error
 from phase2.orchestration_graph import OrchestrationGraph
 from phase2.sse_service import PipelineProgressService
 from phase2.state import PipelineState
@@ -344,6 +345,10 @@ async def _run_pipeline_inner(
 
     except Exception as e:
         logger.error("파이프라인 실패 | %s", e, exc_info=True)
+        # A stage that raised carries the artifacts finished before it. Without
+        # this the snapshot falls back to the pre-Phase2 state and a completed
+        # PRD, project plan or DB schema disappears from the failure report.
+        latest_state = state_from_error(e, latest_state)
         error_type = type(e).__name__
         ai = describe(e)
         # AI 제공사 오류는 원문(영어, 키 일부가 섞일 수 있음) 대신 한국어 안내와 코드를 보낸다
