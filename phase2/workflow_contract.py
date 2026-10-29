@@ -205,6 +205,54 @@ def normalize_boolean_workflows(features):
     return result, changes
 
 
+def normalize_state_transition_effects(features):
+    """Fill a state_transition effect's missing from/to from the declared stateTransitions.
+
+    The model often writes the transition once in stateTransitions and leaves the
+    effect half-typed (e.g. cancel from several states). Patch rounds kept failing on
+    API_STATE_TRANSITION_INCOMPLETE, so only a value the declarations determine
+    uniquely is filled; a many-source transition becomes one effect per source.
+    """
+    result, changes = deepcopy(features), []
+
+    def declared(feature):
+        primary = (feature.get("dbContract") or {}).get("primaryTable")
+        return [(item.get("entity") or primary, item.get("from"), item.get("to"))
+                for item in feature.get("stateTransitions") or [] if isinstance(item, dict)]
+
+    everywhere = [transition for feature in result for transition in declared(feature)]
+    for index, feature in enumerate(result):
+        own = declared(feature)
+        for op_index, operation in enumerate(feature.get("apiContract") or []):
+            if not isinstance(operation, dict) or not isinstance(operation.get("effects"), list):
+                continue
+            effects = []
+            for effect in operation["effects"]:
+                if not (isinstance(effect, dict) and effect.get("kind") == "state_transition"
+                        and (effect.get("from") is None or effect.get("to") is None)):
+                    effects.append(effect)
+                    continue
+                pairs = []
+                for transitions in (own, everywhere):
+                    pairs = list(dict.fromkeys(
+                        (source, target) for table, source, target in transitions
+                        if table == effect.get("table")
+                        and effect.get("from") in {None, source} and effect.get("to") in {None, target}
+                    ))
+                    if pairs:
+                        break
+                # Several targets mean the declarations do not decide this effect.
+                if not pairs or len({target for _, target in pairs}) != 1:
+                    effects.append(effect)
+                    continue
+                expanded = [{**effect, "from": source, "to": target} for source, target in pairs]
+                effects.extend(expanded)
+                changes.append({"pointer": f"/features/{index}/apiContract/{op_index}/effects",
+                                "before": effect, "after": expanded})
+            operation["effects"] = effects
+    return result, changes
+
+
 def _identifier_target(operation, parameter, fields, foreign_keys):
     targets = set()
     for mapping in operation.get("fieldMappings") or []:
@@ -245,6 +293,33 @@ def _discoverable_identifiers(endpoints, fields, foreign_keys, roles):
         if expanded == available:
             return available
         available = expanded
+
+
+def _response_binding(mapping):
+    """True when a fieldMapping describes a returned field rather than a stored input."""
+    return mapping.get("source") not in {"server", "auth", "body", "path", "query", "header"}
+
+
+def _lists_parameter(endpoints, collection, parameters, roles):
+    """A role-visible GET {collection} that returns the path parameter's own field (absenceId).
+
+    The UI can pass that value straight into {absenceId}. Only an exact "id"
+    property or a PK fieldMapping counted before, so a correct list route named
+    after the parameter stayed WORKFLOW_LOOKUP_MISSING through every repair.
+    """
+    from phase2.operation_contract import _schema_nodes
+
+    names = {parameter.get("name") for parameter in parameters if parameter.get("name")}
+    for op in endpoints:
+        if op.get("method") != "GET" or op.get("path", "").rstrip("/") not in {
+            collection, collection.replace("/api/v1/", "/api/v1/me/", 1)
+        } or any(parameter.get("in") == "path" for parameter in op.get("parameters") or []):
+            continue
+        if op.get("authRequired") and op.get("allowedRoles") and set(roles) - set(op["allowedRoles"]):
+            continue
+        if any(names & set(node.get("properties") or {}) for node in _schema_nodes(op.get("responseSchema"))):
+            return True
+    return False
 
 
 def workflow_contract_issues(features, endpoints=None):
@@ -326,7 +401,9 @@ def workflow_contract_issues(features, endpoints=None):
                 issue("WORKFLOW_STATE_UNKNOWN", index, "statePolicies", f"{key}: undeclared states {sorted(unknown, key=repr)}")
             for owner, position, operation in operations:
                 for mapping in operation.get("fieldMappings") or []:
-                    if mapping.get("table") != key[0] or mapping.get("column") != key[1]:
+                    # Storage writes (source server/body/...) name the stored value, not
+                    # the response field; only response bindings expose this column.
+                    if mapping.get("table") != key[0] or mapping.get("column") != key[1] or not _response_binding(mapping):
                         continue
                     value = _field_schema(operation.get("responseSchema"), mapping.get("field")) or {}
                     if set(value.get("enum") or []) - states:
@@ -341,7 +418,7 @@ def workflow_contract_issues(features, endpoints=None):
                 for owner, position, operation in operations:
                     schemas = [_field_schema(operation.get("responseSchema"), mapping.get("field")) or {}
                                for mapping in operation.get("fieldMappings") or []
-                               if mapping.get("table") == key[0] and mapping.get("column") == key[1]]
+                               if mapping.get("table") == key[0] and mapping.get("column") == key[1] and _response_binding(mapping)]
                     if (features[owner].get("dbContract") or {}).get("primaryTable") == key[0]:
                         schemas.extend(parameter.get("schema") or {} for parameter in operation.get("parameters") or []
                                        if parameter.get("name") == key[1])
@@ -369,8 +446,17 @@ def workflow_contract_issues(features, endpoints=None):
                     if collection.count("/") != 3:
                         continue
                     targets = {_identifier_target(operation, parameter, fields, foreign_keys) for parameter in identifier_parameters}
+                    caller_roles = operation.get("allowedRoles") or feature.get("roles") or []
+                    if _lists_parameter(actual, collection, identifier_parameters, caller_roles):
+                        continue
                     if not targets <= available and "route:" + collection not in available and "route:" + collection.replace("/api/v1/", "/api/v1/me/", 1) not in available:
-                        issue("WORKFLOW_LOOKUP_MISSING", index, "readDependencies", f"GET {collection}: UI needs an identifier discovery route before addressing this resource")
+                        # Name the roles that must see the list: a lookup added for
+                        # another role (VOLUNTEER only) never satisfied a manager action.
+                        visible = f" visible to roles {sorted(caller_roles)}" if caller_roles else ""
+                        existing = [op for op in actual if op.get("method") == "GET" and op.get("path", "").rstrip("/") == collection]
+                        hint = (f"; the existing GET {collection} must allow those roles (extend its allowedRoles) and return the identifier"
+                                if existing else "")
+                        issue("WORKFLOW_LOOKUP_MISSING", index, "readDependencies", f"GET {collection}: UI needs an identifier discovery route{visible} before addressing this resource; add this GET operation to apiContract (a readDependencies entry alone does not create it){hint}")
         ownership = feature.get("ownership") or {}
         if ownership.get("scope") == "SYSTEM" and any(op.get("authRequired") for op in feature.get("apiContract") or []) and any(
             text in ownership.get("access", "").casefold() for text in ("인증 없이", "unauthenticated", "public access")
@@ -385,7 +471,10 @@ def workflow_contract_issues(features, endpoints=None):
                 issue("AUTH_ROLE_PROVISION_MISSING", index, "sessionPolicy", f"explicit seed/invite/external supply required for roles {sorted(roles - supplied)}")
             for supply in policy.get("roleProvisioning") or []:
                 if supply.get("source") == "invite" and route_key(supply) not in routes:
-                    issue("WORKFLOW_LOOKUP_MISSING", index, "sessionPolicy", f"{supply.get('method')} {supply.get('path')}: role invitation endpoint required")
+                    if supply.get("method") and supply.get("path"):
+                        issue("WORKFLOW_LOOKUP_MISSING", index, "sessionPolicy", f"{supply.get('method')} {supply.get('path')}: role invitation endpoint required")
+                    else:
+                        issue("WORKFLOW_LOOKUP_MISSING", index, "sessionPolicy", f"invite provisioning for role {supply.get('role')} must name its invitation method/path and that operation must exist in apiContract (or use source seed with a description)")
             if policy["transport"] == "cookie" and (not policy.get("csrfProtection") or not policy.get("httpOnly") or
                                                        (policy.get("sameSite") == "None" and not policy.get("secure"))):
                 issue("AUTH_COOKIE_POLICY_REQUIRED", index, "sessionPolicy", "cookie transport requires HttpOnly, explicit CSRF protection and Secure for SameSite=None")
@@ -416,7 +505,7 @@ def workflow_contract_issues(features, endpoints=None):
                          if str(op.get("path", "")).startswith(dependency["path"].rstrip("/") + "/{")]
             consumer_roles = dependency.get("roles") or sorted({role for op in consumers for role in op.get("allowedRoles") or []}) or feature.get("roles") or []
             if target is None:
-                issue("WORKFLOW_LOOKUP_MISSING", index, "readDependencies", f"GET {dependency['path']}: {dependency['purpose']}")
+                issue("WORKFLOW_LOOKUP_MISSING", index, "readDependencies", f"GET {dependency['path']}: declared read has no operation; add this GET operation to apiContract returning {dependency.get('responseField') or 'the identifier'} ({dependency['purpose']})")
             elif dependency.get("responseField") and _field_schema(target.get("responseSchema"), dependency["responseField"]) is None:
                 issue("WORKFLOW_LOOKUP_OUTPUT", index, "readDependencies", f"GET {dependency['path']}: response field {dependency['responseField']} required")
             elif target.get("authRequired") and target.get("allowedRoles") and set(consumer_roles) - set(target["allowedRoles"]):

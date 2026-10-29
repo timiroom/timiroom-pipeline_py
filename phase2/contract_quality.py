@@ -152,7 +152,9 @@ def operation_quality_issues(operation):
                                   and (not separator or p.get("in") == location)), None)
                     policy = operation.get("sessionPolicy") or {}
                     actual = name if separator else field
-                    credential = (actual.lower() == "authorization" and policy.get("transport") == "bearer"
+                    # Non-auth features carry no sessionPolicy of their own; an
+                    # authenticated route still receives the bearer header then.
+                    credential = (actual.lower() == "authorization" and policy.get("transport", "bearer") == "bearer"
                                   and (not separator or location == "header")) or (
                         actual == policy.get("cookieName") and policy.get("transport") == "cookie"
                         and (not separator or location == "cookie"))

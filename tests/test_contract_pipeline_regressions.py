@@ -182,3 +182,133 @@ def test_dba_manager_does_not_make_views_depend_on_favorites(favorites_and_repea
     views = next(table for table in result["final_tables"] if table["name"] == "document_views")
     assert {column["name"] for column in views["columns"]} == {"id", "user_id", "document_id", "viewed_at"}
     assert not any("REFERENCES favorites(" in column["constraints"] for column in views["columns"])
+
+
+def test_authorization_header_input_is_implied_for_authenticated_route_without_policy():
+    # Live run (cafe-beans): non-auth features listed header.Authorization and
+    # Feature Spec failed because only auth features carry a sessionPolicy.
+    from phase2.contract_quality import operation_quality_issues
+    operation = {"method": "GET", "path": "/api/v1/ingredients", "authRequired": True, "requiredInputs": ["header.Authorization"]}
+    assert not any("API_ACCEPTANCE_FIELD_MISSING" in issue for issue in operation_quality_issues(operation))
+    operation["sessionPolicy"] = {"transport": "cookie", "cookieName": "sid"}
+    assert any("API_ACCEPTANCE_FIELD_MISSING" in issue for issue in operation_quality_issues(operation))
+
+
+def test_draft_field_may_be_supplied_by_a_header():
+    from phase2.feature_draft import DbFieldDraft
+    assert DbFieldDraft.model_validate({"name": "idempotency_key", "type": "text", "source": "header"}).source == "header"
+
+
+def test_null_and_omitted_optional_keys_are_not_contract_drift():
+    # Live run (gym-pt): roleProvisioning had method/path null in the contract and
+    # the API agent omitted them, which blocked Phase3 as sessionPolicy drift.
+    from phase2.operation_contract import _without_nulls
+    contract = {"strategy": "bearer_session", "roleProvisioning": [{"role": "trainer", "source": "seed", "method": None, "path": None}]}
+    endpoint = {"strategy": "bearer_session", "roleProvisioning": [{"role": "trainer", "source": "seed"}]}
+    assert _without_nulls(contract) == _without_nulls(endpoint)
+    assert _without_nulls({**endpoint, "strategy": "cookie"}) != _without_nulls(contract)
+
+
+def test_domain_named_counter_satisfies_decrement_requirement():
+    from phase2.agents.qa_agent import QaAgent
+    prd = {"coreFeatures": [{"name": "PT 차감", "description": "수업 완료 시 남은 PT 횟수를 차감한다."}]}
+    db = {"tables": [
+        {"name": "users", "columns": [{"name": "id"}]},
+        {"name": "pt_passes", "columns": [{"name": "id"}, {"name": "member_user_id"}, {"name": "remaining_sessions"}],
+         "foreignKeys": [{"column": "member_user_id", "references": {"table": "users", "column": "id"}}]},
+    ]}
+    def issues(api):
+        result = QaAgent._check_cross_document_semantics(prd, db, api, [])
+        return [item for part in result if isinstance(part, list) for item in part]
+
+    decrement = {"endpoints": [{"method": "POST", "path": "/api/v1/sessions/{id}/complete",
+                                "effects": [{"kind": "decrement", "table": "pt_passes", "column": "remaining_sessions"}]}]}
+    # The decision follows the API's real mutation, not the column's wording.
+    assert not any("상태 변경을 요구하지만" in str(item) for item in issues(decrement))
+    assert any("상태 변경을 요구하지만" in str(item) for item in issues({"endpoints": []}))
+
+
+def test_invite_acceptance_that_opens_a_session_is_a_public_session_entry():
+    # Live run (academy-makeup): POST /auth/invites/accept was blocked as an
+    # unauthenticated user-owned route although it issues the first session.
+    from phase2.operation_contract import is_public_session_entry
+    feature = {"sessionPolicy": {"strategy": "bearer_session", "sessionTable": "user_sessions"},
+               "dbContract": {"tables": ["users", "user_sessions", "user_invites"]}}
+    operation = {"method": "POST", "path": "/api/v1/auth/invites/accept", "action": "join_with_token", "authRequired": False,
+                 "requestSchema": {"type": "object"}, "effects": [{"table": "users", "kind": "insert"},
+                                                                 {"table": "user_sessions", "kind": "insert"}]}
+    assert is_public_session_entry(operation, feature)
+    operation["effects"] = [{"table": "users", "kind": "insert"}]
+    assert not is_public_session_entry(operation, feature)
+
+
+def test_list_404_is_allowed_only_for_an_identifier_filter_target():
+    from phase2.agents.qa_agent import QaAgent
+
+    def issues(parameters):
+        endpoint = {"method": "GET", "path": "/api/v1/stock-events", "action": "list", "errorCodes": "401, 404 not_found",
+                    "parameters": parameters, "responseSchema": {"type": "array", "items": {"type": "object"}}}
+        result = QaAgent._check_cross_document_semantics({"coreFeatures": []}, {"tables": []}, {"endpoints": [endpoint]}, [])
+        return [item for part in result if isinstance(part, list) for item in part]
+
+    assert any("빈 결과에 404" in str(item) for item in issues([{"name": "limit", "in": "query"}]))
+    assert not any("빈 결과에 404" in str(item) for item in issues([{"name": "materialId", "in": "query"}]))
+
+
+def test_identity_table_is_not_required_to_reference_business_root():
+    # Live run (cafe-beans): an account/invite feature matched users by name and the
+    # association rule demanded users -> materials, which DB repair could not satisfy.
+    from phase2.agents.qa_agent import QaAgent
+    prd = {"coreFeatures": [{"name": "재료 등록"}, {"name": "직원 계정 지정"}]}
+    db = {"tables": [
+        {"name": "materials", "description": "재료 등록", "columns": [{"name": "id"}, {"name": "name"}]},
+        {"name": "users", "description": "직원 계정 지정", "columns": [{"name": "id"}, {"name": "email"}, {"name": "password_hash"}]},
+    ]}
+    result = QaAgent._check_cross_document_semantics(prd, db, {"endpoints": []}, ["재료 등록", "직원 계정 지정"])
+    issues = [str(item) for part in result if isinstance(part, list) for item in part]
+    assert not any("users" in item and ("기능 관계 FK 누락" in item or "배정 주체 FK 누락" in item) for item in issues)
+
+
+def test_unique_id_column_without_reference_is_not_an_inferred_fk():
+    # Live run (cafe-beans): inventory_events.client_request_id (UNIQUE idempotency
+    # key) was treated as an FK to a missing client_requests table.
+    from phase2.agents.dba_agent import is_own_identifier_column
+    from phase2.agents.qa_agent import QaAgent
+    assert is_own_identifier_column({"name": "client_request_id", "constraints": "NOT_NULL UNIQUE"})
+    assert not is_own_identifier_column({"name": "user_id", "constraints": "NOT_NULL UNIQUE REFERENCES users(id)"})
+    assert not is_own_identifier_column({"name": "material_id", "constraints": "NOT_NULL"})
+    db = {"tables": [{"name": "inventory_events", "columns": [
+        {"name": "id", "type": "UUID", "constraints": "PRIMARY_KEY"},
+        {"name": "client_request_id", "type": "UUID", "constraints": "NOT_NULL UNIQUE"}]}]}
+    result = QaAgent._check_cross_document_semantics({"coreFeatures": []}, db, {"endpoints": []}, [])
+    issues = [str(item) for part in result if isinstance(part, list) for item in part]
+    assert not any("client_request_id의 FK 참조 대상" in item for item in issues)
+
+
+def test_quota_exhaustion_is_not_retried_like_a_busy_gateway():
+    # Live run: "insufficient_quota" was retried 5x per call and reported only as
+    # RateLimitError, hiding that the account had no credits left.
+    import httpx
+    import openai
+
+    from phase2.feature_generation import retryable_transport
+    from phase2.llm_runtime import LlmRuntime
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    def error(code):
+        response = httpx.Response(429, request=request)
+        return openai.RateLimitError("rate", response=response, body={"error": {"code": code, "type": code}})
+
+    assert not retryable_transport(error("insufficient_quota"))
+    assert retryable_transport(error("rate_limit_exceeded"))
+    calls = []
+
+    async def factory():
+        calls.append(1)
+        raise error("insufficient_quota")
+
+    runtime = LlmRuntime(1, 5, busy_retries=5, busy_backoff_seconds=0)
+    with pytest.raises(openai.RateLimitError):
+        asyncio.run(runtime.call(factory))
+    assert len(calls) == 1

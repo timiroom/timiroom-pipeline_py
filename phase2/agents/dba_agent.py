@@ -73,6 +73,19 @@ EXTERNAL_OR_POLYMORPHIC_FK_STEMS = frozenset({
     "target", "feature", "provider_message", "provider_route",
 })
 
+
+def is_own_identifier_column(column: dict) -> bool:
+    """A *_id column that is UNIQUE by itself and has no REFERENCES is the row's own key.
+
+    client_request_id, external_order_id and similar idempotency or external keys
+    end in _id but point at no table; inferring a target from the name produced
+    an unrepairable "FK target missing" blocker for any domain that used one.
+    """
+    constraints = str(column.get("constraints") or "")
+    if "REFERENCES" in constraints.upper():
+        return False
+    return bool(column.get("unique")) or "UNIQUE" in constraints.upper().split()
+
 WORKER_SYSTEM = "JSON만 출력하세요. 설명·인사말·마크다운 코드블록 금지. { 로 시작해서 } 로 끝납니다."
 
 MANAGER_SYSTEM = """당신은 시니어 DBA 겸 DB manager입니다.
@@ -943,7 +956,7 @@ def dba_self_check(
                 continue
             column_name = str(column.get("name") or "")
             constraints = str(column.get("constraints") or "")
-            if not column_name.endswith("_id"):
+            if not column_name.endswith("_id") or is_own_identifier_column(column):
                 continue
             stem = column_name[:-3]
             if (
@@ -2722,6 +2735,14 @@ class DbaAgent:
                     )
                     if not isinstance(value.get("indexes"), list):
                         value["indexes"] = [str(value["indexes"])] if value.get("indexes") else []
+                    if isinstance(value.get("foreignKeys"), list):
+                        # A patched FK without a target cannot become a constraint;
+                        # keeping it failed shape validation and each repair added more.
+                        dropped = [fk for fk in value["foreignKeys"] if isinstance(fk, dict) and not (
+                            isinstance(fk.get("references"), dict) and fk["references"].get("table"))]
+                        if dropped:
+                            logger.warning("DBA targeted repair — 대상 없는 FK %d개 무시: %s", len(dropped), name)
+                            value["foreignKeys"] = [fk for fk in value["foreignKeys"] if fk not in dropped]
                     by_name[name] = value
                     applied += 1
             relationships = result.get("relationships")

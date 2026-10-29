@@ -473,3 +473,61 @@ def test_auth_policy_binding_does_not_enrich_explicit_physical_contract():
     before = deepcopy(item["dbContract"])
     bind_auth_registry_policy([item])
     assert item["dbContract"] == before
+
+
+def test_invite_token_table_is_not_a_second_session_table():
+    # Live run (academy-makeup): account_invites(token_hash, expires_at) next to the
+    # declared user_sessions table blocked Feature Spec with an unrepairable conflict.
+    from phase2.operation_contract import session_policy_issues
+    policy = {"strategy": "bearer_session", "sessionTable": "user_sessions"}
+    fields = [{"table": "user_sessions", "name": "session_token_hash"}, {"table": "user_sessions", "name": "expires_at"},
+              {"table": "account_invites", "name": "token_hash"}, {"table": "account_invites", "name": "expires_at"}]
+    feature = {"sessionPolicy": policy, "dbContract": {"fields": fields}, "apiContract": [
+        {"method": "POST", "path": "/api/v1/auth/login", "authRequired": False, "effects": [{"table": "user_sessions", "kind": "insert"}]},
+        {"method": "POST", "path": "/api/v1/auth/invitations", "authRequired": True, "effects": [{"table": "account_invites", "kind": "insert"}]},
+    ]}
+    assert session_policy_issues([feature]) == []
+    # A second table that public login actually writes is still a conflict.
+    feature["apiContract"][0]["effects"].append({"table": "account_invites", "kind": "insert"})
+    assert session_policy_issues([feature])
+
+
+def test_shared_route_unions_compatible_field_mappings():
+    from phase2.operation_contract import operation_registry
+
+    def feature(fid, mappings):
+        return {"featureId": fid, "apiContract": [{"method": "GET", "path": "/api/v1/orders/{orderId}", "fieldMappings": mappings}]}
+
+    path = {"field": "orderId", "table": "orders", "column": "id", "source": "path"}
+    status = {"field": "status", "table": "orders", "column": "status", "source": "response"}
+    quantity = {"field": "items[].quantity", "table": "order_items", "column": "quantity", "source": "response"}
+    operations, conflicts = operation_registry([feature("a", [path, status]), feature("b", [path, quantity])])
+    assert conflicts == []
+    assert next(iter(operations.values()))["fieldMappings"] == [path, status, quantity]
+
+    clash = {"field": "status", "table": "orders", "column": "state", "source": "response"}
+    _, conflicts = operation_registry([feature("a", [path, status]), feature("b", [path, clash])])
+    assert any("fieldMappings" in item for item in conflicts)
+
+
+def test_camel_case_request_field_supplies_its_snake_case_column():
+    db = {"bookings": {"name": "bookings", "columns": [
+        {"name": "room_id", "type": "UUID", "source": "body", "constraints": "NOT_NULL"},
+        {"name": "plan_id", "type": "UUID", "source": "body", "constraints": "NOT_NULL"}]}}
+    endpoint = {"action": "create", "primaryTable": "bookings", "effects": [{"kind": "insert", "table": "bookings"}],
+                "requestSchema": {"type": "object", "properties": {"roomId": {"type": "string"}, "membershipPlanId": {"type": "string"}}}}
+    errors = operation_schema_issues(endpoint, db)
+    assert "API_CREATE_STORAGE_VALUE_MISSING: bookings.room_id" not in errors
+    # A different name still needs an explicit fieldMapping.
+    assert "API_CREATE_STORAGE_VALUE_MISSING: bookings.plan_id" in errors
+
+
+def test_child_insert_takes_parent_fk_from_bound_path_parameter():
+    db = {"adjustments": {"name": "adjustments", "columns": [
+        {"name": "source_record_id", "type": "UUID", "source": "path", "constraints": "NOT_NULL FOREIGN_KEY REFERENCES records(id)"}]}}
+    endpoint = {"action": "create", "path": "/api/v1/records/{recordId}/adjustments", "primaryTable": "adjustments",
+                "effects": [{"kind": "insert", "table": "adjustments"}],
+                "fieldMappings": [{"field": "recordId", "table": "records", "column": "id", "source": "path"}]}
+    assert "API_CREATE_STORAGE_VALUE_MISSING: adjustments.source_record_id" not in operation_schema_issues(endpoint, db)
+    endpoint["fieldMappings"] = []
+    assert "API_CREATE_STORAGE_VALUE_MISSING: adjustments.source_record_id" in operation_schema_issues(endpoint, db)

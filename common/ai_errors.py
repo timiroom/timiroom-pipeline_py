@@ -40,6 +40,15 @@ def _text(exc: BaseException) -> str:
     return " ".join(parts).lower()
 
 
+def is_quota_exhausted(exc: BaseException) -> bool:
+    """크레딧·사용 한도 소진은 기다려도 풀리지 않는 429다. 일시 혼잡과 구분한다."""
+    root = _root(exc)
+    if not isinstance(root, openai.RateLimitError):
+        return False
+    text = _text(root)
+    return any(token in text for token in ("insufficient_quota", "quota", "billing", "credit"))
+
+
 def describe(exc: BaseException) -> AiError | None:
     """AI 호출 오류면 안내를 돌려준다. AI 오류가 아니면 None."""
     root = _root(exc)
@@ -58,7 +67,7 @@ def describe(exc: BaseException) -> AiError | None:
             return AiError(400, "AI_MODEL_NOT_FOUND", "연결한 AI 키에서 고른 모델을 찾지 못했습니다. 설정 > 내 AI 키에서 모델 이름을 확인해 주세요.")
         return AiError(503, "AI_SERVICE_UNAVAILABLE", "티미룸 AI 모델을 찾지 못했습니다. 잠시 후 다시 시도해 주세요.")
     if isinstance(root, openai.RateLimitError):
-        if "insufficient_quota" in text or "quota" in text or "billing" in text or "credit" in text:
+        if is_quota_exhausted(root):
             if byok:
                 return AiError(402, "AI_KEY_QUOTA_EXCEEDED", "연결한 AI 키의 크레딧이나 사용 한도를 모두 썼습니다. AI 제공사 결제 화면에서 확인하거나, 설정 > 내 AI 키에서 키 사용을 끄고 티미룸 AI로 계속하세요.")
             return AiError(503, "AI_SERVICE_UNAVAILABLE", "티미룸 AI 사용량이 잠시 한도에 닿았습니다. 잠시 후 다시 시도해 주세요.")

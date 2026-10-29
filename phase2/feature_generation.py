@@ -11,6 +11,7 @@ from typing import Literal
 
 from pydantic import Field, ValidationError
 
+from common.ai_errors import is_quota_exhausted
 from phase2.artifact_shapes import DbContract, Endpoint, Feature, Registry, shape_issues
 from phase2.contract_guard import feature_contract_issues, semantic_identifier
 from phase2.feature_draft import DraftDocument, compile_document
@@ -27,7 +28,7 @@ from phase2.registry_contract_guard import (
     ownership_contract_issues,
     registry_contract_issues,
 )
-from phase2.workflow_contract import normalize_boolean_workflows
+from phase2.workflow_contract import normalize_boolean_workflows, normalize_state_transition_effects
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +305,8 @@ def unsupported_schema(exc):
 
 
 def retryable_transport(exc):
+    if is_quota_exhausted(exc):
+        return False
     return (type(exc).__name__ in {"APITimeoutError", "APIConnectionError", "TimeoutError", "ConnectError"}
             or getattr(exc, "status_code", 0) in {408, 429, 500, 502, 503, 504})
 
@@ -459,7 +462,7 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
     baseline, failures, previous_issues = None, [], []
-    draft_baseline, active_scope = None, None
+    draft_baseline, active_scope, baseline_issues = None, None, []
     # SDK retries are disabled here: this owner provides the bounded retries.
     # Each retry is a targeted patch over the previous draft, so extra attempts
     # shrink the remaining violations instead of regenerating from scratch.
@@ -472,6 +475,7 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
         normalizations = []
         response_normalizations = []
         boolean_normalizations = []
+        transition_normalizations = []
         start = time.perf_counter()
         raw, finish, usage, provider_model = "", None, None, None
         candidate, payload = None, None
@@ -506,7 +510,10 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
                     payload, failures = strict_payload(raw, finish, allow_patch=draft_baseline is not None)
                     if payload is not None:
                         if draft_baseline is not None:
-                            payload = merge_draft_patch(draft_baseline, payload, active_scope)
+                            # A rejected merge must not leave the sparse patch in
+                            # payload, or it would replace the intact draft baseline.
+                            patch, payload = payload, None
+                            payload = merge_draft_patch(draft_baseline, patch, active_scope)
                         candidate = compile_document(payload)
                 else:
                     candidate, failures = strict_document(raw, finish)
@@ -514,13 +521,14 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
                     candidate, normalizations = normalize_parameter_maps(candidate)
                     candidate, response_normalizations = normalize_response_array_maps(candidate)
                     candidate, boolean_normalizations = normalize_boolean_workflows(candidate)
+                    candidate, transition_normalizations = normalize_state_transition_effects(candidate)
                     candidate = bind_sources(candidate, cores)
                     if baseline is not None and not draft:
                         candidate = _merge_patch(baseline, candidate, previous_issues, cores)
                     failures = document_issues(candidate, cores, preflight=draft)
         except Exception as exc:  # noqa: BLE001 - provider boundary; record the type, never the sensitive response
             logger.warning("Feature Spec bounded generation error: %s", type(exc).__name__)
-            failures = [f"FEATURE_SPEC_TRANSPORT: {type(exc).__name__}"] if not isinstance(exc, ValueError) else [str(exc)]
+            failures = [f"FEATURE_SPEC_TRANSPORT: {'AI_QUOTA_EXHAUSTED' if is_quota_exhausted(exc) else type(exc).__name__}"] if not isinstance(exc, ValueError) else [str(exc)]
             candidate = None
             terminal = not retryable_transport(exc) if not isinstance(exc, ValueError) else False
         else:
@@ -532,7 +540,8 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
                   "responseBytes": len(raw.encode()), "responseHash": hashlib.sha256(raw.encode()).hexdigest(),
                   "issues": failures, "partialRecoveryUsed": False, "parameterMapNormalizations": normalizations,
                   "responseMapNormalizations": response_normalizations,
-                  "booleanPolicyNormalizations": boolean_normalizations}
+                  "booleanPolicyNormalizations": boolean_normalizations,
+                  "stateTransitionNormalizations": transition_normalizations}
         if isinstance(payload, dict) and isinstance(payload.get("features"), list):
             record["featureRefs"] = [{"index": index, **{key: value for key in ("featureId", "sourceFeatureId")
                                                         if isinstance(value := item.get(key), str)}}
@@ -567,7 +576,17 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
         if draft and _patchable_draft(payload):
             draft_baseline = payload
             active_scope = draft_repair_scope(payload, failures, cores)
+            baseline_issues = failures
             patch_scope = {**active_scope, "ownershipCandidates": _ownership_repair_candidates(payload, active_scope)}
+        elif draft and draft_baseline is not None and (payload is None or any(
+                item.startswith("FEATURE_SPEC_REPAIR_SCOPE:") for item in failures)):
+            # The patch was unparseable or broke the repair scope, but the earlier
+            # draft is intact. Passing only the parse/scope error made the model
+            # answer an empty patch, so retry with the baseline issues kept.
+            failures = list(dict.fromkeys([*failures, *baseline_issues]))
+            patch_scope = {**active_scope, "ownershipCandidates": _ownership_repair_candidates(draft_baseline, active_scope)}
+            diagnostics[-1]["retryKind"] = ("SCOPE_REJECTED_PATCH_RETRY" if any(
+                item.startswith("FEATURE_SPEC_REPAIR_SCOPE:") for item in failures) else "UNPARSEABLE_PATCH_RETRY")
         elif draft:
             # Without keyed root collections no valid contract exists to patch.
             # Use only the existing single retry; never salvage nested resources.
@@ -580,7 +599,7 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
                 "For operationIndices, keep the original endpoint count/order and change only those indexed operations; "
                 "preserve every other endpoint and its referenced DTO definitions. "
                 "Exception: missingOperationMethods allows appending only those missing methods after the existing operations. "
-                "missingOperationKeys permits appending ONLY the exact named method/path lookup or role-provision operation, with directly referenced DTOs; it does not authorize other routes. "
+                "missingOperationKeys permits appending ONLY the exact named method/path lookup or role-provision operation, with directly referenced DTOs; it does not authorize other routes. Append each missingOperationKeys route as a real operation in that feature's apiContract (with responseType and its DTO); adding or editing readDependencies alone never satisfies it. "
                 "emptyApiFeatureIds permits filling that feature's currently empty apiContract and defining only its directly referenced NEW DTOs and schema-ref dependencies. "
                 "For duplicateCoreSources, keep exactly ONE existing featureId as prd_core. Reclassify the other listed featureIds as supporting with a parentFeatureId, reason and non-P0 priority; preserve their original sourceFeatureId provenance and operations. "
                 "Do not add or rename a third core for a duplicate source. Missing and duplicated cores are different repairs. "

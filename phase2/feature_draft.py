@@ -1,5 +1,6 @@
 """Shallow generation transport compiled into the existing feature contracts."""
 
+import logging
 from copy import deepcopy
 from typing import Annotated, Literal
 
@@ -23,6 +24,9 @@ from phase2.workflow_contract import (
 )
 
 Scalar = str | int | float | bool | None
+
+
+logger = logging.getLogger(__name__)
 
 
 class DraftModel(BaseModel):
@@ -115,7 +119,9 @@ class DbFieldDraft(DraftModel):
     primaryKey: bool = False
     generated: bool = False
     unique: bool = False
-    source: Literal["request", "body", "path", "query", "auth", "server", "derived"] = "request"
+    # header covers values such as an Idempotency-Key stored for replay checks;
+    # without it one such column made the whole first draft unusable.
+    source: Literal["request", "body", "path", "query", "header", "auth", "server", "derived"] = "request"
     default: Scalar = None
     minimum: int | float | None = None
     maximum: int | float | None = None
@@ -375,6 +381,20 @@ def compile_document(payload):
     _unique(draft.features, "featureId", "/features")
     for index, table in enumerate(draft.tables):
         _unique(table.fields, "name", f"/tables/{index}/fields")
+        # A composite UNIQUE naming a column that this table does not define
+        # (e.g. a sibling table's version column) can never be built. DBA then
+        # drops the index and Phase3 repeats DB_UNIQUE_CONTRACT_MISSING until
+        # the run fails, so keep only constraints the table can implement.
+        declared = {field.name for field in table.fields}
+        kept = []
+        for unique in table.uniqueConstraints:
+            columns = unique.columns if isinstance(unique, UniqueDraft) else unique
+            if set(columns) <= declared:
+                kept.append(unique)
+            else:
+                logger.warning("Feature draft UNIQUE 제거 — %s.%s: 테이블에 없는 컬럼 %s",
+                               table.name, list(columns), sorted(set(columns) - declared))
+        table.uniqueConstraints = kept
     features = []
     for index, feature in enumerate(draft.features):
         data = feature.model_dump(by_alias=True, exclude_none=True)
@@ -434,6 +454,11 @@ def compile_document(payload):
     return features
 
 
+def _collection_root(path):
+    """/api/v1/rooms/{roomId}/photos -> /api/v1/rooms: the resource a route serves."""
+    return "/".join(str(path or "").split("{", 1)[0].rstrip("/").split("/")[:4])
+
+
 def _array(value):
     return value if isinstance(value, list) else []
 
@@ -474,9 +499,17 @@ def repair_scope(payload, issues, cores):
         missing_keys = sorted({f"{method} {path}" for issue in issues
                                if issue.startswith("WORKFLOW_LOOKUP_MISSING:") and re.search(rf"/features/{index}(?:/|:|$)", issue)
                                for method, path in re.findall(r"\b(GET|POST|PUT|PATCH) (/api/v1/[^\s:]+)", issue)})
+        op_indices = {int(value) for issue in issues for value in re.findall(rf"/features/{index}/apiContract/(\d+)", issue)}
+        # A lookup route that already exists (wrong output field or roles) has to
+        # be corrected in place. Listing it only as an append key made the merge
+        # reject the model's correct fix as "unrelated endpoint changed".
+        for op_index, operation in enumerate(_array(feature.get("apiContract"))):
+            key = f"{operation.get('method')} {operation.get('path')}" if isinstance(operation, dict) else None
+            if key in missing_keys:
+                missing_keys.remove(key)
+                op_indices.add(op_index)
         if missing_keys:
             scope["missingOperationKeys"][feature["featureId"]] = missing_keys
-        op_indices = {int(value) for issue in issues for value in re.findall(rf"/features/{index}/apiContract/(\d+)", issue)}
         if any(issue.startswith("API_REQUIRED_OUTPUT_MISSING:") and re.search(rf"/features/{index}(?:\s*:|$)", issue)
                for issue in issues):
             # A feature-level output defect also permits repairing its current
@@ -658,8 +691,8 @@ def merge_patch(baseline, patch, scope):
                 return item.get("method", "GET"), item.get("path"), item.get("responseField", "")
 
             combined = {read_key(item): deepcopy(item) for item in _array(previous.get("readDependencies")) if isinstance(item, dict)}
-            if len({read_key(item) for item in reads}) != len(reads):
-                raise ValueError("FEATURE_SPEC_REPAIR_SCOPE: duplicate read dependency patch")
+            # The patch is keyed by method/path/responseField; a repeated key is
+            # a restatement, so the last entry wins instead of discarding the patch.
             combined.update((read_key(item), deepcopy(item)) for item in reads)
             merged["readDependencies"] = list(combined.values())
         affected = scope.get("operationIndices", {}).get(previous.get("featureId"))
@@ -676,7 +709,11 @@ def merge_patch(baseline, patch, scope):
                                      else deepcopy(operation) for index, operation in enumerate(patch_ops)]
             return merged
         operations = deepcopy(old_ops)
-        missing = list(scope.get("missingOperationMethods", {}).get(previous.get("featureId"), []))
+        # Each missing method may be appended once per resource collection the
+        # feature serves (GET rooms and GET equipment for one catalog feature).
+        collections = {_collection_root(op.get("path")) for op in old_ops if isinstance(op, dict)} or {None}
+        missing = [method for method in scope.get("missingOperationMethods", {}).get(previous.get("featureId"), [])
+                   for _ in collections]
         missing_keys = list(scope.get("missingOperationKeys", {}).get(previous.get("featureId"), []))
         seen = set()
         for operation in patch_ops:
@@ -689,7 +726,8 @@ def merge_patch(baseline, patch, scope):
                 index = matches[0]
                 replacement = merge_operation(old_ops[index], operation)
                 if index not in affected and replacement != old_ops[index]:
-                    raise ValueError("FEATURE_SPEC_REPAIR_SCOPE: unrelated endpoint changed")
+                    raise ValueError(f"FEATURE_SPEC_REPAIR_SCOPE: unrelated endpoint changed in {previous.get('featureId')}: "
+                                     f"{key[0]} {key[1]} is protected; leave it unchanged")
                 operations[index] = replacement
             elif not matches and operation.get("method") in missing:
                 missing.remove(operation["method"])
@@ -698,7 +736,8 @@ def merge_patch(baseline, patch, scope):
                 missing_keys.remove(f"{key[0]} {key[1]}")
                 operations.append(deepcopy(operation))
             else:
-                raise ValueError("FEATURE_SPEC_REPAIR_SCOPE: unrelated endpoint changed")
+                raise ValueError(f"FEATURE_SPEC_REPAIR_SCOPE: unrelated endpoint changed in {previous.get('featureId')}: "
+                                 f"{key[0]} {key[1]} was not requested; append only missingOperationMethods/missingOperationKeys")
         merged["apiContract"] = operations
         return merged
 
@@ -729,13 +768,25 @@ def merge_patch(baseline, patch, scope):
             additional = replacement["apiContract"][len(previous_ops):]
             missing_methods = scope.get("missingOperationMethods", {}).get(previous.get("featureId"), [])
             missing_keys = scope.get("missingOperationKeys", {}).get(previous.get("featureId"), [])
-            if len(replacement["apiContract"]) < len(previous_ops) or len(additional) > len(missing_methods) + len(missing_keys) or any(
-                operation.get("method") not in missing_methods and f"{operation.get('method')} {operation.get('path')}" not in missing_keys
-                for operation in additional
-            ) or any(
-                operation != replacement["apiContract"][index] for index, operation in enumerate(previous_ops) if index not in allowed_indices
-            ):
-                raise ValueError("FEATURE_SPEC_REPAIR_SCOPE: unrelated endpoint changed")
+            # A missing action method may be needed once per resource collection the
+            # feature already serves (rooms and equipment both need GET).
+            collections = {_collection_root(op.get("path")) for op in previous_ops if isinstance(op, dict)} or {None}
+            unrequested = [f"{op.get('method')} {op.get('path')}" for op in additional
+                           if op.get("method") not in missing_methods and f"{op.get('method')} {op.get('path')}" not in missing_keys]
+            per_method = {}
+            for op in additional:
+                if f"{op.get('method')} {op.get('path')}" not in missing_keys:
+                    per_method[op.get("method")] = per_method.get(op.get("method"), 0) + 1
+            unrequested += [f"{count} extra {method}" for method, count in per_method.items()
+                            if method in missing_methods and count > len(collections)]
+            changed = [f"{op.get('method')} {op.get('path')}" for index, op in enumerate(previous_ops)
+                       if index not in allowed_indices and op != replacement["apiContract"][index]]
+            if len(replacement["apiContract"]) < len(previous_ops) or unrequested or changed:
+                detail = "; ".join(filter(None, [
+                    "removed existing operations" if len(replacement["apiContract"]) < len(previous_ops) else "",
+                    f"unrequested operations {unrequested}" if unrequested else "",
+                    f"changed protected operations {changed}" if changed else ""]))
+                raise ValueError(f"FEATURE_SPEC_REPAIR_SCOPE: unrelated endpoint changed in {previous.get('featureId')}: {detail}")
             return
         unaffected = {f"{op.get('method')} {op.get('path')}": op for op in _array(previous.get("apiContract"))
                       if isinstance(op, dict) and f"{op.get('method')} {op.get('path')}" not in allowed_ops}

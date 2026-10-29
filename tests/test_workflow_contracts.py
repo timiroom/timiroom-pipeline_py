@@ -361,6 +361,9 @@ def test_response_enum_cannot_promise_a_state_outside_the_state_policy():
     operation["responseSchema"] = {"type": "object", "properties": {"status": {"type": "string", "enum": ["pending", "confirmed"]}}}
     operation["fieldMappings"] = [{"field": "status", "table": "allocations", "column": "state", "source": "response"}]
     assert any("WORKFLOW_STATE_ENUM_CONFLICT" in value for value in workflow_contract_issues([feature]))
+    # A server-side write to the column is a stored value, not the response field.
+    operation["fieldMappings"][0]["source"] = "server"
+    assert not any("WORKFLOW_STATE_ENUM_CONFLICT" in value for value in workflow_contract_issues([feature]))
 
 
 def test_omitting_transition_entity_does_not_bypass_primary_table_effect_check():
@@ -548,9 +551,9 @@ def test_sparse_read_dependency_patch_adds_without_deleting_existing_promises():
     merged = merge_patch(payload, patch, scope)
     assert merged["features"][0]["readDependencies"] == [*payload["features"][0]["readDependencies"], *patch["features"][0]["readDependencies"]]
     assert merge_patch(merged, patch, scope) == merged
+    # A restated key is collapsed (last wins) instead of discarding the whole patch.
     patch["features"][0]["readDependencies"] *= 2
-    with pytest.raises(ValueError, match="duplicate read dependency"):
-        merge_patch(payload, patch, scope)
+    assert merge_patch(payload, patch, scope) == merged
 
 
 def test_canonical_collection_id_read_resolves_a_mapped_path_identifier():
@@ -736,3 +739,39 @@ def test_feature_spec_publishes_read_contracts_to_prd_without_losing_them_in_nor
     assert not result.generation_blockers
     assert json.loads(result.prd_document)["coreFeatures"][0]["readDependencies"] == result.feature_registry[0]["readDependencies"]
     assert provider.chat.completions.create.await_count == 1
+
+
+def test_existing_lookup_route_is_repairable_in_place():
+    # Live run (academy-makeup): GET /makeup-requests existed but was flagged as a
+    # missing lookup; listing it only as an append key rejected the model's fix.
+    from phase2.feature_draft import repair_scope
+    payload = {"features": [{"featureId": "makeup.assignment", "apiContract": [
+        {"method": "GET", "path": "/api/v1/makeup-requests"}, {"method": "POST", "path": "/api/v1/makeup-schedules"}]}]}
+    issues = ["WORKFLOW_LOOKUP_MISSING: /features/0/readDependencies: GET /api/v1/makeup-requests: lookup",
+              "WORKFLOW_LOOKUP_MISSING: /features/0/readDependencies: GET /api/v1/makeup-schedules: lookup"]
+    scope = repair_scope(payload, issues, [])
+    assert scope["operationIndices"]["makeup.assignment"] == [0]
+    assert scope["missingOperationKeys"]["makeup.assignment"] == ["GET /api/v1/makeup-schedules"]
+
+
+def test_list_route_returning_the_parameter_field_counts_as_lookup():
+    from phase2.workflow_contract import _lists_parameter
+    listing = {"method": "GET", "path": "/api/v1/absences", "authRequired": True, "allowedRoles": ["principal"], "parameters": [],
+               "responseSchema": {"type": "object", "properties": {"items": {"type": "array", "items": {
+                   "type": "object", "properties": {"absenceId": {"type": "string", "format": "uuid"}}}}}}}
+    parameter = [{"name": "absenceId", "in": "path"}]
+    assert _lists_parameter([listing], "/api/v1/absences", parameter, ["principal"])
+    assert not _lists_parameter([listing], "/api/v1/absences", [{"name": "studentId", "in": "path"}], ["principal"])
+    assert not _lists_parameter([listing], "/api/v1/absences", parameter, ["guardian"])
+
+
+def test_lookup_missing_names_the_roles_that_must_discover_the_identifier():
+    parameter = {"name": "assetId", "in": "path", "schema": {"type": "string", "format": "uuid"}}
+    feature = {"workflowContractVersion": 1, "applicability": {"ui": True}, "apiContract": [
+        {"method": "PATCH", "path": "/api/v1/assets/{assetId}", "authRequired": True, "allowedRoles": ["MANAGER"], "parameters": [parameter]},
+        {"method": "GET", "path": "/api/v1/assets", "authRequired": True, "allowedRoles": ["MEMBER"],
+         "responseSchema": {"type": "array", "items": {"type": "object", "properties": {"assetId": {"type": "string"}}}}}]}
+    issues = [value for value in workflow_contract_issues([feature]) if "WORKFLOW_LOOKUP_MISSING" in value]
+    assert issues and "['MANAGER']" in issues[0] and "extend its allowedRoles" in issues[0]
+    feature["apiContract"][1]["allowedRoles"] = ["MEMBER", "MANAGER"]
+    assert not any("WORKFLOW_LOOKUP_MISSING" in value for value in workflow_contract_issues([feature]))

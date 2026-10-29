@@ -11,6 +11,8 @@ from openai import (
     RateLimitError,
 )
 
+from common.ai_errors import is_quota_exhausted
+
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
@@ -52,7 +54,8 @@ class LlmRuntime:
                     async with asyncio.timeout(timeout):
                         return await factory()
             except _RETRYABLE as exc:
-                if attempt >= self._busy_retries:
+                # 크레딧 소진은 재시도해도 같은 429만 돌아오고 단계 시간만 늘린다.
+                if attempt >= self._busy_retries or is_quota_exhausted(exc):
                     raise
                 attempt += 1
                 # 기다리는 동안에는 자리(semaphore)를 내준다. 2, 4, 8, 16, 32초에 흔들림을 더한다.

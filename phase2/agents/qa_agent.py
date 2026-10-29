@@ -30,6 +30,7 @@ from phase2.agents.dba_agent import (
     _build_name_lookup,
     _ensure_fk_references,
     _fk_target,
+    is_own_identifier_column,
     _normalize_special_references,
     _table_name_variants,
     _to_array_schema,
@@ -874,6 +875,8 @@ class QaAgent:
             for column in table.get("columns", []):
                 if not isinstance(column, dict) or not str(column.get("name", "")).endswith("_id"):
                     continue
+                if is_own_identifier_column(column):
+                    continue
                 column_name = str(column.get("name", ""))
                 # These identifiers are intentionally external or polymorphic;
                 # requiring an internal table would create a false blocker.
@@ -1162,6 +1165,11 @@ class QaAgent:
         for feature, table_name in feature_tables:
             if not table_name or not root_table or table_name == root_table:
                 continue
+            # The identity table is what business rows reference, never the
+            # reverse. Name matching can land an account/invite feature on it,
+            # which demanded users -> materials and broke the DB repair loop.
+            if table_name in principal_tables:
+                continue
             kind = feature_relation_kind(str(feature))
             # Event/history resources may legitimately reference a state entity
             # rather than the first aggregate feature's table. Only explicit
@@ -1198,9 +1206,19 @@ class QaAgent:
             and not any(token in name for token in ("assignment", "membership", "link", "mapping"))
             and not (names & {"status", "state"} and name in referenced_tables)
         }
+        # State columns are named per domain (pt_passes.remaining_sessions), so a
+        # fixed name list cannot decide this. A table whose column an API effect
+        # actually mutates is a mutable aggregate whatever the column is called.
+        mutated = {
+            str(effect.get("table"))
+            for endpoint in api.get("endpoints") or [] if isinstance(endpoint, dict)
+            for effect in endpoint.get("effects") or []
+            if isinstance(effect, dict) and effect.get("column")
+            and effect.get("kind") in {"increment", "decrement", "update", "set", "state_transition"}
+        }
         aggregates = {
             name for name, names in columns.items()
-            if names & state_fields and name not in event_tables
+            if (names & state_fields or name in mutated) and name not in event_tables
         }
         mutating_contract = any(token in combined_prd for token in (
             "차감", "증가", "감소", "잔여", "수량을 갱신", "상태를 갱신", "balance", "quantity",
@@ -1317,7 +1335,15 @@ class QaAgent:
             if not endpoint.get("action") and not endpoint.get("responseSchema"):
                 list_operation = list_operation or path.removeprefix("/api/v1/").replace("-", "_") in tables
             if method == "GET" and "{" not in path and not path.endswith("/me") and list_operation:
-                if "404" in str(endpoint.get("errorCodes") or ""):
+                # A query filter naming another resource (materialId, owner_id) may
+                # legitimately 404 when that resource does not exist; only an
+                # unfiltered collection must answer an empty result with [].
+                identifier_filter = any(
+                    isinstance(parameter, dict) and parameter.get("in") == "query"
+                    and re.search(r"(?:Id|_id)$", str(parameter.get("name") or ""))
+                    for parameter in endpoint.get("parameters") or []
+                )
+                if "404" in str(endpoint.get("errorCodes") or "") and not identifier_filter:
                     api_issues.append(f"목록 API가 빈 결과에 404를 명시: {path}")
                 from phase2.operation_contract import _schema_nodes
                 structured_array = any(node.get("type") == "array" for node in _schema_nodes(endpoint.get("responseSchema"), api.get("schemas")))

@@ -16,6 +16,7 @@ from phase2.agents.prd_agent import PrdAgent, sync_core_features_with_registry
 from phase2.agents.qa_agent import QaAgent
 from phase2.agents.search_agent import SearchAgent
 from phase2.artifact_shapes import shape_issues
+from phase2.execution_error import PipelineStageError, mark_stage, stage_snapshot
 from phase2.json_utils import try_parse_json
 from phase2.openapi_spec import build_openapi_document
 from phase2.repair_budget import available_targets, finish_attempt, merge_attempts
@@ -74,6 +75,24 @@ class OrchestrationGraph:
         async with asyncio.timeout(self._timeout_seconds):
             return await self._run_inner(initial_state, pipeline_id)
 
+    @staticmethod
+    async def _stage_execute(stage: str, agent, state: PipelineState, dump=None) -> PipelineState:
+        """Run one stage, keeping the artifacts built before it attached to any failure.
+
+        Without this the route only knows the state from before Phase 2, so a
+        provider error in FEATURE_SPEC or QA threw away a finished PRD and
+        project plan that the caller could still inspect or resume from.
+        """
+        try:
+            return await agent.execute(state, dump)
+        except asyncio.CancelledError as exc:
+            # asyncio.timeout re-raises this as TimeoutError; the snapshot has to
+            # ride the cause chain because we must not swallow the cancellation.
+            mark_stage(exc, stage, state)
+            raise
+        except Exception as exc:
+            raise PipelineStageError(stage, state) from exc
+
     async def _run_inner(self, initial_state: PipelineState, pipeline_id: str | None = None) -> PipelineState:
         logger.info("=== Phase 2 오케스트레이션 시작 ===")
         dump = None  # 디버그 덤프 비활성화 — 필요 시 debug_dump.PipelineDump 구현체를 연결
@@ -81,13 +100,13 @@ class OrchestrationGraph:
 
         try:
             self._progress.send(pipeline_id, "SEARCH", "시장 조사 중...", 30)
-            after_search = await self._search.execute(initial_state, dump)
+            after_search = await self._stage_execute("SEARCH", self._search, initial_state, dump)
             after_search = after_search.copy(last_completed_stage="SEARCH")
             if dump:
                 dump.log_state("SEARCH", after_search)
 
             self._progress.send(pipeline_id, "PM", "프로젝트 목표·범위·우선순위 정리 중...", 40)
-            after_pm = await self._pm.execute(after_search, dump)
+            after_pm = await self._stage_execute("PM", self._pm, after_search, dump)
             if after_pm.generation_blockers:
                 return after_pm
             after_pm = after_pm.copy(last_completed_stage="PM")
@@ -95,7 +114,7 @@ class OrchestrationGraph:
                 dump.log_state("PM", after_pm)
 
             self._progress.send(pipeline_id, "PRD", "프로젝트 계획 기반 PRD 문서 작성 중...", 50)
-            after_prd = await self._prd.execute(after_pm, dump)
+            after_prd = await self._stage_execute("PRD", self._prd, after_pm, dump)
             if after_prd.generation_blockers:
                 return after_prd
             after_prd = after_prd.copy(last_completed_stage="PRD")
@@ -110,7 +129,7 @@ class OrchestrationGraph:
                 dump.log_state("PRD_DBA_API", after_prd_dba_api)
 
             self._progress.send(pipeline_id, "QA", "QA 검수·수정 중...", 75)
-            final_state = await self._qa.execute(after_prd_dba_api, dump)
+            final_state = await self._stage_execute("QA", self._qa, after_prd_dba_api, dump)
             if final_state.qa_repair_issues:
                 final_state = await self._repair_once(final_state, pipeline_id, dump)
             if dump:
@@ -347,12 +366,56 @@ class OrchestrationGraph:
         generation_blockers = list(dict.fromkeys(
             [*base.generation_blockers, *dba.generation_blockers, *api.generation_blockers]
         ))
-        return base.copy(
+        merged = base.copy(
             generation_blockers=generation_blockers,
             qa_db_blockers=list(dict.fromkeys([*base.qa_db_blockers, *dba.qa_db_blockers])),
             qa_api_blockers=list(dict.fromkeys([*base.qa_api_blockers, *api.qa_api_blockers])),
             qa_approved=False if generation_blockers or dba.qa_db_blockers or api.qa_api_blockers else base.qa_approved,
         )
+        if not generation_blockers:
+            return merged
+        # A designer that could not generate stopped this stage. Say so, and keep
+        # its provider diagnostic, so Phase3 reports one cause instead of reading
+        # the empty artifact as an independent defect.
+        diagnostics = list(dict.fromkeys(
+            json.dumps(item, ensure_ascii=False, sort_keys=True)
+            for item in [*base.generation_diagnostics, *dba.generation_diagnostics, *api.generation_diagnostics]
+        ))
+        return stage_snapshot("DBA_API", merged).copy(
+            generation_diagnostics=[json.loads(item) for item in diagnostics],
+            last_completed_stage=base.last_completed_stage,
+        )
+
+    async def _run_db_and_api(self, after_prd: PipelineState, dump=None):
+        """Run both designers and keep whichever one finished if the other fails.
+
+        A plain gather cancels the sibling and raises, so a provider error on one
+        side discarded a complete schema or API spec the other side had already
+        produced — and the route then reported both as missing.
+        """
+        dba_task = asyncio.ensure_future(self._dba.execute(self._clone_frozen_registry(after_prd), dump))
+        api_task = asyncio.ensure_future(self._api.execute(self._clone_frozen_registry(after_prd), dump))
+        try:
+            results = await asyncio.gather(dba_task, api_task, return_exceptions=True)
+        except asyncio.CancelledError as exc:
+            for task in (dba_task, api_task):
+                task.cancel()
+            mark_stage(exc, "DBA_API", self._finished_siblings(after_prd, dba_task, api_task))
+            raise
+        failures = [item for item in results if isinstance(item, BaseException)]
+        if failures:
+            raise PipelineStageError(
+                "DBA_API", self._finished_siblings(after_prd, dba_task, api_task)
+            ) from failures[0]
+        return results
+
+    @staticmethod
+    def _finished_siblings(after_prd: PipelineState, dba_task, api_task) -> PipelineState:
+        partial = after_prd
+        for task, field in ((dba_task, "db_schema"), (api_task, "api_spec")):
+            if task.done() and not task.cancelled() and task.exception() is None:
+                partial = partial.copy(**{field: getattr(task.result(), field)})
+        return partial
 
     async def _run_prd_with_rollback(
         self, pm_state: PipelineState, pipeline_id: str | None, dump=None, *, prd_ready: bool = False
@@ -362,10 +425,12 @@ class OrchestrationGraph:
         # PRD repair는 최대 한 번만 수행한다. 동일 blocker는 Phase3 blocker로 남긴다.
         for attempt in range(2):
             logger.info("PRD/Feature Spec 계약 처리 (PRD ready=%s, 시도 %d)", prd_ready, attempt + 1)
-            after_prd = current if prd_ready and attempt == 0 else await self._prd.execute(current, dump)
+            after_prd = current if prd_ready and attempt == 0 else await self._stage_execute("PRD", self._prd, current, dump)
             if self._feature_spec is not None:
                 self._progress.send(pipeline_id, "FEATURE_SPEC", "기능명세서 및 지원 기능 확정 중...", 55)
-                after_prd = sync_core_features_with_registry(await self._feature_spec.execute(after_prd, dump))
+                after_prd = sync_core_features_with_registry(
+                    await self._stage_execute("FEATURE_SPEC", self._feature_spec, after_prd, dump)
+                )
             if after_prd.generation_blockers:
                 return after_prd
             after_prd = after_prd.copy(last_completed_stage="FEATURE_SPEC")
@@ -373,12 +438,7 @@ class OrchestrationGraph:
 
             # DBA·API는 rag-pipeline과 동일하게 독립적으로 병렬 실행 (교차 주입 없음)
             self._progress.send(pipeline_id, "DBA_API", "DB 스키마 · API 설계 중...", 60)
-            dba_input = self._clone_frozen_registry(after_prd)
-            api_input = self._clone_frozen_registry(after_prd)
-            dba_result, api_result = await asyncio.gather(
-                self._dba.execute(dba_input, dump),
-                self._api.execute(api_input, dump),
-            )
+            dba_result, api_result = await self._run_db_and_api(after_prd, dump)
             if dump:
                 dump.log_state(f"DBA (attempt {attempt + 1})", dba_result)
                 dump.log_state(f"API (attempt {attempt + 1})", api_result)
