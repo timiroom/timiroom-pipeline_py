@@ -290,6 +290,7 @@ def test_quota_exhaustion_is_not_retried_like_a_busy_gateway():
     # RateLimitError, hiding that the account had no credits left.
     import httpx
     import openai
+
     from phase2.feature_generation import retryable_transport
     from phase2.llm_runtime import LlmRuntime
 

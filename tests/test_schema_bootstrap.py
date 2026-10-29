@@ -6,7 +6,6 @@ compose 스택은 init.sql만 실행하고(`/docker-entrypoint-initdb.d/`) migra
 Phase 4 publish()가 저장 단계에서 실패했다.
 """
 
-import io
 import re
 from pathlib import Path
 
@@ -26,7 +25,7 @@ def _created_tables(text: str) -> set[str]:
 
 
 def _read(relative: str) -> str:
-    return io.open(ROOT / relative, encoding="utf-8").read()
+    return open(ROOT / relative, encoding="utf-8").read()
 
 
 def test_init_sql_creates_every_table_migrate_db_creates():
