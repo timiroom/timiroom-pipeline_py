@@ -361,6 +361,9 @@ def test_response_enum_cannot_promise_a_state_outside_the_state_policy():
     operation["responseSchema"] = {"type": "object", "properties": {"status": {"type": "string", "enum": ["pending", "confirmed"]}}}
     operation["fieldMappings"] = [{"field": "status", "table": "allocations", "column": "state", "source": "response"}]
     assert any("WORKFLOW_STATE_ENUM_CONFLICT" in value for value in workflow_contract_issues([feature]))
+    # A server-side write to the column is a stored value, not the response field.
+    operation["fieldMappings"][0]["source"] = "server"
+    assert not any("WORKFLOW_STATE_ENUM_CONFLICT" in value for value in workflow_contract_issues([feature]))
 
 
 def test_omitting_transition_entity_does_not_bypass_primary_table_effect_check():
@@ -548,9 +551,9 @@ def test_sparse_read_dependency_patch_adds_without_deleting_existing_promises():
     merged = merge_patch(payload, patch, scope)
     assert merged["features"][0]["readDependencies"] == [*payload["features"][0]["readDependencies"], *patch["features"][0]["readDependencies"]]
     assert merge_patch(merged, patch, scope) == merged
+    # A restated key is collapsed (last wins) instead of discarding the whole patch.
     patch["features"][0]["readDependencies"] *= 2
-    with pytest.raises(ValueError, match="duplicate read dependency"):
-        merge_patch(payload, patch, scope)
+    assert merge_patch(payload, patch, scope) == merged
 
 
 def test_canonical_collection_id_read_resolves_a_mapped_path_identifier():

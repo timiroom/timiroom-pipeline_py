@@ -50,9 +50,6 @@ class Settings(BaseSettings):
     # 재시도하지 않는다(repair 대상은 pm/prd/db/api뿐). 보정은 초안 대비
     # 훨씬 싸므로(실측 15s/4KB vs 231s/61KB) 초안 1회 + 보정 2회를 기본으로 둔다.
     feature_spec_max_attempts: int = 3
-    # 빈 값이면 계정 기본 처리. priority는 출력 속도가 실측 약 1.9배(92→174 tok/s)지만
-    # 토큰 단가가 더 높다. Feature Spec 소요 시간은 출력 토큰 속도가 결정한다.
-    feature_spec_service_tier: str = ""
     # Opt-in local response diagnostics. Never exposed through progress APIs.
     feature_spec_diagnostics_dir: str = ""
     phase4_storage_timeout_seconds: float = 120.0
@@ -128,8 +125,6 @@ class Settings(BaseSettings):
             raise ValueError("FEATURE_SPEC_REQUEST_TIMEOUT_SECONDS must be > 0")
         if not 1 <= self.feature_spec_max_attempts <= 5:
             raise ValueError("FEATURE_SPEC_MAX_ATTEMPTS must be between 1 and 5")
-        if self.feature_spec_service_tier not in {"", "auto", "default", "flex", "priority"}:
-            raise ValueError("FEATURE_SPEC_SERVICE_TIER must be empty/auto/default/flex/priority")
         if self.phase4_storage_timeout_seconds <= 0:
             raise ValueError("PHASE4_STORAGE_TIMEOUT_SECONDS must be > 0")
         if self.rag_chunk_size <= 0:

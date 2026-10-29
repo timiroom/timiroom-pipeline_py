@@ -508,3 +508,26 @@ def test_shared_route_unions_compatible_field_mappings():
     clash = {"field": "status", "table": "orders", "column": "state", "source": "response"}
     _, conflicts = operation_registry([feature("a", [path, status]), feature("b", [path, clash])])
     assert any("fieldMappings" in item for item in conflicts)
+
+
+def test_camel_case_request_field_supplies_its_snake_case_column():
+    db = {"bookings": {"name": "bookings", "columns": [
+        {"name": "room_id", "type": "UUID", "source": "body", "constraints": "NOT_NULL"},
+        {"name": "plan_id", "type": "UUID", "source": "body", "constraints": "NOT_NULL"}]}}
+    endpoint = {"action": "create", "primaryTable": "bookings", "effects": [{"kind": "insert", "table": "bookings"}],
+                "requestSchema": {"type": "object", "properties": {"roomId": {"type": "string"}, "membershipPlanId": {"type": "string"}}}}
+    errors = operation_schema_issues(endpoint, db)
+    assert "API_CREATE_STORAGE_VALUE_MISSING: bookings.room_id" not in errors
+    # A different name still needs an explicit fieldMapping.
+    assert "API_CREATE_STORAGE_VALUE_MISSING: bookings.plan_id" in errors
+
+
+def test_child_insert_takes_parent_fk_from_bound_path_parameter():
+    db = {"adjustments": {"name": "adjustments", "columns": [
+        {"name": "source_record_id", "type": "UUID", "source": "path", "constraints": "NOT_NULL FOREIGN_KEY REFERENCES records(id)"}]}}
+    endpoint = {"action": "create", "path": "/api/v1/records/{recordId}/adjustments", "primaryTable": "adjustments",
+                "effects": [{"kind": "insert", "table": "adjustments"}],
+                "fieldMappings": [{"field": "recordId", "table": "records", "column": "id", "source": "path"}]}
+    assert "API_CREATE_STORAGE_VALUE_MISSING: adjustments.source_record_id" not in operation_schema_issues(endpoint, db)
+    endpoint["fieldMappings"] = []
+    assert "API_CREATE_STORAGE_VALUE_MISSING: adjustments.source_record_id" in operation_schema_issues(endpoint, db)

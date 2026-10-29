@@ -421,7 +421,18 @@ def operation_schema_issues(endpoint: dict, tables: dict[str, dict], schemas: di
             ):
                 managed.discard(column.get("name"))
         managed |= path_input_fields(endpoint, columns)
-        supplied = _schema_property_names(request, schemas) | {
+        # A child row created under /records/{recordId} takes its parent FK from
+        # the path parameter already bound to that parent table.
+        path_tables = {item.get("table") for item in endpoint.get("fieldMappings") or []
+                       if isinstance(item, dict) and item.get("source") == "path"}
+        for column in columns:
+            reference = (column.get("references") or {}).get("table") if isinstance(column.get("references"), dict) else None
+            reference = reference or (re.search(r"REFERENCES\s+(\w+)", str(column.get("constraints") or ""), re.IGNORECASE) or [None, None])[1]
+            if reference and reference in path_tables:
+                managed.add(column.get("name"))
+        # roomId in the request DTO is the room_id column; only the casing differs.
+        supplied = {name for prop in _schema_property_names(request, schemas)
+                    for name in (prop, re.sub(r"(?<!^)(?=[A-Z])", "_", prop).lower())} | {
             str(item.get("column")) for item in endpoint.get("fieldMappings") or []
             if isinstance(item, dict) and item.get("table") == primary.get("name")}
         for column in columns:

@@ -918,3 +918,21 @@ def test_unparseable_patch_keeps_baseline_issues_and_retries_patch():
     assert any(item.get("retryKind") == "UNPARSEABLE_PATCH_RETRY" for item in diagnostics)
     last_prompt = create.call_args.kwargs["messages"][-1]["content"]
     assert "FEATURE_OWNER_TABLE_UNKNOWN" in last_prompt and "unusable" not in last_prompt
+
+
+def test_rejected_patch_never_replaces_the_draft_baseline():
+    payload = draft()
+    payload["features"][0]["apiContract"][0]["effects"] = [{"kind": "state_transition", "table": "items", "column": "name"}]
+    payload["features"][0]["ownership"] = {"scope": "SHARED", "ownerEntity": "unknown", "access": "Restricted to members"}
+    fixed = {"method": "POST", "path": "/api/v1/items", "effects": [{"kind": "insert", "table": "items"}]}
+    rogue = {"features": [{"featureId": "items.create", "apiContract": [fixed, {"method": "GET", "path": "/api/v1/unrelated"}]}]}
+    empty = {"version": "contract-draft-v1", "features": [], "tables": [], "schemas": []}
+    create = AsyncMock(side_effect=[response(payload), response(rogue), response(empty)])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    _, diagnostics, failures = asyncio.run(generate_document(
+        client, "test", None, "JSON", [{"sourceFeatureId": "source.items"}], draft=True, max_attempts=3))
+    assert "GET /api/v1/unrelated" in diagnostics[1]["issues"][0]
+    # The empty patch is merged over the intact draft, so the original issue
+    # remains instead of every feature failing the draft shape.
+    assert failures and not any("FEATURE_DRAFT_SHAPE" in item for item in failures)
+    assert any("FEATURE_OWNER_TABLE_UNKNOWN" in item for item in failures)

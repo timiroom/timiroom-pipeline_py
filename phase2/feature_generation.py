@@ -446,15 +446,12 @@ def _merge_patch(baseline, patch, issues, cores):
     return merged
 
 
-async def generate_document(client, model, runtime, prompt, cores, *, mode="auto", diagnostics_dir="", max_tokens=16000, draft=False, reasoning_effort=None, timeout_seconds=None, max_attempts=2, service_tier=None):
+async def generate_document(client, model, runtime, prompt, cores, *, mode="auto", diagnostics_dir="", max_tokens=16000, draft=False, reasoning_effort=None, timeout_seconds=None, max_attempts=2):
     diagnostics = []
     current_mode = "json_schema" if mode == "auto" else mode
     # Keep other model families' existing request contract unchanged.
     applied_effort = reasoning_effort if model.startswith("gpt-5.4") else None
     sampling = {"reasoning_effort": applied_effort} if applied_effort and applied_effort != "none" else {"temperature": 0.2}
-    if service_tier:
-        # Output-token throughput bounds this call; priority roughly doubles it.
-        sampling["service_tier"] = service_tier
     messages = [{"role": "system", "content": "Return one complete JSON object. Never truncate or emit Markdown."},
                 {"role": "user", "content": prompt}]
     if draft:
@@ -513,7 +510,10 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
                     payload, failures = strict_payload(raw, finish, allow_patch=draft_baseline is not None)
                     if payload is not None:
                         if draft_baseline is not None:
-                            payload = merge_draft_patch(draft_baseline, payload, active_scope)
+                            # A rejected merge must not leave the sparse patch in
+                            # payload, or it would replace the intact draft baseline.
+                            patch, payload = payload, None
+                            payload = merge_draft_patch(draft_baseline, patch, active_scope)
                         candidate = compile_document(payload)
                 else:
                     candidate, failures = strict_document(raw, finish)
@@ -585,7 +585,8 @@ async def generate_document(client, model, runtime, prompt, cores, *, mode="auto
             # answer an empty patch, so retry with the baseline issues kept.
             failures = list(dict.fromkeys([*failures, *baseline_issues]))
             patch_scope = {**active_scope, "ownershipCandidates": _ownership_repair_candidates(draft_baseline, active_scope)}
-            diagnostics[-1]["retryKind"] = ("UNPARSEABLE_PATCH_RETRY" if payload is None else "SCOPE_REJECTED_PATCH_RETRY")
+            diagnostics[-1]["retryKind"] = ("SCOPE_REJECTED_PATCH_RETRY" if any(
+                item.startswith("FEATURE_SPEC_REPAIR_SCOPE:") for item in failures) else "UNPARSEABLE_PATCH_RETRY")
         elif draft:
             # Without keyed root collections no valid contract exists to patch.
             # Use only the existing single retry; never salvage nested resources.

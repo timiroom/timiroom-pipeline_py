@@ -295,6 +295,11 @@ def _discoverable_identifiers(endpoints, fields, foreign_keys, roles):
         available = expanded
 
 
+def _response_binding(mapping):
+    """True when a fieldMapping describes a returned field rather than a stored input."""
+    return mapping.get("source") not in {"server", "auth", "body", "path", "query", "header"}
+
+
 def _lists_parameter(endpoints, collection, parameters, roles):
     """A role-visible GET {collection} that returns the path parameter's own field (absenceId).
 
@@ -396,7 +401,9 @@ def workflow_contract_issues(features, endpoints=None):
                 issue("WORKFLOW_STATE_UNKNOWN", index, "statePolicies", f"{key}: undeclared states {sorted(unknown, key=repr)}")
             for owner, position, operation in operations:
                 for mapping in operation.get("fieldMappings") or []:
-                    if mapping.get("table") != key[0] or mapping.get("column") != key[1]:
+                    # Storage writes (source server/body/...) name the stored value, not
+                    # the response field; only response bindings expose this column.
+                    if mapping.get("table") != key[0] or mapping.get("column") != key[1] or not _response_binding(mapping):
                         continue
                     value = _field_schema(operation.get("responseSchema"), mapping.get("field")) or {}
                     if set(value.get("enum") or []) - states:
@@ -411,7 +418,7 @@ def workflow_contract_issues(features, endpoints=None):
                 for owner, position, operation in operations:
                     schemas = [_field_schema(operation.get("responseSchema"), mapping.get("field")) or {}
                                for mapping in operation.get("fieldMappings") or []
-                               if mapping.get("table") == key[0] and mapping.get("column") == key[1]]
+                               if mapping.get("table") == key[0] and mapping.get("column") == key[1] and _response_binding(mapping)]
                     if (features[owner].get("dbContract") or {}).get("primaryTable") == key[0]:
                         schemas.extend(parameter.get("schema") or {} for parameter in operation.get("parameters") or []
                                        if parameter.get("name") == key[1])
@@ -464,7 +471,10 @@ def workflow_contract_issues(features, endpoints=None):
                 issue("AUTH_ROLE_PROVISION_MISSING", index, "sessionPolicy", f"explicit seed/invite/external supply required for roles {sorted(roles - supplied)}")
             for supply in policy.get("roleProvisioning") or []:
                 if supply.get("source") == "invite" and route_key(supply) not in routes:
-                    issue("WORKFLOW_LOOKUP_MISSING", index, "sessionPolicy", f"{supply.get('method')} {supply.get('path')}: role invitation endpoint required")
+                    if supply.get("method") and supply.get("path"):
+                        issue("WORKFLOW_LOOKUP_MISSING", index, "sessionPolicy", f"{supply.get('method')} {supply.get('path')}: role invitation endpoint required")
+                    else:
+                        issue("WORKFLOW_LOOKUP_MISSING", index, "sessionPolicy", f"invite provisioning for role {supply.get('role')} must name its invitation method/path and that operation must exist in apiContract (or use source seed with a description)")
             if policy["transport"] == "cookie" and (not policy.get("csrfProtection") or not policy.get("httpOnly") or
                                                        (policy.get("sameSite") == "None" and not policy.get("secure"))):
                 issue("AUTH_COOKIE_POLICY_REQUIRED", index, "sessionPolicy", "cookie transport requires HttpOnly, explicit CSRF protection and Secure for SameSite=None")
