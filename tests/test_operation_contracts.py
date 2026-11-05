@@ -531,3 +531,60 @@ def test_child_insert_takes_parent_fk_from_bound_path_parameter():
     assert "API_CREATE_STORAGE_VALUE_MISSING: adjustments.source_record_id" not in operation_schema_issues(endpoint, db)
     endpoint["fieldMappings"] = []
     assert "API_CREATE_STORAGE_VALUE_MISSING: adjustments.source_record_id" in operation_schema_issues(endpoint, db)
+
+
+def _check_registry(fields):
+    return [{
+        "featureId": "listing.create", "name": "listing", "source": "prd_core", "actions": ["create"],
+        "apiContract": [{"method": "POST", "path": "/api/v1/listings", "action": "create", "successStatus": 201}],
+        "dbContract": {"tables": ["users", "listings"], "primaryTable": "listings", "foreignKeys": [
+            {"table": "listings", "column": "user_id", "references": {"table": "users", "column": "id"}}], "fields": fields},
+    }]
+
+
+def _check_workers():
+    def worker(name, *columns):
+        return {"name": name, "description": name, "indexes": [], "columns": [
+            {"name": "id", "type": "BIGINT", "constraints": "PRIMARY_KEY"},
+            *[{"name": column, "type": kind, "constraints": "NOT_NULL"} for column, kind in columns]]}
+    return [worker("users", ("email", "TEXT")),
+            worker("listings", ("price", "INTEGER"), ("category", "TEXT"), ("user_id", "BIGINT"))]
+
+
+_CHECK_FIELDS = [
+    {"table": "listings", "name": "price", "type": "INTEGER", "required": True, "minimum": 0},
+    {"table": "listings", "name": "category", "type": "TEXT", "required": True, "enum": ["stroller", "toys"]},
+    {"table": "listings", "name": "user_id", "type": "BIGINT", "required": True},
+    {"table": "users", "name": "email", "type": "TEXT", "required": True},
+]
+
+
+@pytest.mark.parametrize("declare_users_primary_key", [True, False])
+def test_registry_check_constraints_reach_the_schema_with_or_without_explicit_projection(declare_users_primary_key):
+    # Live run (d33944dc): one declared table had no primaryKey field, so the explicit projection was
+    # skipped and the heuristic path dropped every CHECK -> 19x DB_WORKFLOW_CHECK_MISSING on each repair.
+    from phase2.operation_contract import cross_contract_issues
+
+    primary_keys = [{"table": "listings", "name": "id", "type": "BIGINT", "primaryKey": True, "generated": True}]
+    if declare_users_primary_key:
+        primary_keys.append({"table": "users", "name": "id", "type": "BIGINT", "primaryKey": True, "generated": True})
+    registry = _check_registry(primary_keys + deepcopy(_CHECK_FIELDS))
+    tables, _, _ = dba_self_check(_check_workers(), [], registry)
+    issues = cross_contract_issues(registry, {"tables": tables}, {"endpoints": []}, {"coreFeatures": []})
+    assert not [item for item in issues if item[0] == "DB_WORKFLOW_CHECK_MISSING"]
+    listings = next(item for item in tables if item["name"] == "listings")
+    assert "CHECK (price >= 0)" in listings["constraints"]
+
+
+def test_registry_check_is_not_added_for_a_column_the_table_does_not_have():
+    from phase2.agents.dba_agent import _apply_registry_check_constraints
+
+    registry = _check_registry([
+        {"table": "listings", "name": "price", "type": "INTEGER", "minimum": 0},
+        {"table": "listings", "name": "latitude", "type": "DOUBLE PRECISION", "minimum": -90, "maximum": 90},
+    ])
+    by_name = {"listings": {"name": "listings", "columns": [{"name": "id"}, {"name": "price"}]}}
+    _apply_registry_check_constraints(by_name, registry)
+    assert by_name["listings"]["constraints"] == ["CHECK (price >= 0)"]
+    _apply_registry_check_constraints(by_name, registry)
+    assert by_name["listings"]["constraints"] == ["CHECK (price >= 0)"]

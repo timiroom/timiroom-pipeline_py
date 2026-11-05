@@ -838,9 +838,11 @@ def test_pre_auth_routes_cover_common_recovery_and_verification_names():
     for path in ("/api/v1/auth/forgot-password", "/auth/email-verifications", "/api/v1/auth/verify-email",
                  "/api/v1/auth/password-reset-requests", "/api/v1/auth/register",
                  "/api/v1/auth/token-refresh", "/api/v1/auth/refresh-token", "/api/v1/auth/tokens/refresh",
-                 "/api/v1/auth/sign-in", "/api/v1/auth/sign-up"):
+                 "/api/v1/auth/sign-in", "/api/v1/auth/sign-up",
+                 "/api/v1/auth/magic-links", "/api/v1/auth/magic-link", "/api/v1/auth/magic-links/verify"):
         assert is_pre_auth_route(path), path
-    for path in ("/api/v1/auth/logout", "/api/v1/auth/password-change", "/api/v1/profile", "/api/v1/auth/me"):
+    for path in ("/api/v1/auth/logout", "/api/v1/auth/password-change", "/api/v1/profile", "/api/v1/auth/me",
+                 "/api/v1/auth/magic-linksX", "/api/v1/users/magic-links", "/api/v1/magic-links"):
         assert not is_pre_auth_route(path), path
 
 
