@@ -72,7 +72,13 @@ def session_tables(registry):
         for field in (feature.get("dbContract") or {}).get("fields") or []:
             if isinstance(field, dict) and isinstance(field.get("table"), str) and isinstance(field.get("name"), str):
                 fields.setdefault(field.get("table"), set()).add(field.get("name"))
-    inferred = {name for name, names in fields.items() if name and {"token_hash", "expires_at"} <= names}
+    # A one-time credential (magic link, reset, invite) is consumed once and never
+    # holds a session. A magic link is issued by a public request, so the `issued`
+    # filter below kept it as a second session table; the model then dropped the
+    # table to satisfy the conflict and broke its own API contract.
+    consumed = {"used_at", "consumed_at", "redeemed_at"}
+    inferred = {name for name, names in fields.items()
+                if name and {"token_hash", "expires_at"} <= names and not names & consumed}
     # Invite/reset tokens share token_hash+expires_at but are written by an
     # authenticated issuer, not by the public login/signup that opens a session.
     # Counting them made a single declared sessionTable an unrepairable conflict.
