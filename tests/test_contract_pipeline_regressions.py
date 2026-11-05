@@ -242,6 +242,37 @@ def test_invite_acceptance_that_opens_a_session_is_a_public_session_entry():
     assert not is_public_session_entry(operation, feature)
 
 
+def test_magic_link_token_table_is_not_a_second_session_table():
+    # Live run (b786d312): a public magic-link request writes magic_link_tokens
+    # (token_hash+expires_at), so it was inferred as a session table next to the
+    # declared sessions table. The repair then removed magic_link_tokens and the
+    # Feature Spec failed on its own API contract.
+    from phase2.operation_contract import session_policy_issues
+
+    def field(table, name):
+        return {"table": table, "name": name, "type": "TEXT"}
+
+    def registry(token_columns):
+        return [{
+            "featureId": "auth", "sessionPolicy": {"strategy": "bearer_session", "sessionTable": "sessions"},
+            "apiContract": [
+                {"method": "POST", "path": "/api/v1/auth/magic-link", "action": "request_magic_link", "authRequired": False,
+                 "effects": [{"table": "magic_link_tokens", "kind": "insert"}]},
+                {"method": "POST", "path": "/api/v1/auth/magic-link/verify", "action": "verify_magic_link", "authRequired": False,
+                 "effects": [{"table": "magic_link_tokens", "kind": "update", "column": "used_at"},
+                             {"table": "sessions", "kind": "insert"}]},
+            ],
+            "dbContract": {"tables": ["magic_link_tokens", "sessions"], "fields": [
+                *(field("magic_link_tokens", name) for name in ["email", "token_hash", "expires_at", *token_columns]),
+                *(field("sessions", name) for name in ["user_id", "token_hash", "expires_at"]),
+            ]},
+        }]
+
+    assert session_policy_issues(registry(["used_at"])) == []
+    # Without a consumption column the table still looks like a second session store.
+    assert any("AUTH_SESSION_CONTRACT_CONFLICT" in issue for issue in session_policy_issues(registry([])))
+
+
 def test_list_404_is_allowed_only_for_an_identifier_filter_target():
     from phase2.agents.qa_agent import QaAgent
 
