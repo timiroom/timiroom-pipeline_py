@@ -19,7 +19,7 @@ from phase2.agent_contract import (
     route_contract_table,
 )
 from phase2.artifact_shapes import shape_issues
-from phase2.contract_quality import index_issues, volatile_index
+from phase2.contract_quality import database_checks, index_issues, volatile_index
 from phase2.feature_coverage import missing_features_note, uncovered_features
 from phase2.feature_registry import (
     missing_db_contract_features,
@@ -39,6 +39,7 @@ from phase2.quality_rules import (
     self_check_passed,
 )
 from phase2.registry_contract_guard import contract_artifacts, shared_db_issues
+from phase2.workflow_contract import workflow_check_constraints
 from phase2.repair_scope import (
     merge_columns,
     preserve_unscoped,
@@ -1445,7 +1446,38 @@ def apply_explicit_db_contracts(tables: list[dict], registry: list[dict]) -> lis
                 issues.append(f"DB_UNIQUE_TARGET_UNKNOWN: {table_name}.{names}")
                 continue
             _ensure_unique_index(table, tuple(names))
+    _apply_registry_check_constraints(by_name, registry)
     return list(dict.fromkeys(issues))
+
+
+_CHECK_KEYWORDS = {"check", "in", "and", "or", "not", "null", "true", "false", "is"}
+
+
+def _check_columns(check: str) -> set[str]:
+    """Column names a CHECK expression refers to (quoted literals and keywords removed)."""
+    bare = re.sub(r"'(?:''|[^'])*'", "''", check)
+    return {word for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", bare) if word.lower() not in _CHECK_KEYWORDS}
+
+
+def _apply_registry_check_constraints(by_name: dict[str, dict], registry: list[dict]) -> None:
+    """Keep registry-derived CHECKs on the heuristic path, as the explicit projection does.
+
+    project_explicit_schema is abandoned as soon as one declared table lacks a primaryKey
+    field, and the heuristic path never carried table-level CHECKs, so Phase3
+    (cross_contract_issues -> DB_WORKFLOW_CHECK_MISSING) failed on every repair round.
+    A CHECK is only added when every column it names exists on the table.
+    """
+    expected = {name: sorted(checks) for name, checks in workflow_check_constraints(registry).items()}
+    for name, checks in database_checks(registry).items():
+        expected[name] = [*expected.get(name, []), *checks]
+    for name, checks in expected.items():
+        table = by_name.get(name)
+        if not table:
+            continue
+        columns = {str(column.get("name")) for column in table.get("columns") or [] if isinstance(column, dict)}
+        usable = [check for check in checks if _check_columns(check) <= columns]
+        if usable:
+            table["constraints"] = list(dict.fromkeys([*(table.get("constraints") or []), *usable]))
 
 
 def enforce_schema_contracts(
